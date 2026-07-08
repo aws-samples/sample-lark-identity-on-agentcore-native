@@ -42,7 +42,7 @@ PY
 base_cdk_stacks() {
   log "Base — CDK stacks"
   $CDK deploy "$PREFIX-security" "$PREFIX-agentcore" "$PREFIX-router" \
-             "$PREFIX-gateway" "$PREFIX-observability" \
+             "$PREFIX-gateway" "$PREFIX-shim" "$PREFIX-observability" \
              --require-approval never --outputs-file cdk.out/outputs.json
 }
 

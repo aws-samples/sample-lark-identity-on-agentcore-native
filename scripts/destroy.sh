@@ -85,7 +85,7 @@ fi
 log "CDK — destroy stacks"
 # gateway/router depend on agentcore+security; destroy dependents first.
 $CDK destroy \
-  "$PREFIX-gateway" "$PREFIX-router" \
+  "$PREFIX-shim" "$PREFIX-gateway" "$PREFIX-router" \
   "$PREFIX-agentcore" "$PREFIX-observability" "$PREFIX-security" \
   --force
 

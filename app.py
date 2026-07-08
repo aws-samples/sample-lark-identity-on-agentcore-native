@@ -22,6 +22,7 @@ from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
 from stacks.router_stack import RouterStack
 from stacks.gateway_stack import GatewayStack
+from stacks.shim_stack import ShimStack
 from stacks.observability_stack import ObservabilityStack
 
 app = cdk.App()
@@ -63,6 +64,14 @@ router = RouterStack(
 
 # --- Gateway: demo tool Lambda + Gateway IAM (mcpServer target wired in Phase 3) ---
 gateway = GatewayStack(app, f"{prefix}-gateway", env=env)
+
+# --- Shim: Lark OAuth RFC-6749 façade + 3LO return-url ---
+shim = ShimStack(
+    app,
+    f"{prefix}-shim",
+    lark_api_domain=ctx("lark_api_domain") or "https://open.larksuite.com",
+    env=env,
+)
 
 # --- Observability: dashboard + alarms ---
 observability = ObservabilityStack(app, f"{prefix}-observability", env=env)

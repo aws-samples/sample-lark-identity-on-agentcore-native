@@ -11,4 +11,7 @@ uv run --with boto3 --with aiohttp --with pytest python -m pytest agent/test_age
 echo "== router =="
 uv run --with cryptography --with boto3 --with pytest python -m pytest lambda/router/test_router.py -q
 
+echo "== shim =="
+uv run --with boto3 --with pytest python -m pytest lambda/shim/test_shim.py -q
+
 echo "== all green =="
