@@ -10,10 +10,11 @@
 # Usage: [PROFILE=p REGION=r] scripts/deploy.sh [--base|--runtime|--gateway]
 set -euo pipefail
 
-PROFILE="${PROFILE:-default}"
+PROFILE="${PROFILE:-}"   # empty -> use ambient creds (instance role / env), no named profile
 REGION="${REGION:-us-west-2}"
 PREFIX="lark-id"
-export AWS_PROFILE="$PROFILE" AWS_REGION="$REGION" UV_LINK_MODE=copy
+export AWS_REGION="$REGION" UV_LINK_MODE=copy
+[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 

@@ -14,10 +14,11 @@
 #   --yes   skip the interactive confirmation
 set -euo pipefail
 
-PROFILE="${PROFILE:-default}"
+PROFILE="${PROFILE:-}"   # empty -> ambient creds (instance role / env), no named profile
 REGION="${REGION:-us-west-2}"
 PREFIX="lark-id"
-export AWS_PROFILE="$PROFILE" AWS_REGION="$REGION"
+export AWS_REGION="$REGION"
+[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
