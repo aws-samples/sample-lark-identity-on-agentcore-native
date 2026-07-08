@@ -3,21 +3,22 @@
 # allowlist your open_id. Override target with PROFILE=... REGION=... env vars.
 #
 # Prereqs (Lark developer console):
-#   1. Self-built app with "Bot" + "Web app" capabilities.
+#   1. Self-built app with "Bot" capability (chat-only variant — no web app).
 #   2. Permissions: im:message, im:message:send_as_bot, im:message.content:readonly,
 #      im:chat:readonly, im:resource, contact:user.base:readonly
+#      + User Token Scopes for 3LO: drive:drive, docx:document, offline_access
 #   3. Event subscription: subscribe im.message.receive_v1; set Request URL to the
 #      webhook URL printed below; enable encryption and note the Encrypt Key.
-#   4. Web app: register the SPA URL (below) as a redirect/safe domain.
+#   4. Security settings: register the OAuth shim's redirect URL (Phase 3) as a
+#      redirect domain for the 3LO authorize flow.
 #   5. Publish the app.
 #
-# Fill .env (see .env.example) BEFORE running this. Then re-run
-# `scripts/deploy.sh --frontend` so the App ID is injected into the SPA.
+# Fill .env (see .env.example) BEFORE running this.
 set -euo pipefail
 
 PROFILE="${PROFILE:-default}"
 REGION="${REGION:-us-west-2}"
-PREFIX="lark-agent"
+PREFIX="lark-id"
 export AWS_PROFILE="$PROFILE" AWS_REGION="$REGION"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -35,12 +36,9 @@ set -a; . ./.env; set +a
 
 WEBHOOK="$(aws cloudformation describe-stacks --stack-name "$PREFIX-router" \
   --query "Stacks[0].Outputs[?OutputKey=='WebhookLarkUrl'].OutputValue" --output text 2>/dev/null || true)"
-SITE="$(aws cloudformation describe-stacks --stack-name "$PREFIX-webui" \
-  --query "Stacks[0].Outputs[?OutputKey=='SiteUrl'].OutputValue" --output text 2>/dev/null || true)"
 
 log "Register these in the Lark developer console (if not done):"
 echo "  Event Request URL : ${WEBHOOK:-<deploy router first>}"
-echo "  Web app URL       : ${SITE:-<deploy webui first>}"
 
 log "Writing credentials to Secrets Manager ($PREFIX/channels/lark)"
 TMPF="$(mktemp)"
@@ -63,4 +61,4 @@ else
   echo "  (LARK_ADMIN_OPEN_ID blank — skipping allowlist; add later via scripts/manage-allowlist.sh)"
 fi
 
-log "Done. Run 'scripts/deploy.sh --frontend' to inject the App ID into the SPA."
+log "Done."

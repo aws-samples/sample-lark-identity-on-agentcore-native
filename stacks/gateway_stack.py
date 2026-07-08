@@ -1,15 +1,15 @@
-"""Gateway stack — Interceptor Lambda + demo tool + IAM for the MCP Gateway.
+"""Gateway stack — demo tool Lambda + IAM for the MCP Gateway.
 
 The AgentCore Gateway itself is NOT a CloudFormation resource in this region
 (verified). It is created by scripts/deploy.sh via
 `aws bedrock-agentcore-control create-gateway` with:
   - authorizerConfiguration.customJWTAuthorizer -> Cognito discovery + client
-  - interceptorConfigurations -> this Interceptor Lambda, inputConfiguration
-    passRequestHeaders=true, interceptionPoints=[REQUEST]
   - a Lambda target -> the demo tool Lambda
 
-This stack provisions everything the Gateway needs and grants the
-bedrock-agentcore service principal permission to invoke both Lambdas.
+Identity variant: no interceptor. Per-user identity/credentials are handled
+natively by AgentCore Identity (Token Vault + OAuth provider); this stack will
+be reworked in Phase 3 to the mcpServer-target shape. The tool Lambda below is
+transitional — its Lark logic moves into the MCP server in Phase 2.
 """
 
 from aws_cdk import (
@@ -27,14 +27,7 @@ from stacks import retention_days
 
 
 class GatewayStack(Stack):
-    def __init__(
-        self,
-        scope: Construct,
-        construct_id: str,
-        *,
-        tool_keys_secret_prefix: str,
-        **kwargs,
-    ) -> None:
+    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         region = Stack.of(self).region
@@ -44,36 +37,6 @@ class GatewayStack(Stack):
 
         agentcore_principal = iam.ServicePrincipal("bedrock-agentcore.amazonaws.com")
         gateway_source_arn = f"arn:aws:bedrock-agentcore:{region}:{account}:gateway/*"
-
-        # --- Interceptor Lambda ---
-        interceptor_log = logs.LogGroup(
-            self, "InterceptorLog",
-            log_group_name=f"/{prefix}/lambda/interceptor",
-            retention=retention_days(log_retention),
-            removal_policy=RemovalPolicy.DESTROY,
-        )
-        self.interceptor_fn = _lambda.Function(
-            self, "InterceptorFn",
-            function_name=f"{prefix}-interceptor",
-            runtime=_lambda.Runtime.PYTHON_3_13,
-            handler="index.handler",
-            code=_lambda.Code.from_asset("lambda/interceptor"),
-            timeout=Duration.seconds(15),
-            memory_size=256,
-            environment={"TOOL_KEYS_SECRET_PREFIX": tool_keys_secret_prefix},
-            log_group=interceptor_log,
-        )
-        self.interceptor_fn.add_to_role_policy(iam.PolicyStatement(
-            actions=["secretsmanager:GetSecretValue"],
-            resources=[f"arn:aws:secretsmanager:{region}:{account}:secret:{tool_keys_secret_prefix}/*"],
-        ))
-        # Allow the Gateway service to invoke the interceptor
-        self.interceptor_fn.add_permission(
-            "AllowGatewayInvokeInterceptor",
-            principal=agentcore_principal,
-            action="lambda:InvokeFunction",
-            source_arn=gateway_source_arn,
-        )
 
         # --- Demo tool Lambda (Gateway target) ---
         tool_log = logs.LogGroup(
@@ -126,9 +89,8 @@ class GatewayStack(Stack):
         )
         self.gateway_role.add_to_policy(iam.PolicyStatement(
             actions=["lambda:InvokeFunction"],
-            resources=[self.interceptor_fn.function_arn, self.tool_fn.function_arn],
+            resources=[self.tool_fn.function_arn],
         ))
 
-        CfnOutput(self, "InterceptorFnArn", value=self.interceptor_fn.function_arn)
         CfnOutput(self, "ToolFnArn", value=self.tool_fn.function_arn)
         CfnOutput(self, "GatewayRoleArn", value=self.gateway_role.role_arn)

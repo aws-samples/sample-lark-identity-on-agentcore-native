@@ -27,7 +27,7 @@ class SecurityStack(Stack):
         prefix = self.node.try_get_context("resource_prefix") or "lark-agent"
 
         # --- Cognito user pool: token factory for Lark-authenticated users ---
-        # username == "lark:{open_id}"; passwords are HMAC-derived by the web_api
+        # username == "lark:{open_id}"; passwords are HMAC-derived by the agent
         # Lambda, so no interactive sign-up / recovery / MFA applies.
         self.user_pool = cognito.UserPool(
             self,
@@ -81,24 +81,6 @@ class SecurityStack(Stack):
             description="HMAC salt for deriving Cognito user passwords",
             generate_secret_string=secretsmanager.SecretStringGenerator(
                 password_length=64,
-                exclude_punctuation=True,
-            ),
-            removal_policy=RemovalPolicy.DESTROY,
-        )
-
-        # --- Downstream MCP tool keys (per-tenant) for the Gateway Interceptor --
-        # The interceptor reads `{prefix}/tool-keys/{tenant}` and injects the key
-        # into the outbound tool request. Seed a "default" tenant for the PoC.
-        self.tool_keys_secret_prefix = f"{prefix}/tool-keys"
-        self.tool_keys_default_secret = secretsmanager.Secret(
-            self,
-            "ToolKeysDefault",
-            secret_name=f"{self.tool_keys_secret_prefix}/default",
-            description="Downstream MCP tool API key for the 'default' tenant",
-            generate_secret_string=secretsmanager.SecretStringGenerator(
-                secret_string_template='{"api_key":"demo-"}',
-                generate_string_key="filler",
-                password_length=24,
                 exclude_punctuation=True,
             ),
             removal_policy=RemovalPolicy.DESTROY,

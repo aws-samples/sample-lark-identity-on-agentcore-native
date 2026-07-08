@@ -16,7 +16,7 @@ set -euo pipefail
 
 PROFILE="${PROFILE:-default}"
 REGION="${REGION:-us-west-2}"
-PREFIX="lark-agent"
+PREFIX="lark-id"
 export AWS_PROFILE="$PROFILE" AWS_REGION="$REGION"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -32,9 +32,9 @@ warn() { printf '\033[1;33m%s\033[0m\n' "$*"; }
 
 # --- confirmation --------------------------------------------------------
 if [ "${1:-}" != "--yes" ]; then
-  warn "This will DELETE all lark-agent resources in account $ACCOUNT / $REGION:"
+  warn "This will DELETE all $PREFIX resources in account $ACCOUNT / $REGION:"
   warn "  AgentCore Gateway ($GW_NAME) + targets, Runtime ($RUNTIME_NAME),"
-  warn "  and CDK stacks (webui, gateway, router, agentcore, observability, security)."
+  warn "  and CDK stacks (gateway, router, agentcore, observability, security)."
   warn "  Secrets include your Lark credentials ($PREFIX/channels/lark) — re-seedable"
   warn "  from .env via scripts/setup-lark.sh. Lark console app config is NOT touched."
   read -r -p "Type the account id ($ACCOUNT) to proceed: " reply
@@ -83,24 +83,17 @@ fi
 
 # --- 3. CDK stacks (reverse dependency order) ----------------------------
 log "CDK — destroy stacks"
-# webui/gateway/router depend on agentcore+security; destroy dependents first.
+# gateway/router depend on agentcore+security; destroy dependents first.
 $CDK destroy \
-  "$PREFIX-webui" "$PREFIX-gateway" "$PREFIX-router" \
+  "$PREFIX-gateway" "$PREFIX-router" \
   "$PREFIX-agentcore" "$PREFIX-observability" "$PREFIX-security" \
   --force
 
-# --- 4. dynamic per-user secrets (NOT managed by any stack) --------------
-# web_api creates {prefix}/user-tokens/{open_id} at runtime when a user
-# authorizes, so cdk destroy never removes them — clean them up explicitly.
-log "Secrets — remove dynamic per-user token secrets ($PREFIX/user-tokens/*)"
-for name in $(aws secretsmanager list-secrets \
-    --query "SecretList[?starts_with(Name,'$PREFIX/user-tokens/')].Name" --output text 2>/dev/null || true); do
-  echo "  deleting $name"
-  aws secretsmanager delete-secret --secret-id "$name" \
-    --force-delete-without-recovery >/dev/null 2>&1 || warn "  ($name delete failed)"
-done
+# NOTE (identity variant): per-user tokens live in the AgentCore Identity Token
+# Vault, not Secrets Manager — Phase 3 must extend this script to delete the
+# OAuth2 credential provider (which purges its vaulted tokens) and the shim.
 
-# --- 5. leftover local state --------------------------------------------
+# --- 4. leftover local state --------------------------------------------
 log "Local — clear the AgentCore CLI config so a fresh deploy reconfigures"
 [ -f .bedrock_agentcore.yaml ] && { rm -f .bedrock_agentcore.yaml; echo "  removed .bedrock_agentcore.yaml"; }  # safe-rm-ok
 rm -rf .bedrock_agentcore 2>/dev/null || true  # safe-rm-ok

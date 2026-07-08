@@ -2,13 +2,13 @@
 """lark-agent on AgentCore — CDK application entry point.
 
 A single-tenant-friendly PoC that runs a simple Python agent on Bedrock
-AgentCore Runtime, reachable from two Lark entrypoints (webhook messages +
-desktop-client embedded web UI), with Lark as the identity provider and
-per-user identity forwarded to downstream MCP tools via an AgentCore Gateway
-Request Interceptor.
+AgentCore Runtime, reachable from Lark bot chat (webhook messages), with Lark
+as the identity provider. Per-user Lark tokens live in the AgentCore Identity
+Token Vault (3LO) and are injected by the Gateway into an MCP-server target —
+the agent never holds a downstream credential.
 
 Deployment is hybrid:
-  Phase 1 (CDK):  Security, AgentCore base (Role/ECR/S3), Router, WebUI,
+  Phase 1 (CDK):  Security, AgentCore base (Role/ECR/S3), Router,
                   Gateway, Observability
   Phase 2 (CLI):  AgentCore Runtime + Gateway created/updated by deploy.sh
                   (control-plane APIs), IDs fed back into cdk.json context
@@ -21,7 +21,6 @@ import aws_cdk as cdk
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
 from stacks.router_stack import RouterStack
-from stacks.webui_stack import WebUiStack
 from stacks.gateway_stack import GatewayStack
 from stacks.observability_stack import ObservabilityStack
 
@@ -62,30 +61,8 @@ router = RouterStack(
     env=env,
 )
 
-# --- WebUI: Lark-embedded SPA + auth/session API (JWT authorizer) ---
-webui = WebUiStack(
-    app,
-    f"{prefix}-webui",
-    runtime_arn=agentcore.runtime_arn,
-    runtime_endpoint_qualifier=ctx("runtime_endpoint_id") or "DEFAULT",
-    identity_table_name=router.identity_table_name,
-    identity_table_arn=router.identity_table_arn,
-    lark_secret_name=security.lark_secret.secret_name,
-    cognito_user_pool_id=security.user_pool_id,
-    cognito_user_pool_arn=security.user_pool_arn,
-    cognito_client_id=security.user_pool_client_id,
-    cognito_issuer_url=security.cognito_issuer_url,
-    cognito_password_secret_name=security.cognito_password_secret.secret_name,
-    env=env,
-)
-
-# --- Gateway: MCP Request Interceptor (per-user credential injection) + demo tool ---
-gateway = GatewayStack(
-    app,
-    f"{prefix}-gateway",
-    tool_keys_secret_prefix=security.tool_keys_secret_prefix,
-    env=env,
-)
+# --- Gateway: demo tool Lambda + Gateway IAM (mcpServer target wired in Phase 3) ---
+gateway = GatewayStack(app, f"{prefix}-gateway", env=env)
 
 # --- Observability: dashboard + alarms ---
 observability = ObservabilityStack(app, f"{prefix}-observability", env=env)

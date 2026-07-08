@@ -9,10 +9,8 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# Node / web-ui
+# Node
 node_modules/
-web-ui/dist/
-web-ui/config.js
 .dev
 
 # AgentCore Starter Toolkit

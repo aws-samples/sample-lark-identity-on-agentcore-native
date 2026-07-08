@@ -3,7 +3,7 @@
 The agent never holds downstream tool credentials. Instead, for each end-user it
 mints a short-lived Cognito JWT (username = ``lark:{open_id}``) and attaches it as
 a Bearer token on outbound MCP/Gateway calls. The Gateway's JWT authorizer
-verifies it and the Request Interceptor derives the user's tenant from its claims.
+verifies it and AgentCore Identity keys the Token Vault by that user identity.
 
 Passwords are HMAC-derived from a Secrets Manager salt, so they are deterministic
 and never stored. Users are auto-provisioned on first use via AdminCreateUser.
@@ -128,8 +128,8 @@ def get_user_jwt(username: str, email: str = "") -> str:
 
     # Use the ACCESS token: the Gateway's allowedClients check validates the
     # `client_id` claim, which only access tokens carry (ID tokens have `aud`
-    # and would fail with insufficient_scope). The interceptor reads identity
-    # from the access token's `username` claim.
+    # and would fail with insufficient_scope). AgentCore Identity keys the
+    # vault by the access token's user identity.
     token = resp["AuthenticationResult"]["AccessToken"]
     _token_cache[username] = (token, _jwt_exp(token))
     return token

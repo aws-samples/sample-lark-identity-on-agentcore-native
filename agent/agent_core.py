@@ -9,13 +9,13 @@ microVM, so the cache holds essentially one entry per container.
 
 Memory: AgentCoreMemorySessionManager with batch_size=1 persists each turn to
 Memory immediately (STM), so history survives idle-termination + a new microVM,
-and is keyed by (actor_id, session_id) — one long thread per user, shared across
-reconnects and both Lark entrypoints.
+and is keyed by (actor_id, session_id) — one long thread per user.
 
 Identity pass-through: the user's Cognito access token is the Bearer on the MCP
-connection, so the Gateway authorizer + interceptor see the real end-user; the
-agent never holds a downstream tool credential. The token expires (~1h), so the
-cached session is rebuilt after a TTL.
+connection, so the Gateway authorizer sees the real end-user and AgentCore
+Identity injects that user's vaulted downstream token; the agent never holds a
+downstream tool credential. The token expires (~1h), so the cached session is
+rebuilt after a TTL.
 
 `run_chat` returns the final text; `stream_chat` yields text deltas.
 """

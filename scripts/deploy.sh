@@ -4,16 +4,15 @@
 # Steps (idempotent — re-runnable independently):
 #   --base      CDK base stacks (security, agentcore, router, gateway, observability)
 #   --runtime   create/update the AgentCore Runtime from the built image (CLI)
-#   --gateway   create/update the MCP Gateway + interceptor + demo target (CLI)
-#   --frontend  deploy the WebUI stack, inject SPA config, upload the SPA
+#   --gateway   create/update the MCP Gateway + demo target (CLI)
 #   (no arg)    run all steps in order
 #
-# Usage: [PROFILE=p REGION=r] scripts/deploy.sh [--base|--runtime|--gateway|--frontend]
+# Usage: [PROFILE=p REGION=r] scripts/deploy.sh [--base|--runtime|--gateway]
 set -euo pipefail
 
 PROFILE="${PROFILE:-default}"
 REGION="${REGION:-us-west-2}"
-PREFIX="lark-agent"
+PREFIX="lark-id"
 export AWS_PROFILE="$PROFILE" AWS_REGION="$REGION" UV_LINK_MODE=copy
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -86,11 +85,10 @@ phase2_runtime() {
 }
 
 phase3_gateway() {
-  log "Phase 3 — MCP Gateway + interceptor + demo target"
-  local issuer client interceptor tool grole gid
+  log "Phase 3 — MCP Gateway + demo target"
+  local issuer client tool grole gid
   issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
   client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
-  interceptor="$(cfn_out "$PREFIX-gateway" InterceptorFnArn)"
   tool="$(cfn_out "$PREFIX-gateway" ToolFnArn)"
   grole="$(cfn_out "$PREFIX-gateway" GatewayRoleArn)"
 
@@ -99,13 +97,15 @@ phase3_gateway() {
 
   if [ -z "$gid" ] || [ "$gid" = "None" ]; then
     log "creating gateway"
+    # No interceptor (identity variant). Protocol 2025-11-25+ is required for
+    # the 3LO elicitation flow wired in plan Phase 3/3b.
     gid="$(aws bedrock-agentcore-control create-gateway \
       --name "${PREFIX}-gw" \
       --protocol-type MCP \
+      --protocol-configuration '{"mcp":{"supportedVersions":["2025-11-25"]}}' \
       --role-arn "$grole" \
       --authorizer-type CUSTOM_JWT \
       --authorizer-configuration "{\"customJWTAuthorizer\":{\"discoveryUrl\":\"$issuer/.well-known/openid-configuration\",\"allowedClients\":[\"$client\"]}}" \
-      --interceptor-configurations "[{\"interceptor\":{\"lambda\":{\"arn\":\"$interceptor\"}},\"interceptionPoints\":[\"REQUEST\"],\"inputConfiguration\":{\"passRequestHeaders\":true}}]" \
       --query gatewayId --output text)"
   fi
   ctx_set gateway_id "$gid"
@@ -174,36 +174,11 @@ JSON
   fi
 }
 
-phase4_frontend() {
-  log "Phase 4 — re-deploy dependent stacks + publish SPA"
-  # webui depends on runtime ARN (from runtime_id) — deploy now that it's set
-  $CDK deploy "$PREFIX-webui" --require-approval never --outputs-file cdk.out/outputs.json
-
-  local api_base app_id bucket
-  api_base="$(cfn_out "$PREFIX-webui" ApiUrl)"
-  bucket="$(cfn_out "$PREFIX-webui" SiteBucketName)"
-  # larkAppId comes from .env (single config source), not Secrets Manager.
-  [ -f .env ] && { set -a; . ./.env; set +a; }
-  app_id="${LARK_APP_ID:-}"
-
-  log "rendering web-ui/config.js from template (apiBase=$api_base appId=${app_id:-<empty>})"
-  sed -e "s|REPLACE_API_BASE|${api_base%/}|" -e "s|REPLACE_LARK_APP_ID|${app_id}|" \
-    web-ui/config.js.example > web-ui/config.js
-
-  log "uploading SPA to s3://$bucket"
-  # exclude the template + docs; config.js (generated) IS uploaded
-  aws s3 sync web-ui/ "s3://$bucket/" --delete \
-    --exclude "*.md" --exclude "*.example" --cache-control "no-cache"
-
-  log "Done. Site: $(cfn_out "$PREFIX-webui" SiteUrl)"
-  log "Webhook URL (register in Lark): $(cfn_out "$PREFIX-router" WebhookLarkUrl)"
-}
-
 case "${1:-all}" in
   --base|--phase1) base_cdk_stacks ;;  # --phase1 kept as a back-compat alias
   --runtime)  phase2_runtime ;;
   --gateway)  phase3_gateway ;;
-  --frontend) phase4_frontend ;;
-  all|"")     base_cdk_stacks; phase2_runtime; phase3_gateway; phase4_frontend ;;
-  *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--runtime|--gateway|--frontend]"; exit 1 ;;
+  all|"")     base_cdk_stacks; phase2_runtime; phase3_gateway
+              log "Webhook URL (register in Lark): $(cfn_out "$PREFIX-router" WebhookLarkUrl)" ;;
+  *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--runtime|--gateway]"; exit 1 ;;
 esac
