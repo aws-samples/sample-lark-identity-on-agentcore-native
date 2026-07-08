@@ -27,7 +27,7 @@ class ObservabilityStack(Stack):
                 statistic=stat, period=Duration.minutes(5),
             )
 
-        functions = [f"{prefix}-router", f"{prefix}-demo-tool"]
+        functions = [f"{prefix}-router"]
 
         dashboard = cw.Dashboard(self, "Dashboard", dashboard_name=f"{prefix}-ops")
         dashboard.add_widgets(

@@ -86,11 +86,10 @@ phase2_runtime() {
 }
 
 phase3_gateway() {
-  log "Phase 3 — MCP Gateway + demo target"
-  local issuer client tool grole gid
+  log "Phase 3 — MCP Gateway (mcpServer target wired below)"
+  local issuer client grole gid
   issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
   client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
-  tool="$(cfn_out "$PREFIX-gateway" ToolFnArn)"
   grole="$(cfn_out "$PREFIX-gateway" GatewayRoleArn)"
 
   gid="$(aws bedrock-agentcore-control list-gateways \
@@ -98,12 +97,13 @@ phase3_gateway() {
 
   if [ -z "$gid" ] || [ "$gid" = "None" ]; then
     log "creating gateway"
-    # No interceptor (identity variant). Protocol 2025-11-25+ is required for
-    # the 3LO elicitation flow wired in plan Phase 3/3b.
+    # Identity variant: no interceptor. sessionConfiguration is REQUIRED for warm
+    # microVM reuse (measured — without it every tool call cold-starts). Protocol
+    # 2025-11-25 for the 3LO elicitation flow (lark-mcp negotiates it — measured).
     gid="$(aws bedrock-agentcore-control create-gateway \
       --name "${PREFIX}-gw" \
       --protocol-type MCP \
-      --protocol-configuration '{"mcp":{"supportedVersions":["2025-11-25"]}}' \
+      --protocol-configuration '{"mcp":{"supportedVersions":["2025-11-25"],"sessionConfiguration":{"sessionTimeoutInSeconds":3600}}}' \
       --role-arn "$grole" \
       --authorizer-type CUSTOM_JWT \
       --authorizer-configuration "{\"customJWTAuthorizer\":{\"discoveryUrl\":\"$issuer/.well-known/openid-configuration\",\"allowedClients\":[\"$client\"]}}" \
@@ -116,63 +116,11 @@ phase3_gateway() {
     --query gatewayUrl --output text 2>/dev/null || true)"
   [ -n "$gurl" ] && ctx_set gateway_url "$gurl"
 
-  # demo tool target (idempotent create). Pass JSON via file:// to avoid shell
-  # quote mangling of the nested schema.
-  if ! aws bedrock-agentcore-control list-gateway-targets --gateway-identifier "$gid" \
-       --query "items[?name=='demo-whoami']" --output text 2>/dev/null | grep -q demo-whoami; then
-    log "creating demo tool target"
-    local tgt_file; tgt_file="$(mktemp)"
-    cat > "$tgt_file" <<JSON
-{"mcp":{"lambda":{"lambdaArn":"$tool","toolSchema":{"inlinePayload":[{"name":"whoami","description":"Report the calling end-user identity injected by the gateway","inputSchema":{"type":"object","properties":{}}}]}}}}
-JSON
-    aws bedrock-agentcore-control create-gateway-target \
-      --gateway-identifier "$gid" \
-      --name demo-whoami \
-      --target-configuration "file://$tgt_file" \
-      --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]' \
-      >/dev/null && echo "  demo-whoami target created" || echo "(target create failed — check output)"
-    rm -f "$tgt_file"
-  fi
-
-  # list_my_docs target (same Lambda) — proves permission inheritance: lists the
-  # calling user's Lark docs, scoped to that user's own Lark permissions.
-  if ! aws bedrock-agentcore-control list-gateway-targets --gateway-identifier "$gid" \
-       --query "items[?name=='demo-docs']" --output text 2>/dev/null | grep -q demo-docs; then
-    log "creating list_my_docs target"
-    local docs_file; docs_file="$(mktemp)"
-    cat > "$docs_file" <<JSON
-{"mcp":{"lambda":{"lambdaArn":"$tool","toolSchema":{"inlinePayload":[{"name":"list_my_docs","description":"List the calling user's Lark cloud documents, scoped to that user's own Lark permissions (the agent never holds the user's token). Returns one folder level; pass folder_token (from a folder entry in a prior result) to descend into a subfolder","inputSchema":{"type":"object","properties":{"folder_token":{"type":"string","description":"optional; a folder's token to list its contents. Omit for the drive root"}}}}]}}}}
-JSON
-    aws bedrock-agentcore-control create-gateway-target \
-      --gateway-identifier "$gid" \
-      --name demo-docs \
-      --target-configuration "file://$docs_file" \
-      --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]' \
-      >/dev/null && echo "  demo-docs target created" || echo "(target create failed — check output)"
-    rm -f "$docs_file"
-  fi
-
-  # doc write tools (same Lambda) — create/edit/delete Lark docs AS the user.
-  if ! aws bedrock-agentcore-control list-gateway-targets --gateway-identifier "$gid" \
-       --query "items[?name=='demo-doc-write']" --output text 2>/dev/null | grep -q demo-doc-write; then
-    log "creating doc-write target"
-    local w_file; w_file="$(mktemp)"
-    cat > "$w_file" <<'JSON'
-{"mcp":{"lambda":{"lambdaArn":"__TOOL_ARN__","toolSchema":{"inlinePayload":[
-  {"name":"create_doc","description":"Create a new Lark doc owned by the calling user","inputSchema":{"type":"object","properties":{"title":{"type":"string","description":"document title"},"content":{"type":"string","description":"optional initial text content"}},"required":["title"]}},
-  {"name":"edit_doc","description":"Append text content to an existing Lark doc the user can edit","inputSchema":{"type":"object","properties":{"document_id":{"type":"string"},"content":{"type":"string"}},"required":["document_id","content"]}},
-  {"name":"delete_doc","description":"Delete a Lark doc/file the user owns (moves to trash)","inputSchema":{"type":"object","properties":{"document_id":{"type":"string","description":"file token"},"type":{"type":"string","description":"docx|file|sheet…, default docx"}},"required":["document_id"]}}
-]}}}}
-JSON
-    sed -i "s|__TOOL_ARN__|$tool|" "$w_file"
-    aws bedrock-agentcore-control create-gateway-target \
-      --gateway-identifier "$gid" \
-      --name demo-doc-write \
-      --target-configuration "file://$w_file" \
-      --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]' \
-      >/dev/null && echo "  demo-doc-write target created" || echo "(target create failed — check output)"
-    rm -f "$w_file"
-  fi
+  # TODO(Phase 3): create the mcpServer target -> lark-mcp Runtime, bound to a 3LO
+  # AUTHORIZATION_CODE OAuth credential provider (the Lark shim). Endpoint must be
+  # the URL-encoded runtime ARN; outbound auth = OAUTH (not GATEWAY_IAM_ROLE, since
+  # SigV4 would occupy the Authorization header the vaulted Lark token needs).
+  echo "  gateway ready ($gid); mcpServer target + 3LO provider wired in Phase 3"
 }
 
 case "${1:-all}" in
