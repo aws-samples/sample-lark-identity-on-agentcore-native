@@ -1,0 +1,7 @@
+// Template for web-ui/config.js — copied+filled by scripts/deploy.sh --frontend
+// (apiBase from the WebUI stack output, larkAppId from .env LARK_APP_ID) and
+// uploaded to S3. The generated config.js is gitignored; edit this template only.
+window.LARK_AGENT_CONFIG = {
+  apiBase: "REPLACE_API_BASE",
+  larkAppId: "REPLACE_LARK_APP_ID",
+};

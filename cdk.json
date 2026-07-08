@@ -1,0 +1,34 @@
+{
+  "app": "uv run python app.py",
+  "watch": {
+    "include": [
+      "**"
+    ],
+    "exclude": [
+      ".dev/**",
+      ".git/**",
+      ".venv/**",
+      "web-ui/node_modules/**",
+      "cdk.out/**"
+    ]
+  },
+  "context": {
+    "account": "",
+    "region": "us-west-2",
+    "resource_prefix": "lark-agent",
+    "default_model_id": "global.anthropic.claude-sonnet-5",
+    "lark_api_domain": "https://open.larksuite.com",
+    "runtime_id": "lark_agent_agent-mw5fwNFHcd",
+    "runtime_endpoint_id": "DEFAULT",
+    "gateway_id": "lark-agent-gw-gmgxrswkhe",
+    "gateway_url": "https://lark-agent-gw-gmgxrswkhe.gateway.bedrock-agentcore.us-west-2.amazonaws.com/mcp",
+    "registration_open": false,
+    "presigned_url_expires": 300,
+    "session_idle_timeout": 1800,
+    "session_max_lifetime": 28800,
+    "cloudwatch_log_retention_days": 30,
+    "daily_token_budget": 1000000,
+    "lambda_timeout_seconds": 60,
+    "lambda_memory_mb": 256
+  }
+}
