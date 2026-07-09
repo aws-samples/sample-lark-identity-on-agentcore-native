@@ -55,16 +55,21 @@ phase2_runtime() {
   command -v agentcore >/dev/null || { echo "agentcore CLI not found: npm i -g @aws/agentcore"; exit 1; }
   export AGENTCORE_SUPPRESS_RECOMMENDATION=1
 
-  local role model pool client gw
+  local role model memory shim mcp_arn mcp_url
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
   model="$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['default_model_id'])")"
-  pool="$(cfn_out "$PREFIX-security" UserPoolId)"
-  client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
-  gw="$(uv run python -c "import json;print(json.load(open('cdk.json'))['context'].get('gateway_url',''))")"
+  memory="$(uv run python -c "import json;print(json.load(open('cdk.json'))['context'].get('memory_id',''))" 2>/dev/null)"
+  shim="$(cfn_out "$PREFIX-shim" ShimReturnUrl)"
+  # lark-cli MCP server runtime → its SigV4 MCP invocations URL (URL-encoded ARN).
+  mcp_arn="$(aws bedrock-agentcore-control list-agent-runtimes \
+    --query "agentRuntimes[?agentRuntimeName=='lark_id_mcp'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
+  mcp_url="https://bedrock-agentcore.$REGION.amazonaws.com/runtimes/$(uv run python -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$mcp_arn")/invocations?qualifier=DEFAULT"
   [ -n "$role" ] || { echo "missing execution role output — run --base first"; exit 1; }
+  [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || { echo "lark_id_mcp runtime not found — deploy the MCP server first (scripts/build-mcp.sh + create runtime)"; exit 1; }
 
   # Configure once (idempotent; writes .bedrock_agentcore.yaml). Custom Dockerfile
-  # in agent/ is respected.
+  # in agent/ is respected. Allow the agent's own execution role to fetch per-user
+  # tokens and invoke the lark-cli MCP runtime (granted out-of-band / in agentcore stack).
   if [ ! -f .bedrock_agentcore.yaml ]; then
     agentcore configure -e agent/server.py -n "${PREFIX//-/_}_agent" \
       --execution-role "$role" -dt container -p HTTP -r "$REGION" --non-interactive
@@ -72,10 +77,12 @@ phase2_runtime() {
 
   agentcore deploy --auto-update-on-conflict \
     --env "BEDROCK_MODEL_ID=$model" \
-    --env "COGNITO_USER_POOL_ID=$pool" \
-    --env "COGNITO_CLIENT_ID=$client" \
-    --env "COGNITO_PASSWORD_SECRET_ID=$PREFIX/cognito-password-secret" \
-    --env "GATEWAY_URL=$gw"
+    --env "BEDROCK_AGENTCORE_MEMORY_ID=$memory" \
+    --env "LARK_MCP_URL=$mcp_url" \
+    --env "SHIM_RETURN_URL=$shim" \
+    --env "LARK_OAUTH_PROVIDER=lark-id-3lo" \
+    --env "AGENT_WORKLOAD_NAME=lark-id-agent-wl" \
+    --env "LARK_SCOPES=drive:drive docx:document offline_access"
 
   # Persist the runtime id back into cdk.json for the dependent stacks.
   local rid
