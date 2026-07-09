@@ -119,6 +119,12 @@ def handle_token(form: dict, headers: dict) -> dict:
                    "code": form.get("code", "")}
         if form.get("redirect_uri"):
             payload["redirect_uri"] = form["redirect_uri"]
+        # PKCE: AgentCore Identity uses code_challenge on /authorize, so Lark
+        # requires the matching code_verifier here. Forward it (and passthrough
+        # code_challenge* on the off chance a caller sends them).
+        for k in ("code_verifier", "code_challenge", "code_challenge_method"):
+            if form.get(k):
+                payload[k] = form[k]
     elif grant == "refresh_token":
         payload = {"grant_type": grant, "client_id": cid, "client_secret": secret,
                    "refresh_token": form.get("refresh_token", "")}
@@ -161,13 +167,20 @@ def handle_return(qs: dict) -> dict:
     user consents on Lark; CompleteResourceTokenAuth verifies initiator==completer
     and lets Identity vault the token. Then show a static done page.
     """
+    logger.info("return qs: %s", json.dumps(qs))  # see exactly what AgentCore appends
     session_id = qs.get("session_id") or qs.get("sessionId") or qs.get("state", "")
+    # userId is carried on the returnUrl we set at GetResourceOauth2Token time (?uid=lark:...).
+    user_id = qs.get("uid", "")
     if not session_id:
-        return _resp(400, {"error": "missing session_id"})
+        return _resp(400, {"error": "missing session_id", "received": qs})
+    if not user_id:
+        return _resp(400, {"error": "missing uid on return url", "received": qs})
     try:
-        # API name/param verified against docs, not a live call — confirm the
-        # exact boto3 method + arg in Phase 3b (local boto3 predates this API).
-        _agentcore.complete_resource_token_auth(sessionUri=session_id)
+        # CompleteResourceTokenAuth needs BOTH sessionUri and a userIdentifier struct.
+        _agentcore.complete_resource_token_auth(
+            sessionUri=session_id,
+            userIdentifier={"userId": user_id},
+        )
     except Exception as e:  # noqa: BLE001
         logger.exception("CompleteResourceTokenAuth failed")
         return {"statusCode": 502, "headers": {"Content-Type": "text/html"},

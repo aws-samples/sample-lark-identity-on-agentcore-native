@@ -56,6 +56,19 @@ def test_authorization_code_success_strips_code_wrapper():
     assert "code" not in b  # the Lark envelope field must be gone
 
 
+def test_authorization_code_forwards_pkce_verifier():
+    captured = {}
+
+    def _cap(req, timeout):  # noqa: ANN001
+        captured["body"] = json.loads(req.data.decode())
+        return _fake_urlopen(200, {"code": "0", "access_token": "t", "token_type": "Bearer", "expires_in": 1})
+    with mock.patch.object(index.urllib.request, "urlopen", side_effect=_cap):
+        r = index.handler(_evt("POST", "/token",
+            body="grant_type=authorization_code&client_id=cli&client_secret=sec&code=abc&code_verifier=VERIF123"), None)
+    assert r["statusCode"] == 200
+    assert captured["body"]["code_verifier"] == "VERIF123"  # PKCE forwarded to Lark
+
+
 def test_refresh_grant_sends_refresh_body():
     captured = {}
 
@@ -121,6 +134,13 @@ def test_unsupported_grant():
 
 def test_return_url_completes_auth():
     with mock.patch.object(index, "_agentcore") as ac:
-        r = index.handler(_evt("GET", "/return", qs={"session_id": "sess-uri"}), None)
-    ac.complete_resource_token_auth.assert_called_once_with(sessionUri="sess-uri")
+        r = index.handler(_evt("GET", "/return",
+                               qs={"session_id": "sess-uri", "uid": "lark:ou_x"}), None)
+    ac.complete_resource_token_auth.assert_called_once_with(
+        sessionUri="sess-uri", userIdentifier={"userId": "lark:ou_x"})
     assert r["statusCode"] == 200 and "Authorized" in r["body"]
+
+
+def test_return_url_missing_uid():
+    r = index.handler(_evt("GET", "/return", qs={"session_id": "sess-uri"}), None)
+    assert r["statusCode"] == 400 and "uid" in r["body"]
