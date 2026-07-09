@@ -168,13 +168,14 @@ def handle_return(qs: dict) -> dict:
     and lets Identity vault the token. Then show a static done page.
     """
     logger.info("return qs: %s", json.dumps(qs))  # see exactly what AgentCore appends
-    session_id = qs.get("session_id") or qs.get("sessionId") or qs.get("state", "")
-    # userId is carried on the returnUrl we set at GetResourceOauth2Token time (?uid=lark:...).
-    user_id = qs.get("uid", "")
+    session_id = qs.get("session_id") or qs.get("sessionId", "")
+    # userId is carried via customState (echoed back as `state`) — the return URL
+    # itself must stay bare, since the workload allowlist matches it exactly.
+    user_id = qs.get("state") or qs.get("uid", "")
     if not session_id:
         return _resp(400, {"error": "missing session_id", "received": qs})
     if not user_id:
-        return _resp(400, {"error": "missing uid on return url", "received": qs})
+        return _resp(400, {"error": "missing state/uid (userId)", "received": qs})
     try:
         # CompleteResourceTokenAuth needs BOTH sessionUri and a userIdentifier struct.
         _agentcore.complete_resource_token_auth(

@@ -133,14 +133,15 @@ def test_unsupported_grant():
 
 
 def test_return_url_completes_auth():
+    # userId arrives via customState echoed back as `state`; return URL stays bare.
     with mock.patch.object(index, "_agentcore") as ac:
         r = index.handler(_evt("GET", "/return",
-                               qs={"session_id": "sess-uri", "uid": "lark:ou_x"}), None)
+                               qs={"session_id": "sess-uri", "state": "lark:ou_x"}), None)
     ac.complete_resource_token_auth.assert_called_once_with(
         sessionUri="sess-uri", userIdentifier={"userId": "lark:ou_x"})
     assert r["statusCode"] == 200 and "Authorized" in r["body"]
 
 
-def test_return_url_missing_uid():
+def test_return_url_missing_userid():
     r = index.handler(_evt("GET", "/return", qs={"session_id": "sess-uri"}), None)
-    assert r["statusCode"] == 400 and "uid" in r["body"]
+    assert r["statusCode"] == 400 and "userId" in r["body"]
