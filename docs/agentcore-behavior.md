@@ -29,3 +29,15 @@ Facts about how AgentCore Gateway and Runtime actually behave for an MCP-server 
 
 - Send `MCP-Protocol-Version: <version>` on **every** request after `initialize` (the gateway is otherwise stateless about it and falls back to an older version, 400 `-32042`).
 - Tool names are target-prefixed: `<targetName>___<toolName>`.
+
+## 3LO (per-user authorization) with a custom OAuth2 provider — the important one
+
+Registering a non-standard IdP (e.g. behind an RFC-6749 shim) yields a `CustomOauth2` credential provider. Two facts govern what works:
+
+- **The Gateway's per-user 3LO elicitation at `tools/call` does NOT fire for `CustomOauth2` providers.** When the calling user has no vaulted token, instead of the documented `-32042` elicitation (auth URL), the Gateway returns a tool result `{isError:true, "An internal error occurred. Please retry later."}` and never even calls Identity. This elicitation path is wired for built-in vendors (GithubOauth2, LinkedinOauth2 are the publicly confirmed ones) but not for `CustomOauth2`. It is an AWS-side gap (see awslabs/agentcore-samples issue #1424, closed "not planned"). A shim makes the IdP *standard*, but not a *built-in vendor* — so it cannot dodge this.
+- **The agent-side SDK path is unaffected and is the sanctioned workaround.** Driving 3LO explicitly works for `CustomOauth2`:
+  1. `GetWorkloadAccessTokenForUserId(workloadName, userId)` → workload access token (binds the end user).
+  2. `GetResourceOauth2Token(workloadIdentityToken, resourceCredentialProviderName, scopes, oauth2Flow=USER_FEDERATION, resourceOauth2ReturnUrl=...)` → if no vaulted token, returns `{authorizationUrl, sessionUri}`; if present, returns the access token.
+  The agent surfaces `authorizationUrl` to the user out-of-band (e.g. a chat message), the user consents, the browser lands on your return URL with `?session_id=<sessionUri>`, and you call `CompleteResourceTokenAuth(userIdentifier={userId:<same userId>}, sessionUri)` to vault the token. The token still lives in the managed Token Vault; only the *prompting* is agent-driven rather than Gateway-emitted. (AWS's own Entra ID 3LO workshop routes around the Gateway elicitation the same way.)
+
+- **`CompleteResourceTokenAuth` requires both `sessionUri` and `userIdentifier`** (a struct `{userId}` or `{userToken}`), and the OAuth authorization code is short-lived (~5 min) — the completion must happen automatically on the return-URL callback, not via a delayed manual step.
