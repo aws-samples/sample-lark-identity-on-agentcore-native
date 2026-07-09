@@ -35,10 +35,27 @@ Facts about how AgentCore Gateway and Runtime actually behave for an MCP-server 
 Registering a non-standard IdP (e.g. behind an RFC-6749 shim) yields a `CustomOauth2` credential provider. Two facts govern what works:
 
 - **The Gateway's per-user 3LO elicitation at `tools/call` does NOT fire for `CustomOauth2` providers.** When the calling user has no vaulted token, instead of the documented `-32042` elicitation (auth URL), the Gateway returns a tool result `{isError:true, "An internal error occurred. Please retry later."}` and never even calls Identity. This elicitation path is wired for built-in vendors (GithubOauth2, LinkedinOauth2 are the publicly confirmed ones) but not for `CustomOauth2`. It is an AWS-side gap (see awslabs/agentcore-samples issue #1424, closed "not planned"). A shim makes the IdP *standard*, but not a *built-in vendor* — so it cannot dodge this.
-- **The agent-side SDK path is unaffected and is the sanctioned workaround.** Driving 3LO explicitly works for `CustomOauth2`:
-  1. `GetWorkloadAccessTokenForUserId(workloadName, userId)` → workload access token (binds the end user).
-  2. `GetResourceOauth2Token(workloadIdentityToken, resourceCredentialProviderName, scopes, oauth2Flow=USER_FEDERATION, resourceOauth2ReturnUrl=...)` → if no vaulted token, returns `{authorizationUrl, sessionUri}`; if present, returns the access token.
-  The agent surfaces `authorizationUrl` to the user out-of-band (e.g. a chat message), the user consents, the browser lands on your return URL with `?session_id=<sessionUri>`, and you call `CompleteResourceTokenAuth(userIdentifier={userId:<same userId>}, sessionUri)` to vault the token. The token still lives in the managed Token Vault; only the *prompting* is agent-driven rather than Gateway-emitted. (AWS's own Entra ID 3LO workshop routes around the Gateway elicitation the same way.)
+- **The agent-side SDK path gets FURTHER but still cannot vault the token for `CustomOauth2`.** Driving 3LO explicitly avoids the `tools/call` elicitation gap:
+  1. `GetWorkloadAccessTokenForUserId(workloadName, userId)` → workload access token.
+  2. `GetResourceOauth2Token(workloadIdentityToken, resourceCredentialProviderName, scopes, oauth2Flow=USER_FEDERATION, resourceOauth2ReturnUrl=..., customState=userId)` → returns `{authorizationUrl, sessionUri}` when no token is vaulted.
+  This part works: the user opens the URL, the shim 302s to Lark, the user consents, Lark returns a code, and the shim's `/token` successfully exchanges it (Lark issues a real `user_access_token`). But the final **vaulting step fails**: `CompleteResourceTokenAuth(sessionUri, userIdentifier={userId})` returns `AccessDeniedException: "Invalid or expired session"`, and the token never lands in the vault. See the dedicated finding below.
+
+## FINDING: AgentCore native 3LO does not work end-to-end for a non-standard IdP (Lark) — measured
+
+**Bottom line:** Lark can only be a `CustomOauth2` provider (it is not one of AgentCore's ~24 built-in vendors), and AgentCore's native per-user 3LO token vaulting is defective for `CustomOauth2` in this account/region (2026-07). The token cannot be placed in the managed Token Vault via the documented flow. This blocks the "fully native managed Token Vault for the user token" thesis; everything else in the design works.
+
+**What works (measured):**
+- Shim translating Lark's non-standard OAuth (JSON body / `code:"0"` envelope / HTTP-200-on-error / PKCE `code_verifier`) into RFC-6749 — verified end to end: real Lark `user_access_token` returned through the shim.
+- `CustomOauth2` provider registration, Gateway `mcpServer` target (via `mcpToolSchema`), lark-mcp on Runtime, Gateway→lark-mcp forwarding (with `GATEWAY_IAM_ROLE`), per-user microVM isolation.
+- `GetResourceOauth2Token(USER_FEDERATION)` emitting the authorization URL for the custom provider.
+
+**Where it breaks (both native paths):**
+1. **Gateway-mediated (tools/call elicitation):** returns `{isError:true,"An internal error occurred"}` instead of the `-32042` elicitation — the elicitation path is wired only for built-in vendors, not `CustomOauth2` (awslabs/agentcore-samples #1424, "not planned").
+2. **Agent-driven (GetResourceOauth2Token + CompleteResourceTokenAuth):** `CompleteResourceTokenAuth` returns `AccessDeniedException "Invalid or expired session"` even though — verified — the sessionUri is byte-identical to the initiating `request_uri`, the userIdentifier is correct, PKCE `code_verifier` was forwarded (Lark issued a token), the return URL was registered on the workload identity (`UpdateWorkloadIdentity --allowed-resource-oauth2-return-urls`), the browser carried AgentCore's `session_id`/`csrf_token` (SameSite=Lax) cookies through, AgentCore's own `/identities/oauth2/callback` succeeded (redirected to our return URL), the same IAM principal initiated and completed, and it was well within the 10-min TTL. Matches the open AWS bug `aws/bedrock-agentcore-sdk-typescript#37`.
+
+**Diagnosis:** the *initiate* + *Lark token-exchange* halves are correct and ours; the *AgentCore-side session resolution / vaulting* for a `CustomOauth2` provider is the defective half — not fixable by configuration. Built-in vendors (Google/Github/etc.) take a different, working code path, but a non-standard IdP like Lark cannot be registered as one.
+
+**Consequence for the design:** for the user-token leg, fall back to a self-managed vault (Secrets Manager: store on first consent via the shim, refresh with the `refresh_token`) while keeping the rest native (shim, lark-mcp on Runtime, Gateway, per-user isolation). The managed Token Vault remains usable for any downstream that IS a built-in vendor.
 
 - **`CompleteResourceTokenAuth` requires both `sessionUri` and `userIdentifier`** (a struct `{userId}` or `{userToken}`), and the OAuth authorization code is short-lived (~5 min) — the completion must happen automatically on the return-URL callback, not via a delayed manual step.
 
