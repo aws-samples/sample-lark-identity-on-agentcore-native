@@ -133,10 +133,13 @@ def test_unsupported_grant():
 
 
 def test_return_url_completes_auth():
-    # userId arrives via customState echoed back as `state`; return URL stays bare.
+    # userId arrives via customState echoed back as `state`, base64url-encoded
+    # (AgentCore rejects ':' in state). /return decodes it back.
+    import base64
+    st = base64.urlsafe_b64encode(b"lark:ou_x").decode().rstrip("=")
     with mock.patch.object(index, "_agentcore") as ac:
         r = index.handler(_evt("GET", "/return",
-                               qs={"session_id": "sess-uri", "state": "lark:ou_x"}), None)
+                               qs={"session_id": "sess-uri", "state": st}), None)
     ac.complete_resource_token_auth.assert_called_once_with(
         sessionUri="sess-uri", userIdentifier={"userId": "lark:ou_x"})
     assert r["statusCode"] == 200 and "Authorized" in r["body"]

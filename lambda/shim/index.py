@@ -160,6 +160,15 @@ def handle_token(form: dict, headers: dict) -> dict:
     })
 
 
+def _b64url_decode(s: str) -> str:
+    """Decode a base64url userId from `state`; if it isn't valid b64url, return as-is."""
+    try:
+        pad = "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s + pad).decode()
+    except Exception:  # noqa: BLE001
+        return s
+
+
 def handle_return(qs: dict) -> dict:
     """3LO return-url: bind the completed consent to the initiating session.
 
@@ -169,9 +178,11 @@ def handle_return(qs: dict) -> dict:
     """
     logger.info("return qs: %s", json.dumps(qs))  # see exactly what AgentCore appends
     session_id = qs.get("session_id") or qs.get("sessionId", "")
-    # userId is carried via customState (echoed back as `state`) — the return URL
-    # itself must stay bare, since the workload allowlist matches it exactly.
-    user_id = qs.get("state") or qs.get("uid", "")
+    # userId is carried via customState (echoed back as `state`), base64url-encoded
+    # because AgentCore rejects ':' in state (it corrupts the requestUri validation).
+    # The return URL itself stays bare (workload allowlist is exact-match).
+    raw_state = qs.get("state") or qs.get("uid", "")
+    user_id = _b64url_decode(raw_state) if raw_state else ""
     if not session_id:
         return _resp(400, {"error": "missing session_id", "received": qs})
     if not user_id:
