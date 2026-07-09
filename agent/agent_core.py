@@ -11,11 +11,13 @@ Memory: AgentCoreMemorySessionManager with batch_size=1 persists each turn to
 Memory immediately (STM), so history survives idle-termination + a new microVM,
 and is keyed by (actor_id, session_id) — one long thread per user.
 
-Identity pass-through: the user's Cognito access token is the Bearer on the MCP
-connection, so the Gateway authorizer sees the real end-user and AgentCore
-Identity injects that user's vaulted downstream token; the agent never holds a
-downstream tool credential. The token expires (~1h), so the cached session is
-rebuilt after a TTL.
+Per-user Lark access (agent-side 3LO): for each end-user the agent fetches that
+user's vaulted Lark token from AgentCore Identity (GetResourceOauth2Token,
+USER_FEDERATION) and connects directly to the lark-mcp Runtime, passing the token
+in a custom header (the lark-mcp sidecar copies it to Authorization). If the user
+hasn't consented yet, the agent replies with the 3LO auth link instead (see
+lark_3lo.py). We drive 3LO from the agent because the Gateway does not do per-user
+3LO injection for a CustomOauth2 provider (AWS gap, agentcore-samples#1424).
 
 `run_chat` returns the final text; `stream_chat` yields text deltas.
 """
@@ -27,21 +29,17 @@ import os
 import time
 import logging
 import threading
-from datetime import timedelta
 from typing import Iterator
 
 from strands import Agent
 from strands.models import BedrockModel
-from strands.tools.mcp.mcp_client import MCPClient
-from mcp.client.streamable_http import streamablehttp_client
 
-from identity import get_user_jwt
+import lark_3lo
 
 log = logging.getLogger("agent.core")
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
 _MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
-_GATEWAY_URL = os.environ.get("GATEWAY_URL", "").rstrip("/")
 _MEMORY_ID = os.environ.get("BEDROCK_AGENTCORE_MEMORY_ID", "")
 _SYSTEM = os.environ.get(
     "AGENT_SYSTEM_PROMPT",
@@ -80,33 +78,48 @@ def _make_session_manager(actor_id: str, session_id: str):
 
 
 def _build_session(actor_id: str, email: str) -> dict:
-    """Build a fresh (agent, mcp) for a session. MCP client is entered once and
-    kept open; tools are listed once here, not per message."""
+    """Build a session for this user. Agent-side 3LO: if the user's Lark token is
+    vaulted, open an MCP client to lark-mcp (SigV4 + token in the custom header)
+    and list tools; if not, carry the auth_url so run_chat can prompt the user.
+    The MCP client is entered once and kept open for the session."""
     session_id = _session_id_for(actor_id)
     mcp = None
     tools = []
-    if _GATEWAY_URL:
-        token = get_user_jwt(actor_id, email)
-        mcp = MCPClient(lambda: streamablehttp_client(
-            _GATEWAY_URL, headers={"Authorization": f"Bearer {token}"},
-            timeout=timedelta(seconds=30),
-        ))
+    auth_url = None
+    try:
+        kind, value = lark_3lo.get_user_lark_token(actor_id)
+    except Exception as e:  # noqa: BLE001 — never crash the turn on identity hiccups
+        log.exception("3LO token lookup failed for %s", actor_id)
+        kind, value = "error", str(e)
+
+    if kind == "token":
+        mcp = lark_3lo.mcp_client_for(value)
         mcp.__enter__()  # persistent connection for the session's lifetime
         tools = mcp.list_tools_sync()
+    elif kind == "auth_url":
+        auth_url = value  # no tools this session; user must consent first
+
     agent = Agent(
         model=_model, system_prompt=_SYSTEM, tools=tools,
         session_manager=_make_session_manager(actor_id, session_id),
     )
-    return {"agent": agent, "mcp": mcp, "created": time.time()}
+    return {"agent": agent, "mcp": mcp, "created": time.time(), "auth_url": auth_url}
+
+
+_AUTH_PROMPT = (
+    "To do that I need access to your Lark account. Please authorize once here, "
+    "then send your message again:\n{url}"
+)
 
 
 def _get_session(actor_id: str, email: str) -> dict:
-    """Return the cached session for this user, rebuilding it if absent or if its
-    access token is near expiry."""
+    """Return the cached session for this user, rebuilding it if absent or near
+    token expiry. A pending-authorization session (no token yet) is NOT cached —
+    so the next turn re-checks the vault and picks up a freshly consented token."""
     session_id = _session_id_for(actor_id)
     with _lock:
         s = _sessions.get(session_id)
-        if s and (time.time() - s["created"]) < _SESSION_TTL:
+        if s and not s.get("auth_url") and (time.time() - s["created"]) < _SESSION_TTL:
             return s
         if s and s.get("mcp"):
             try:
@@ -114,21 +127,29 @@ def _get_session(actor_id: str, email: str) -> dict:
             except Exception:
                 pass
         s = _build_session(actor_id, email)
-        _sessions[session_id] = s
+        if not s.get("auth_url"):
+            _sessions[session_id] = s  # only cache authorized sessions
         return s
 
 
 def run_chat(actor_id: str, message: str, email: str = "") -> str:
-    """Non-streaming chat → assistant's final text. History via Memory."""
-    agent = _get_session(actor_id, email)["agent"]
-    return str(agent(message))
+    """Non-streaming chat → assistant's final text. History via Memory.
+    If the user hasn't authorized Lark yet, reply with the consent link instead."""
+    s = _get_session(actor_id, email)
+    if s.get("auth_url"):
+        return _AUTH_PROMPT.format(url=s["auth_url"])
+    return str(s["agent"](message))
 
 
 def stream_chat(actor_id: str, message: str, email: str = "") -> Iterator[str]:
     """Streaming chat for the WebSocket path. Yields text deltas."""
     import asyncio
 
-    agent = _get_session(actor_id, email)["agent"]
+    s = _get_session(actor_id, email)
+    if s.get("auth_url"):
+        yield _AUTH_PROMPT.format(url=s["auth_url"])
+        return
+    agent = s["agent"]
     loop = asyncio.new_event_loop()
     try:
         agen = agent.stream_async(message)

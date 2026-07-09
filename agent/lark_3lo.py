@@ -1,0 +1,99 @@
+"""Agent-side per-user 3LO for Lark + direct connection to the lark-mcp Runtime.
+
+Why this exists: the Gateway does not do per-user 3LO token injection for a
+CustomOauth2 provider (AWS gap, agentcore-samples#1424). So the agent drives 3LO
+itself against AgentCore Identity and delivers the user's vaulted Lark token to
+the lark-mcp Runtime directly, in a custom passthrough header.
+
+Flow per user (actor_id = "lark:{open_id}"):
+  1. get_user_lark_token(actor_id):
+       GetWorkloadAccessTokenForUserId → GetResourceOauth2Token(USER_FEDERATION)
+       - token vaulted  → return ("token", <lark_user_access_token>)
+       - not yet        → return ("auth_url", <url to send to the user in chat>)
+  2. with a token, mcp_client_for(token) opens an MCP client to the lark-mcp
+     Runtime over SigV4, passing the token in the custom header the sidecar
+     copies to Authorization for official lark-mcp.
+
+Non-blocking: we never poll waiting for consent. First turn returns an auth_url
+(the agent posts it to Lark chat and ends the turn); a later turn finds the
+token vaulted and proceeds.
+"""
+
+from __future__ import annotations
+
+import base64
+import os
+from datetime import timedelta
+
+import boto3
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+import httpx
+
+from mcp.client.streamable_http import streamablehttp_client
+from strands.tools.mcp.mcp_client import MCPClient
+
+_REGION = os.environ.get("AWS_REGION", "us-west-2")
+_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "lark-id-3lo")
+_WORKLOAD = os.environ.get("AGENT_WORKLOAD_NAME", "lark-id-agent-wl")
+_SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # bare, allowlisted on the workload
+_LARK_MCP_URL = os.environ.get("LARK_MCP_URL", "")        # SigV4 Runtime MCP invocations URL
+_SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
+_CUSTOM_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Lark-Token"
+
+_agentcore = boto3.client("bedrock-agentcore", region_name=_REGION)
+
+
+def _b64url(s: str) -> str:
+    return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
+
+
+def get_user_lark_token(actor_id: str) -> tuple[str, str]:
+    """Return ("token", <lark token>) if vaulted, else ("auth_url", <url>).
+
+    actor_id is "lark:{open_id}" — the same id the token was (or will be) vaulted
+    under, carried through as customState so the shim /return can complete it.
+    """
+    wat = _agentcore.get_workload_access_token_for_user_id(
+        workloadName=_WORKLOAD, userId=actor_id
+    )["workloadAccessToken"]
+    kwargs = dict(
+        workloadIdentityToken=wat,
+        resourceCredentialProviderName=_PROVIDER,
+        scopes=_SCOPES,
+        oauth2Flow="USER_FEDERATION",
+        customState=_b64url(actor_id),
+    )
+    if _SHIM_RETURN_URL:
+        kwargs["resourceOauth2ReturnUrl"] = _SHIM_RETURN_URL
+    resp = _agentcore.get_resource_oauth2_token(**kwargs)
+    if resp.get("accessToken"):
+        return "token", resp["accessToken"]
+    return "auth_url", resp["authorizationUrl"]
+
+
+class _SigV4HTTPXAuth(httpx.Auth):
+    """Sign every httpx request (incl. SSE polls) with SigV4 for bedrock-agentcore."""
+
+    def __init__(self, creds, service: str, region: str):
+        self._signer = SigV4Auth(creds, service, region)
+
+    def auth_flow(self, request: httpx.Request):
+        headers = dict(request.headers)
+        headers.pop("connection", None)  # or the server rejects on signature mismatch
+        aws_req = AWSRequest(method=request.method, url=str(request.url),
+                             data=request.content, headers=headers)
+        self._signer.add_auth(aws_req)
+        request.headers.update(dict(aws_req.headers))
+        yield request
+
+
+def mcp_client_for(lark_token: str) -> MCPClient:
+    """MCP client to the lark-mcp Runtime: SigV4 transport + Lark token in the
+    custom header (the sidecar copies it to Authorization for official lark-mcp)."""
+    creds = boto3.Session(region_name=_REGION).get_credentials()
+    auth = _SigV4HTTPXAuth(creds, "bedrock-agentcore", _REGION)
+    headers = {_CUSTOM_HEADER: lark_token}
+    return MCPClient(lambda: streamablehttp_client(
+        _LARK_MCP_URL, headers=headers, auth=auth, timeout=timedelta(seconds=60),
+    ))

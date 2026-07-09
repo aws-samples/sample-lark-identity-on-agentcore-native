@@ -1,16 +1,33 @@
-# Official Lark MCP server for AgentCore Runtime (ARM64).
-# Streamable HTTP on 0.0.0.0:8000/mcp (AgentCore MCP contract). NEVER --oauth:
-# per-request Authorization: Bearer passthrough is what carries each user's token.
-FROM public.ecr.aws/docker/library/node:20-slim
+# Lark MCP server for AgentCore Runtime (ARM64), backed by the official lark-cli
+# as a stateless per-request execution engine.
+#
+# Each tools/call reads the caller's user_access_token from a custom passthrough
+# header and spawns `lark-cli` with LARKSUITE_CLI_USER_ACCESS_TOKEN set — which
+# bypasses lark-cli's local AuthStore and calls Lark AS that user, per request.
+# (Official lark-mcp can't do this: it validates the token against a local store
+# populated only by `lark-mcp login`, rejecting externally-vaulted tokens.)
+#
+# MCP contract: streamable HTTP on 0.0.0.0:8000/mcp. No sidecar — server.js reads
+# the custom header directly. lark-cli install follows ddpie/lark-mcp-on-agentcore
+# (the `install` subcommand + ca-certificates, not plain `npm install -g`, which
+# can't fetch the binary in a clean container).
+FROM public.ecr.aws/docker/library/node:20-bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Official Lark CLI (pinned). The `install` subcommand fetches the platform binary;
+# fall back to -g. Provides `lark-cli api <method> <path>` for every Lark endpoint,
+# with per-invocation token via env var.
+ARG LARK_CLI_VERSION=1.0.68
+RUN npx -y @larksuite/cli@${LARK_CLI_VERSION} install 2>/dev/null || npm install -g @larksuite/cli@${LARK_CLI_VERSION}
+RUN npx -y skills add larksuite/cli -y -g 2>/dev/null || true
 
 WORKDIR /app
-
-# Pin the version so the (undocumented) per-request Bearer passthrough behavior is stable.
-ARG LARK_MCP_VERSION=0.5.1
-RUN npm install -g @larksuiteoapi/lark-mcp@${LARK_MCP_VERSION}
+COPY server.js /app/server.js
 
 EXPOSE 8000
 
-# app-id/app-secret come from env (APP_ID/APP_SECRET), injected at deploy.
-# --host 0.0.0.0 -p 8000 to match the Runtime contract; default tool preset.
-CMD ["sh", "-c", "lark-mcp mcp -m streamable --host 0.0.0.0 -p 8000 -a \"$APP_ID\" -s \"$APP_SECRET\""]
+# app-id/secret + brand from env; PORT defaults to 8000. Runs as PID 1.
+CMD ["node", "/app/server.js"]

@@ -18,8 +18,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 REPO="$PREFIX-mcp-server"
 ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$REPO"
-LARK_MCP_VERSION="${LARK_MCP_VERSION:-0.5.1}"
-TAG="$LARK_MCP_VERSION"
+LARK_CLI_VERSION="${LARK_CLI_VERSION:-1.0.68}"   # engine = official lark-cli (not lark-mcp)
+TAG="cli-$LARK_CLI_VERSION"
 PROJECT="$PREFIX-mcp-builder"
 SRC_BUCKET="bedrock-agentcore-codebuild-sources-$ACCOUNT-$REGION"
 CB_ROLE_NAME="$PREFIX-mcp-builder-role"
@@ -48,7 +48,7 @@ echo "  $ECR"
 log "Upload build source to S3"
 SRC_KEY="$PREFIX-mcp/source.zip"
 TMPZIP="$(mktemp -u).zip"   # -u: name only, let zip create it (zip rejects a pre-existing empty file)
-( cd mcp-server && zip -qr "$TMPZIP" Dockerfile )
+( cd mcp-server && zip -qr "$TMPZIP" . -x '*.pyc' '__pycache__/*' )  # Dockerfile + proxy.py + any other source
 aws s3 cp "$TMPZIP" "s3://$SRC_BUCKET/$SRC_KEY" >/dev/null
 rm -f "$TMPZIP"  # safe-rm-ok
 echo "  s3://$SRC_BUCKET/$SRC_KEY"
@@ -56,7 +56,7 @@ echo "  s3://$SRC_BUCKET/$SRC_KEY"
 log "Create/update CodeBuild project ($PROJECT, ARM64 native)"
 # Build the whole project definition in Python so buildspec embedding is valid JSON.
 PROJ_FILE="$(mktemp).json"
-ECR="$ECR" TAG="$TAG" LARK_MCP_VERSION="$LARK_MCP_VERSION" PROJECT="$PROJECT" \
+ECR="$ECR" TAG="$TAG" LARK_CLI_VERSION="$LARK_CLI_VERSION" PROJECT="$PROJECT" \
 SRC_BUCKET="$SRC_BUCKET" SRC_KEY="$SRC_KEY" CB_ROLE_ARN="$CB_ROLE_ARN" \
 python3 <<'PY' > "$PROJ_FILE"
 import json, os
@@ -70,7 +70,7 @@ buildspec = "\n".join([
     f"      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin {ecr}",
     "  build:",
     "    commands:",
-    f"      - docker build --build-arg LARK_MCP_VERSION={e['LARK_MCP_VERSION']} -t {ecr}:{tag} .",
+    f"      - docker build --build-arg LARK_CLI_VERSION={e['LARK_CLI_VERSION']} -t {ecr}:{tag} .",
     "  post_build:",
     "    commands:",
     f"      - docker push {ecr}:{tag}",
