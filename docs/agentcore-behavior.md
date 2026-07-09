@@ -41,3 +41,22 @@ Registering a non-standard IdP (e.g. behind an RFC-6749 shim) yields a `CustomOa
   The agent surfaces `authorizationUrl` to the user out-of-band (e.g. a chat message), the user consents, the browser lands on your return URL with `?session_id=<sessionUri>`, and you call `CompleteResourceTokenAuth(userIdentifier={userId:<same userId>}, sessionUri)` to vault the token. The token still lives in the managed Token Vault; only the *prompting* is agent-driven rather than Gateway-emitted. (AWS's own Entra ID 3LO workshop routes around the Gateway elicitation the same way.)
 
 - **`CompleteResourceTokenAuth` requires both `sessionUri` and `userIdentifier`** (a struct `{userId}` or `{userToken}`), and the OAuth authorization code is short-lived (~5 min) — the completion must happen automatically on the return-URL callback, not via a delayed manual step.
+
+## Built-in OAuth2 vendors vs CustomOauth2 — which downstream systems need the shim + agent-side workaround
+
+`create-oauth2-credential-provider` accepts a `credentialProviderVendor`. The full set (from the control-plane API schema) is 24 built-in vendors plus `CustomOauth2`:
+
+`GoogleOauth2, GithubOauth2, SlackOauth2, SalesforceOauth2, MicrosoftOauth2, AtlassianOauth2, LinkedinOauth2, XOauth2, OktaOauth2, OneLoginOauth2, PingOneOauth2, FacebookOauth2, YandexOauth2, RedditOauth2, ZoomOauth2, TwitchOauth2, SpotifyOauth2, DropboxOauth2, NotionOauth2, HubspotOauth2, CyberArkOauth2, FusionAuthOauth2, Auth0Oauth2, CognitoOauth2` — and `CustomOauth2`.
+
+Two things vary across them, and they are independent:
+
+**Integration depth (from the config schema):** only seven have a dedicated config sub-key with endpoints baked in — Google, Github, Slack, Salesforce, Microsoft, Atlassian, Linkedin (you supply just client id/secret). The rest of the built-ins (Okta, PingOne, Auth0, Zoom, Notion, …) use `includedOauth2ProviderConfig`, where you still supply the `authorizationEndpoint`/`tokenEndpoint`/`issuer` yourself. `CustomOauth2` is fully self-described (via `authorizationServerMetadata` or a discovery URL).
+
+**Whether Gateway per-user `-32042` elicitation works (the thing that matters for end-user 3LO):**
+- **Publicly confirmed working:** `GithubOauth2`, `LinkedinOauth2` (AWS samples/workshops).
+- **Confirmed NOT working:** `CustomOauth2` (issue #1424).
+- **Listed but unverified in public material:** the other 22 built-ins — very likely fine (the gap is `CustomOauth2`-specific), but not proven; verify per-vendor before relying on it.
+
+**Routing guidance for adding a downstream business system:**
+- If the system is a built-in vendor (Salesforce, Microsoft/M365, Atlassian/Jira, Slack, Zoom, HubSpot, Okta, Google, …), register it directly as that vendor — no shim needed, and the Gateway-native 3LO likely works (verify the elicitation once).
+- If it is NOT one of the built-ins (e.g. **Lark/Feishu**, and most China-region or in-house IdPs), it must be `CustomOauth2` — which means: (a) if its OAuth is non-standard, front it with an RFC-6749 shim to register at all; and (b) drive 3LO agent-side (`GetResourceOauth2Token`), because Gateway `tools/call` elicitation won't fire. This project's Lark path is the reference implementation of that "non-built-in IdP" pattern.
