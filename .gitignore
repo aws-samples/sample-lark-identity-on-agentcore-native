@@ -16,6 +16,7 @@ node_modules/
 # AgentCore Starter Toolkit
 .bedrock_agentcore.yaml
 .bedrock_agentcore/
+.agentcore.json
 
 # Local
 *.log
