@@ -56,10 +56,11 @@ async def handle_invocations(request: web.Request) -> web.Response:
         if not message:
             return web.json_response({"error": "message required"}, status=400)
         try:
-            reply = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.run_chat, actor_id, message, email
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, agent_core.chat_result, actor_id, message, email
             )
-            return web.json_response({"reply": reply})
+            # {reply, needs_auth, auth_url?} — router drives the consent wait.
+            return web.json_response(result)
         except Exception as e:
             log.exception("chat failed")
             # Return 200: AgentCore wraps non-2xx as RuntimeClientError and drops

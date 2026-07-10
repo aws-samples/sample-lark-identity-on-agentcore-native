@@ -177,6 +177,42 @@ def send_message(receive_id: str, text: str, receive_id_type: str = "chat_id") -
     return ok
 
 
+def send_link_message(receive_id: str, text: str, link_text: str, url: str,
+                       receive_id_type: str = "chat_id") -> bool:
+    """Send a rich-text (post) message: `text` followed by a clickable `link_text`
+    hyperlink, so the user sees "点击授权" instead of a long raw URL."""
+    token = get_tenant_token()
+    if not token:
+        log.error("cannot send: no tenant token")
+        return False
+
+    api = f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
+    # post content: zh_cn locale, one paragraph = [text run, link run].
+    post = {"zh_cn": {"content": [[
+        {"tag": "text", "text": (text + " ") if text else ""},
+        {"tag": "a", "text": link_text, "href": url},
+    ]]}}
+    body = json.dumps({
+        "receive_id": receive_id,
+        "msg_type": "post",
+        "content": json.dumps(post),  # content is a JSON string
+    }).encode()
+    try:
+        req = urllib.request.Request(api, data=body, method="POST", headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {token}",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+        if result.get("code") != 0:
+            log.error("send_link_message error: %s", result)
+            return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.error("send_link_message failed: %s", e)
+        return False
+
+
 def download_image(image_key: str) -> tuple[bytes | None, str | None]:
     """Download an image resource by key. Returns (bytes, content_type) or (None, None)."""
     token = get_tenant_token()

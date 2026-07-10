@@ -17,37 +17,40 @@ This is the **AgentCore Identity** variant: per-user Lark tokens live in the **A
                               │   :8080  /ping  /invocations(POST)            │
                               │   Strands Agent + AgentCore Memory (per-user) │
                               └───────────────────────┬───────────────────────┘
-                                        │ MCP call, Bearer = user's Cognito ACCESS token
+                          agent-side 3LO: fetch THIS user's │ token from the vault
                                         ▼
                               ┌───────────────────────┐   ┌─────────────────────────┐
-                              │   AgentCore Gateway   │◀──┤   AgentCore Identity    │
-                              │  customJWTAuthorizer  │   │  Token Vault (3LO):     │
-                              │   (Cognito, inbound)  │   │  stores / refreshes /   │
-                              └───────────┬───────────┘   │  injects THIS user's    │
-                                          │ per-user      │  Lark user_access_token │
-                                          │ token injected└────────────┬────────────┘
+                              │  agent_core.lark_3lo  │◀──┤   AgentCore Identity    │
+                              │ GetResourceOauth2Token│   │  Token Vault (3LO):     │
+                              │  (USER_FEDERATION)    │   │  stores / refreshes /   │
+                              └───────────┬───────────┘   │  THIS user's            │
+                                          │ SigV4 + token │  Lark user_access_token │
+                                          │ in custom hdr └────────────┬────────────┘
                                           ▼                            │ RFC-6749 token calls
                               ┌───────────────────────┐   ┌────────────▼────────────┐
-                              │    Lark MCP server    │   │     Lark OAuth shim     │
+                              │   Lark MCP server     │   │     Lark OAuth shim     │
                               │  (AgentCore Runtime,  │   │  (Lambda + API GW)      │
-                              │    mcpServer target)  │   │  form ⇄ JSON translate, │
+                              │   lark-cli engine)    │   │  form ⇄ JSON translate, │
                               └───────────┬───────────┘   │  code!=0 → 4xx          │
-                                          │ HTTPS, Bearer └────────────┬────────────┘
-                                          │ = user_access_token        │ JSON, code:0 envelope
+                                          │ lark-cli as   └────────────┬────────────┘
+                                          │ user_access_token          │ JSON, code:0 envelope
                                           ▼                            ▼
                               ┌─────────────────────────────────────────────────────┐
                               │  Lark REST API  →  returns only what THIS user can  │
                               └─────────────────────────────────────────────────────┘
 
-  Identity: every message resolves to  lark:{open_id}  (Cognito JWT minted by the agent).
-  First-time consent: no vaulted token yet → the Gateway answers the tool call with an
-  MCP elicitation (-32042) carrying an authorization URL → the agent sends that URL as a
-  chat message → the user authorizes on Lark's own consent page (via the shim) → Identity
-  vaults the token → the retried call succeeds. Later calls inject silently; the agent
-  never holds the Lark token.
-```
+  Identity: every message resolves to  lark:{open_id}.
+  First-time consent (consent-wait): agent has no vaulted token → returns needs_auth +
+  authorization URL → the router posts it as a clickable "点击授权" rich-text link, then
+  holds and polls the vault (up to AUTH_WAIT_SECONDS) → the user authorizes on Lark's
+  own consent page (via the shim) → Identity vaults the token → the router re-invokes the
+  agent with the same message, so the user gets the answer WITHOUT re-sending. Later
+  turns fetch the token silently; the agent never holds it long-term.
 
-Status: being converted from the interceptor baseline — see the phase plan below. The interceptor's Lambda-target tools still exist transitionally and are replaced by the MCP server + Token Vault in Phases 1–3.
+  Note: the Gateway does NOT do per-user 3LO for a CustomOauth2 provider (AWS gap,
+  agentcore-samples#1424), so this variant drives 3LO agent-side rather than via a
+  Gateway mcpServer target. See docs/agentcore-behavior.md.
+```
 
 ## Layout
 

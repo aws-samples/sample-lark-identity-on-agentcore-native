@@ -35,6 +35,7 @@ class RouterStack(Stack):
         runtime_arn: str,
         runtime_endpoint_qualifier: str,
         lark_secret_name: str,
+        shim_return_url: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -89,6 +90,11 @@ class RouterStack(Stack):
                 "LARK_API_DOMAIN": lark_api_domain,
                 "REGISTRATION_OPEN": registration_open,
                 "SELF_FUNCTION_NAME": fn_name,
+                # 3LO consent-wait: poll the vault so the user needn't re-send.
+                "LARK_OAUTH_PROVIDER": "lark-id-3lo",
+                "AGENT_WORKLOAD_NAME": f"{prefix}-agent-wl",
+                "LARK_SCOPES": "drive:drive docx:document offline_access",
+                "SHIM_RETURN_URL": shim_return_url,
             },
             log_group=log_group,
         )
@@ -137,7 +143,24 @@ class RouterStack(Stack):
         self.router_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
-                resources=[f"arn:aws:secretsmanager:{region}:{account}:secret:{prefix}/*"],
+                resources=[
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:{prefix}/*",
+                    # Identity-managed OAuth provider secret (for the vault check below).
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:bedrock-agentcore-identity!default/oauth2/*",
+                ],
+            )
+        )
+        # 3LO consent-wait: check the vault for the user's Lark token (same
+        # USER_FEDERATION sequence the agent uses) so the router can hold and
+        # re-invoke once consent completes, sparing the user a re-send.
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+                    "bedrock-agentcore:GetWorkloadAccessToken",
+                    "bedrock-agentcore:GetResourceOauth2Token",
+                ],
+                resources=["*"],
             )
         )
 

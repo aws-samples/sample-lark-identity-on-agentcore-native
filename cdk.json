@@ -26,7 +26,7 @@
     "session_max_lifetime": 28800,
     "cloudwatch_log_retention_days": 30,
     "daily_token_budget": 1000000,
-    "lambda_timeout_seconds": 60,
+    "lambda_timeout_seconds": 90,
     "lambda_memory_mb": 256
   }
 }

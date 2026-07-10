@@ -42,7 +42,9 @@ lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 
 # ------------------------------- invoke agent -------------------------------
 
-def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str) -> str:
+def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str) -> dict:
+    """Invoke the agent once. Returns the parsed response dict
+    {reply, needs_auth, auth_url?} (or {reply:<raw>} on non-JSON)."""
     payload = json.dumps({
         "action": "chat", "userId": user_id, "actorId": actor_id,
         "channel": "lark", "message": message,
@@ -56,8 +58,58 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str) -> 
     try:
         data = json.loads(raw)
     except Exception:
-        return raw or ""
-    return data.get("reply", data.get("error", ""))
+        return {"reply": raw or ""}
+    if "reply" not in data and "error" in data:
+        data["reply"] = data["error"]
+    return data
+
+
+# ------------------------------- consent wait -------------------------------
+
+# How long the async Lambda holds, waiting for the user to finish 3LO consent.
+# Bounded by the Lambda timeout (see the agentcore read_timeout above); on
+# timeout we fall back to "send your message again".
+AUTH_WAIT_SECONDS = int(os.environ.get("AUTH_WAIT_SECONDS", "45"))
+AUTH_POLL_INTERVAL = float(os.environ.get("AUTH_POLL_INTERVAL", "2"))
+LARK_OAUTH_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "lark-id-3lo")
+AGENT_WORKLOAD_NAME = os.environ.get("AGENT_WORKLOAD_NAME", "lark-id-agent-wl")
+LARK_SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
+SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # required by GetResourceOauth2Token
+
+
+def user_token_vaulted(actor_id: str) -> bool:
+    """True once the user's Lark token is in the Token Vault (consent complete).
+    Same USER_FEDERATION sequence the agent uses; here we only check presence.
+    ResourceOauth2ReturnUrl is required even for a presence check — without a
+    valid token AgentCore refuses the call rather than returning empty."""
+    try:
+        wat = agentcore.get_workload_access_token_for_user_id(
+            workloadName=AGENT_WORKLOAD_NAME, userId=actor_id
+        )["workloadAccessToken"]
+        kwargs = dict(
+            workloadIdentityToken=wat,
+            resourceCredentialProviderName=LARK_OAUTH_PROVIDER,
+            scopes=LARK_SCOPES,
+            oauth2Flow="USER_FEDERATION",
+        )
+        if SHIM_RETURN_URL:
+            kwargs["resourceOauth2ReturnUrl"] = SHIM_RETURN_URL
+        resp = agentcore.get_resource_oauth2_token(**kwargs)
+        return bool(resp.get("accessToken"))
+    except Exception:
+        logger.exception("vault check failed for %s", actor_id)
+        return False
+
+
+def wait_for_consent(actor_id: str) -> bool:
+    """Poll the vault until the token appears or AUTH_WAIT_SECONDS elapses."""
+    import time
+    deadline = time.monotonic() + AUTH_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if user_token_vaulted(actor_id):
+            return True
+        time.sleep(AUTH_POLL_INTERVAL)
+    return False
 
 
 # ------------------------------- async processing ---------------------------
@@ -127,7 +179,24 @@ def process_lark_event(body: str, headers: dict) -> None:
     session_id = identity.get_or_create_session(user_id)
     logger.info("invoking agent: session=%s msg=%r", session_id, agent_message[:80])
     try:
-        reply = invoke_agent(session_id, user_id, actor_id, agent_message)
+        result = invoke_agent(session_id, user_id, actor_id, agent_message)
+        # First-use 3LO: post the consent link, then hold and poll the vault so
+        # the user gets an answer without re-sending (bounded by AUTH_WAIT_SECONDS).
+        if result.get("needs_auth"):
+            auth_url = result.get("auth_url")
+            if auth_url:
+                lark.send_link_message(
+                    chat_id, "需要访问你的 Lark 账号，请先授权：", "点击授权", auth_url)
+            else:  # no structured url — fall back to the agent's text
+                lark.send_message(chat_id, result.get("reply", ""))
+            logger.info("awaiting consent for %s (<= %ds)", actor_id, AUTH_WAIT_SECONDS)
+            if wait_for_consent(actor_id):
+                logger.info("consent complete for %s; re-invoking", actor_id)
+                result = invoke_agent(session_id, user_id, actor_id, agent_message)
+            else:
+                logger.info("consent wait timed out for %s", actor_id)
+                return  # link already sent; user finishes later and re-sends
+        reply = result.get("reply", "")
     except Exception as e:  # noqa: BLE001
         logger.exception("agent invocation failed")
         reply = f"Sorry, something went wrong: {e}"

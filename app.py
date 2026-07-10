@@ -52,6 +52,16 @@ agentcore = AgentCoreStack(
     env=env,
 )
 
+# --- Shim: Lark OAuth RFC-6749 façade + 3LO return-url ---
+# Created before the router so the router can consume its return_url for the
+# consent-wait vault check.
+shim = ShimStack(
+    app,
+    f"{prefix}-shim",
+    lark_api_domain=ctx("lark_api_domain") or "https://open.larksuite.com",
+    env=env,
+)
+
 # --- Router: Lark webhook ingestion (HTTP API + Lambda + DynamoDB identity) ---
 router = RouterStack(
     app,
@@ -59,19 +69,12 @@ router = RouterStack(
     runtime_arn=agentcore.runtime_arn,
     runtime_endpoint_qualifier=ctx("runtime_endpoint_id") or "DEFAULT",
     lark_secret_name=security.lark_secret.secret_name,
+    shim_return_url=shim.return_url,
     env=env,
 )
 
 # --- Gateway: demo tool Lambda + Gateway IAM (mcpServer target wired in Phase 3) ---
 gateway = GatewayStack(app, f"{prefix}-gateway", env=env)
-
-# --- Shim: Lark OAuth RFC-6749 façade + 3LO return-url ---
-shim = ShimStack(
-    app,
-    f"{prefix}-shim",
-    lark_api_domain=ctx("lark_api_domain") or "https://open.larksuite.com",
-    env=env,
-)
 
 # --- Observability: dashboard + alarms ---
 observability = ObservabilityStack(app, f"{prefix}-observability", env=env)

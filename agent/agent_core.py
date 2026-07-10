@@ -132,13 +132,21 @@ def _get_session(actor_id: str, email: str) -> dict:
         return s
 
 
-def run_chat(actor_id: str, message: str, email: str = "") -> str:
-    """Non-streaming chat → assistant's final text. History via Memory.
-    If the user hasn't authorized Lark yet, reply with the consent link instead."""
+def chat_result(actor_id: str, message: str, email: str = "") -> dict:
+    """Non-streaming chat → {reply, needs_auth, auth_url}. History via Memory.
+    When the user hasn't authorized Lark yet, needs_auth is True and auth_url is
+    the raw consent URL, so the caller (router) can drive the wait-for-consent
+    loop instead of asking the user to re-send."""
     s = _get_session(actor_id, email)
     if s.get("auth_url"):
-        return _AUTH_PROMPT.format(url=s["auth_url"])
-    return str(s["agent"](message))
+        return {"reply": _AUTH_PROMPT.format(url=s["auth_url"]),
+                "needs_auth": True, "auth_url": s["auth_url"]}
+    return {"reply": str(s["agent"](message)), "needs_auth": False}
+
+
+def run_chat(actor_id: str, message: str, email: str = "") -> str:
+    """Back-compat: assistant's final text (or the consent prompt)."""
+    return chat_result(actor_id, message, email)["reply"]
 
 
 def stream_chat(actor_id: str, message: str, email: str = "") -> Iterator[str]:

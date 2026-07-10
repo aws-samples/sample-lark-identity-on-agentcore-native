@@ -61,6 +61,7 @@ class ShimStack(Stack):
         self.http_api.add_routes(path="/return", methods=[apigwv2.HttpMethod.GET], integration=integration)
 
         base = (self.http_api.url or "").rstrip("/")
+        self.return_url = f"{base}/return"  # consumed by the router (consent-wait)
         CfnOutput(self, "ShimIssuer", value=base)
         CfnOutput(self, "ShimAuthorizeUrl", value=f"{base}/authorize")
         CfnOutput(self, "ShimTokenUrl", value=f"{base}/token")
