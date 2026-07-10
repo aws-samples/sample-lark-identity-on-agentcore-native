@@ -91,12 +91,14 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # Secrets read — Cognito password salt + Lark creds.
+        # Secrets read — Cognito password salt + Lark creds, plus the OAuth provider secret AgentCore Identity vaults per credential provider.
+        # GetResourceOauth2Token reads that managed secret AS the caller, so the execution role needs GetSecretValue on it (name: bedrock-agentcore-identity!default/oauth2/*).
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
                 resources=[
                     f"arn:aws:secretsmanager:{region}:{account}:secret:{prefix}/*",
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:bedrock-agentcore-identity!default/oauth2/*",
                 ],
             )
         )
