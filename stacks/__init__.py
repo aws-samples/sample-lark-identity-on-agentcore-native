@@ -67,6 +67,14 @@ def _copy(src: str, dst: str) -> None:
     shutil.copy2(src, dst)
 
 
+# Docker-bundling fallback: copy sources, then pip-install requirements if present.
+_BUNDLE_CMD = (
+    "cp -r /asset-input/*.py /asset-output/ 2>/dev/null || true; "
+    "if [ -f /asset-input/requirements.txt ]; then "
+    "pip install -r /asset-input/requirements.txt -t /asset-output; fi"
+)
+
+
 def lambda_asset(source_dir: str) -> _lambda.AssetCode:
     """Bundle a Lambda source dir (source + pip deps) into an asset.
 
@@ -78,11 +86,6 @@ def lambda_asset(source_dir: str) -> _lambda.AssetCode:
         bundling=BundlingOptions(
             image=DockerImage.from_registry("public.ecr.aws/sam/build-python3.13:latest"),
             local=_UvLocalBundling(source_dir),
-            command=[
-                "bash", "-c",
-                "cp -r /asset-input/*.py /asset-output/ 2>/dev/null || true; "
-                "if [ -f /asset-input/requirements.txt ]; then "
-                "pip install -r /asset-input/requirements.txt -t /asset-output; fi",
-            ],
+            command=["bash", "-c", _BUNDLE_CMD],
         ),
     )

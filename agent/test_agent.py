@@ -70,7 +70,7 @@ def test_ensure_user_email_sanitizes_colon():
 
 def test_session_id_deterministic_per_user():
     """Load just the _session_id_for function without importing the heavy deps."""
-    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py")).read()
+    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
     ns = {"hashlib": hashlib}
     # exec only the function definition we care about
     start = src.index("def _session_id_for")

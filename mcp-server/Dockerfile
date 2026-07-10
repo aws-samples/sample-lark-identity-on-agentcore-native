@@ -29,5 +29,14 @@ COPY server.js /app/server.js
 
 EXPOSE 8000
 
+# Run as a non-root user (least privilege). HOME must be writable for lark-cli.
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser /app
+USER appuser
+ENV HOME=/home/appuser
+
+# Liveness: any GET returns 200 "ok" (server.js). curl is installed above.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8000/ || exit 1
+
 # app-id/secret + brand from env; PORT defaults to 8000. Runs as PID 1.
 CMD ["node", "/app/server.js"]

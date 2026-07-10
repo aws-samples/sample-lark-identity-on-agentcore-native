@@ -100,6 +100,7 @@ def decrypt_event(encrypted: str) -> dict | None:
         cipher_bytes = base64.b64decode(encrypted)
         key = hashlib.sha256(encrypt_key.encode()).digest()  # 32-byte AES-256 key
         iv, ct = cipher_bytes[:16], cipher_bytes[16:]
+        # nosemgrep: crypto-mode-without-authentication -- AES-CBC is Lark's fixed webhook scheme; authenticity is enforced by verify_signature upstream
         decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
         padded = decryptor.update(ct) + decryptor.finalize()
         pad = padded[-1]

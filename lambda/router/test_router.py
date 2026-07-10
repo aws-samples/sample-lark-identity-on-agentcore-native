@@ -6,7 +6,6 @@ Env is set before importing modules so boto3 clients construct without error;
 AWS calls are mocked.
 """
 
-import base64
 import hashlib
 import json
 import os
@@ -22,21 +21,16 @@ os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "arn:aws:bedrock-agentcore:us-wes
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # noqa: E402
-
 ENCRYPT_KEY = "test-encrypt-key"
 
-
-def _lark_encrypt(plaintext: str, key_str: str = ENCRYPT_KEY) -> str:
-    """Reproduce Lark's AES-256-CBC framing: sha256(key) key, IV prepended, PKCS#7."""
-    key = hashlib.sha256(key_str.encode()).digest()
-    iv = b"0123456789abcdef"
-    data = plaintext.encode()
-    pad = 16 - (len(data) % 16)
-    data += bytes([pad]) * pad
-    enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
-    ct = enc.update(data) + enc.finalize()
-    return base64.b64encode(iv + ct).decode()
+# Golden ciphertext: Lark's AES-256-CBC webhook framing (key=sha256(ENCRYPT_KEY),
+# IV "0123456789abcdef" prepended, PKCS#7) of the payload below. Precomputed so the
+# test never constructs a cipher itself — it exercises the production decrypt path
+# against a fixed, real-format payload.
+_GOLDEN_EVENT = {"type": "url_verification", "challenge": "abc123"}
+_GOLDEN_CIPHERTEXT = (
+    "MDEyMzQ1Njc4OWFiY2RlZjTCy6xCTjl4LV6d/+dDtlSdzPmqcTkTl1iyYaHzzRk+H4NOv2+gZhM3z9/EBitHGNigsYuEJZ1EgAioJmTx0ps="
+)
 
 
 @pytest.fixture
@@ -49,9 +43,7 @@ def lark_mod():
 
 
 def test_decrypt_event_roundtrip(lark_mod):
-    payload = {"type": "url_verification", "challenge": "abc123"}
-    enc = _lark_encrypt(json.dumps(payload))
-    assert lark_mod.decrypt_event(enc) == payload
+    assert lark_mod.decrypt_event(_GOLDEN_CIPHERTEXT) == _GOLDEN_EVENT
 
 
 def test_verify_signature_valid(lark_mod):
