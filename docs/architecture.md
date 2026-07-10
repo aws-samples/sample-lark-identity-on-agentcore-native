@@ -20,50 +20,41 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
 | AgentCore Memory | Per-user short-term memory (conversation history), keyed by `(actor_id, session)` | `lark_agent_agent_mem` (STM) |
 
-## Two entrypoints, one identity
+## One entrypoint, one identity
+
+> **Status (2026-07): this variant is chat-only and drives 3LO agent-side.** There is no web UI, no Cognito, and no Gateway on the tool path — the Gateway can't do per-user 3LO for a CustomOauth2 provider (AWS gap, agentcore-samples#1424), so the agent fetches each user's token from the Token Vault itself and calls a lark-cli MCP server directly. The sections below marked *(legacy)* still describe the interceptor/Gateway/web-UI baseline and are being updated.
 
 ```
-  Lark message  ────▶  Router Lambda ─┐        Lark desktop web UI ──▶ SPA (S3/CloudFront)
-  (bot chat)           verify/decrypt  │          h5sdk requestAccess ─▶ login code
-                       resolve user    │                                  │
-                                       │                                  ▼
-                                       │                        web_api Lambda
-                                       │      POST /api/lark/auth  code ─▶ Cognito JWT (Lark is IdP)
-                                       │                          + store user_access_token (Secrets Manager)
-                                       │      POST /api/session    JWT  ─▶ presigned WSS URL
-                                       │                                  │
-             InvokeAgentRuntime (SigV4)│                                  │ browser opens WSS
-             payload carries actorId   ▼                                  ▼ (platform bridges to /ws:8080)
+  Lark message  ────▶  Router Lambda ──────────┐
+  (bot chat)           verify/decrypt          │  first-use 3LO (consent-wait):
+                       resolve user             │  post "点击授权" link, poll the vault,
+                       InvokeAgentRuntime SigV4 │  then re-invoke — no re-send
+                       payload carries actorId  ▼
                              ┌─────────────────────────────────────────────────────┐
                              │  Agent container (ARM64, AgentCore Runtime)          │
                              │    Strands agent + AgentCore Memory (per-user STM)   │
-                             └───────────────────────┬─────────────────────────────┘
-                                       │ MCP (streamable HTTP), Bearer = user's Cognito ACCESS token
-                                       ▼
+                             │    lark_3lo: GetResourceOauth2Token(USER_FEDERATION) │◀── AgentCore Identity
+                             └───────────────────────┬─────────────────────────────┘     Token Vault (3LO):
+                                       │ MCP (streamable HTTP), SigV4               │     stores/refreshes THIS
+                                       │ + user's Lark token in a custom header     │     user's user_access_token
+                                       ▼                                            │     (shim ⇄ Lark OAuth)
                              ┌───────────────────┐
-                             │ AgentCore Gateway │  MCP server; customJWTAuthorizer (Cognito, allowedClients)
-                             │  + Interceptor λ  │  passRequestHeaders=true; injects end-user identity into the call
-                             └─────────┬─────────┘
-                                       │ Gateway invokes its Lambda target (IAM role)
-                                       ▼
-                             ┌───────────────────┐
-                             │   Tool Lambda     │  whoami / list_my_docs
-                             │                   │  list_my_docs: load THIS user's Lark user_access_token
-                             │                   │  (Secrets Manager, by open_id) + refresh if expired
-                             └─────────┬─────────┘
+                             │  Lark MCP server  │  AgentCore Runtime; lark-cli engine.
+                             │  (lark-cli)       │  Reads the custom header, runs lark-cli
+                             └─────────┬─────────┘  AS the user (LARKSUITE_CLI_USER_ACCESS_TOKEN).
                                        │ HTTPS, Authorization: Bearer <user_access_token>
                                        ▼
-                                  Lark REST API (GET /open-apis/drive/v1/files)
+                                  Lark REST API
                                   → returns only what THIS user can see. Lark adjudicates.
 ```
 
-Both `lark:{open_id}` from the webhook and from the web UI are the same person, so session, memory, and the stored Lark token are shared across entrypoints.
+Identity is `lark:{open_id}` for every message; session, memory, and the vaulted Lark token are keyed by it.
 
-## Why Lark is wrapped in Cognito
+## Why Lark is wrapped in Cognito *(legacy — this variant has no Cognito/web UI)*
 
 Lark is **not** a standard OIDC provider (no `id_token`, no discovery endpoint), so its login can't be plugged straight into an AgentCore/API-Gateway JWT authorizer. `web_api` performs a token exchange: Lark login code → Lark user info → Cognito `AdminCreateUser`/`AdminInitiateAuth` → a standard Cognito JWT (username = `lark:{open_id}`). Downstream, everything validates a normal Cognito JWT.
 
-## The Gateway → Lark path (a common point of confusion)
+## The Gateway → Lark path (a common point of confusion) *(legacy — no Gateway on this variant's tool path)*
 
 The Gateway does **not** talk to Lark directly. Its target is a **Lambda**. The chain is:
 
@@ -74,7 +65,9 @@ agent  ──MCP──▶  AgentCore Gateway  ──invoke (IAM)──▶  Tool 
 
 Lark is a plain REST API at the bottom, not an MCP server. The Lambda target exists because "look up this user's token, refresh it if expired, then call Lark" is per-user logic that needs somewhere to run — an OpenAPI target pointed straight at Lark couldn't manage per-user tokens.
 
-## Auth at every hop
+## Auth at every hop *(legacy — the Gateway/Cognito/WSS hops don't exist on this variant)*
+
+On this variant the hops are: Lark webhook → Router (signature+AES); Router → Runtime (IAM SigV4); Agent → lark-cli MCP Runtime (IAM SigV4 + user's Lark token in a custom passthrough header); lark-cli → Lark REST (Bearer = user_access_token, scoped by Lark to that user). The legacy table below describes the interceptor baseline.
 
 | Hop | Credential | Who verifies |
 |---|---|---|
@@ -97,7 +90,7 @@ Note the deliberate split: the Runtime uses SigV4 inbound (so the webhook + web 
 
 The agent is a Strands agent with an `AgentCoreMemorySessionManager` (STM) keyed by `(actor_id, session)`, `session_id` derived from `actor_id` — one long thread per user. History persists across reconnects and both entrypoints (30-day retention), independent of the microVM. Per-session `(agent, MCP client)` are cached and reused across messages (rebuilding per message re-handshakes the Gateway and re-lists tools, ~15–20s of avoidable latency).
 
-## Sequence: a web-UI turn that reads the user's docs
+## Sequence: a web-UI turn that reads the user's docs *(legacy — no web UI; see the consent-wait flow above)*
 
 ```mermaid
 sequenceDiagram
@@ -137,4 +130,4 @@ sequenceDiagram
 
 ## Deploy shape
 
-Six CDK stacks (security, agentcore, router, webui, gateway, observability). The AgentCore **Runtime** and **Gateway** have no CloudFormation resources in this region, so `scripts/deploy.sh` creates them out-of-band: the Runtime image is built ARM64 via the AgentCore CLI (CodeBuild), the Gateway + interceptor + tool targets via the control-plane CLI; their ids are fed back into `cdk.json`. See `README.md` for the deploy commands and Lark console setup, and `.dev/TIMEOUTS.md` (working notes) for the connection/timeout details.
+CDK stacks: security, agentcore, router, shim, gateway, observability. On this variant the tool path is agent-side 3LO, so the gateway stack is reduced to its service role (no mcpServer target); the shim stack (Lark OAuth RFC-6749 façade + 3LO return-url) is what the 3LO flow actually uses. Two AgentCore **Runtimes** (the agent and the lark-cli MCP server) have no CloudFormation resources in this region, so `scripts/deploy.sh` builds them out-of-band: ARM64 images via CodeBuild, runtimes created via the AgentCore CLI / control-plane; ids fed back into `cdk.json`. See `README.md` for the deploy commands and Lark console setup.
