@@ -99,6 +99,32 @@ Deletes in dependency order — Gateway + targets → both CLI-created Runtimes 
 scripts/test.sh              # agent + router unit suites
 ```
 
+## Cost
+
+This deploys billable AWS resources. All the always-on pieces are consumption- or per-unit-priced (no fixed reservation), so an idle single-user demo in us-west-2 is on the order of a couple USD/month before model usage; the variable cost is dominated by the agent's Bedrock calls. Verify current rates on the AWS pricing pages — figures below are as researched, not a quote.
+
+- **Bedrock model invocations** — the main usage-sensitive line; priced per input/output token on the model in `default_model_id`. A chatty demo is cents-to-dollars; a load test is not.
+- **AgentCore Runtime ×2** — this variant runs **two** Runtimes (the agent and the lark-cli MCP server), each metered per-second: CPU (`~$0.0895/vCPU-hour`) billed only during active processing, memory (`~$0.00945/GB-hour`) accrues continuously while the microVM is alive. Two microVMs means roughly double the interceptor variant's Runtime memory-time at idle.
+- **AgentCore Identity Token Vault (3LO)** — stores/refreshes/injects each user's Lark token natively. No separate per-user Secrets Manager charge (unlike the interceptor variant) — this is the main cost-structure difference between the two.
+- **AgentCore Memory (STM)** — billed per event *written* (`~$0.25 per 1,000` create-event calls), **not** for retention duration.
+- **Lambda + API Gateway** — router (webhook) + shim (OAuth RFC-6749 façade, a backend web service); effectively free at demo volume.
+- **Secrets Manager** — `$0.40/secret/month` each, and only two static secrets: the Lark credentials (`{prefix}/channels/lark`) and the Cognito password salt. This variant does **not** create dynamic per-user secrets.
+- **Cognito, DynamoDB (on-demand)** — the identity/state plane; negligible at demo volume. (A `user-files` S3 bucket is provisioned but not used on the current tool path — near-zero cost.)
+
+`scripts/destroy.sh` removes everything `deploy.sh` created (Gateway, both Runtimes, the CDK stacks). Note it does **not** delete the `lark-id-3lo` OAuth credential provider or the tokens vaulted in AgentCore Identity — the vault itself has no standing charge, but re-seed the provider via the docs on the next deploy. Costs are usage-driven; an idle deployment still accrues the two microVMs' memory-time and the two static per-secret charges.
+
+## Security considerations
+
+This is a **reference implementation, not production-ready as-is**. Before any real use:
+
+- **Per-user Lark tokens live in the AgentCore Identity Token Vault**, not in application code or a self-managed store. The agent fetches a user's token at call time (agent-side 3LO) and passes it to the lark-cli MCP server in a custom header; it holds no long-lived credential of its own. Treat the account hosting the vault as sensitive.
+- **The MCP server calls Lark strictly as the user.** `LARKSUITE_CLI_DEFAULT_AS=user` — the lark-cli engine always acts with the vaulted `user_access_token`, never the bot identity, so access is scoped to what that user can do in Lark and Lark adjudicates it.
+- **Command execution is injection-safe.** The MCP server spawns lark-cli via `execFile` (no shell) with arguments passed as an array, and the user token via an environment variable — never interpolated into a command line.
+- **IAM is scoped but a sample.** Re-review least-privilege for your account before production.
+- **Webhook verification is fail-closed** — a missing/invalid signature or a timestamp outside the replay window is rejected before decryption. Don't relax this.
+- **AES-CBC webhook decryption** is Lark's fixed scheme (not our choice); authenticity is guaranteed by the upstream signature check, not by the cipher mode.
+- **No secrets in this repo** — Lark credentials come from `.env` → Secrets Manager via `scripts/setup-lark.sh`; `.env` is git-ignored.
+
 ### Notes & limitations
 
 - **3LO is agent-side, not Gateway-mediated.** The Gateway does not do per-user 3LO for a `CustomOauth2` provider like Lark (AWS gap, agentcore-samples#1424), so the agent drives 3LO itself and delivers the vaulted token to the lark-cli MCP server in a custom passthrough header. See `docs/agentcore-behavior.md`.
