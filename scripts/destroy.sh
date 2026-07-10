@@ -25,7 +25,8 @@ cd "$ROOT"
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT" CDK_DEFAULT_REGION="$REGION"
 CDK="npx --yes aws-cdk@2"
-RUNTIME_NAME="${PREFIX//-/_}_agent"
+# Both CLI-created runtimes: the agent and the lark-cli MCP server.
+RUNTIME_NAMES=("${PREFIX//-/_}_agent" "${PREFIX//-/_}_mcp")
 GW_NAME="${PREFIX}-gw"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
@@ -34,7 +35,7 @@ warn() { printf '\033[1;33m%s\033[0m\n' "$*"; }
 # --- confirmation --------------------------------------------------------
 if [ "${1:-}" != "--yes" ]; then
   warn "This will DELETE all $PREFIX resources in account $ACCOUNT / $REGION:"
-  warn "  AgentCore Gateway ($GW_NAME) + targets, Runtime ($RUNTIME_NAME),"
+  warn "  AgentCore Gateway ($GW_NAME) + targets, Runtimes (${RUNTIME_NAMES[*]}),"
   warn "  and CDK stacks (gateway, router, agentcore, observability, security)."
   warn "  Secrets include your Lark credentials ($PREFIX/channels/lark) — re-seedable"
   warn "  from .env via scripts/setup-lark.sh. Lark console app config is NOT touched."
@@ -69,18 +70,20 @@ else
   echo "  no gateway named $GW_NAME — skipping"
 fi
 
-# --- 2. runtime (CLI-created) --------------------------------------------
-log "Runtime — delete the AgentCore Runtime"
-rid="$(aws bedrock-agentcore-control list-agent-runtimes \
-  --query "agentRuntimes[?agentRuntimeName=='$RUNTIME_NAME'].agentRuntimeId" \
-  --output text 2>/dev/null | head -1 || true)"
-if [ -n "$rid" ] && [ "$rid" != "None" ]; then
-  echo "  deleting runtime $rid"
-  aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "$rid" >/dev/null 2>&1 \
-    || warn "  (runtime delete failed)"
-else
-  echo "  no runtime named $RUNTIME_NAME — skipping"
-fi
+# --- 2. runtimes (CLI-created) -------------------------------------------
+log "Runtimes — delete the AgentCore Runtimes (agent + lark-cli MCP server)"
+for rname in "${RUNTIME_NAMES[@]}"; do
+  rid="$(aws bedrock-agentcore-control list-agent-runtimes \
+    --query "agentRuntimes[?agentRuntimeName=='$rname'].agentRuntimeId" \
+    --output text 2>/dev/null | head -1 || true)"
+  if [ -n "$rid" ] && [ "$rid" != "None" ]; then
+    echo "  deleting runtime $rname ($rid)"
+    aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "$rid" >/dev/null 2>&1 \
+      || warn "  (runtime $rname delete failed)"
+  else
+    echo "  no runtime named $rname — skipping"
+  fi
+done
 
 # --- 3. CDK stacks (reverse dependency order) ----------------------------
 log "CDK — destroy stacks"

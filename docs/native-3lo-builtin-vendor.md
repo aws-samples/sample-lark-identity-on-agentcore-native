@@ -52,7 +52,7 @@ Built-in vendors with a dedicated config sub-key (endpoints baked in, you supply
      forceAuthentication=true)                                           # mint a fresh authorization
    → if a token is already vaulted for this user: returns {accessToken}
    → otherwise: returns {authorizationUrl, sessionUri}
-3. Surface authorizationUrl to the user (a chat message / link). END the turn — do not block-poll.
+3. Surface authorizationUrl to the user (a chat message / link). The simplest form ends the turn here (the user re-sends after consenting). This project instead has the router post the link, then poll the vault a bounded time and re-invoke on success, so the user needn't re-send — see the "consent-wait" flow in the README / architecture.md.
 4. User opens it → AgentCore /authorize sets session cookies (SameSite=Lax) and 302s to the IdP →
    user consents → IdP 302s the code to AgentCore's own /identities/oauth2/callback → AgentCore
    exchanges the code, then 302s the browser to your return URL with ?session_id=<sessionUri>&state=<base64url userId>.

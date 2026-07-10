@@ -9,8 +9,8 @@
 #      + User Token Scopes for 3LO: drive:drive, docx:document, offline_access
 #   3. Event subscription: subscribe im.message.receive_v1; set Request URL to the
 #      webhook URL printed below; enable encryption and note the Encrypt Key.
-#   4. Security settings: register the OAuth shim's redirect URL (Phase 3) as a
-#      redirect domain for the 3LO authorize flow.
+#   4. Security settings: register the OAuth provider's callbackUrl
+#      (.../identities/oauth2/callback/<uuid>) as a redirect URL for the 3LO flow.
 #   5. Publish the app.
 #
 # Fill .env (see .env.example) BEFORE running this.
