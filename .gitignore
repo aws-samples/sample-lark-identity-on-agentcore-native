@@ -2,6 +2,8 @@
 cdk.out/
 *.d.ts
 .cdk.staging/
+# per-deployment state written by deploy.sh (runtime/gateway/memory ids)
+.cdk-state.json
 
 # Python
 .venv/

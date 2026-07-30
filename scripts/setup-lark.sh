@@ -16,19 +16,21 @@
 # Fill .env (see .env.example) BEFORE running this.
 set -euo pipefail
 
-PROFILE="${PROFILE:-}"   # empty -> ambient creds (instance role / env), no named profile
-REGION="${REGION:-us-west-2}"
-PREFIX="lark-id"
-export AWS_REGION="$REGION"
-[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+[ -f .env ] || { echo "missing .env — copy .env.example to .env and fill it in"; exit 1; }
+# Deployment target: command-line env vars win over .env, which wins over defaults.
+_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}"
+set -a; . ./.env; set +a
+PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
+REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
+PREFIX="lark-agent"
+export AWS_REGION="$REGION"
+[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
 TABLE="$PREFIX-identity"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
-
-[ -f .env ] || { echo "missing .env — copy .env.example to .env and fill it in"; exit 1; }
-set -a; . ./.env; set +a
 
 : "${LARK_APP_ID:?set LARK_APP_ID in .env}"
 : "${LARK_APP_SECRET:?set LARK_APP_SECRET in .env}"

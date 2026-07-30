@@ -14,13 +14,17 @@
 #   --yes   skip the interactive confirmation
 set -euo pipefail
 
-PROFILE="${PROFILE:-}"   # empty -> ambient creds (instance role / env), no named profile
-REGION="${REGION:-us-west-2}"
-PREFIX="lark-id"
-export AWS_REGION="$REGION"
-[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+# Deployment target: command-line env vars win over .env, which wins over defaults.
+_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}"
+[ -f .env ] && { set -a; . ./.env; set +a; }
+PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
+REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
+PREFIX="lark-agent"
+export AWS_REGION="$REGION"
+[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT" CDK_DEFAULT_REGION="$REGION"

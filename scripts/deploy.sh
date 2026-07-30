@@ -10,13 +10,17 @@
 # Usage: [PROFILE=p REGION=r] scripts/deploy.sh [--base|--runtime|--gateway]
 set -euo pipefail
 
-PROFILE="${PROFILE:-}"   # empty -> use ambient creds (instance role / env), no named profile
-REGION="${REGION:-us-west-2}"
-PREFIX="lark-id"
-export AWS_REGION="$REGION" UV_LINK_MODE=copy
-[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+# Deployment target: command-line env vars win over .env, which wins over defaults.
+_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}"
+[ -f .env ] && { set -a; . ./.env; set +a; }
+PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
+REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
+PREFIX="lark-agent"
+export AWS_REGION="$REGION" UV_LINK_MODE=copy
+[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT" CDK_DEFAULT_REGION="$REGION"
@@ -29,18 +33,26 @@ cfn_out() { # stack, output-key
     --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null
 }
 
-ctx_set() { # key value  — persist an id back into cdk.json context
+ctx_set() { # key value  — persist a deployment id into .cdk-state.json (gitignored)
   uv run python - "$1" "$2" <<'PY'
-import json, sys
+import json, os, sys
 k, v = sys.argv[1], sys.argv[2]
-with open("cdk.json") as f: d = json.load(f)
-d["context"][k] = v
-with open("cdk.json", "w") as f: json.dump(d, f, indent=2); f.write("\n")
-print(f"cdk.json: {k} = {v}")
+f = ".cdk-state.json"
+d = json.load(open(f)) if os.path.isfile(f) else {}
+d[k] = v
+with open(f, "w") as fh: json.dump(d, fh, indent=2); fh.write("\n")
+print(f".cdk-state.json: {k} = {v}")
 PY
 }
 
 base_cdk_stacks() {
+  # First deploy in a region needs the CDK bootstrap stack; it creates an assets
+  # bucket/ECR repo and deploy roles, so this step needs broader IAM permissions.
+  aws cloudformation describe-stacks --stack-name CDKToolkit >/dev/null 2>&1 || {
+    log "CDK bootstrap — first deploy in $REGION"
+    $CDK bootstrap "aws://$ACCOUNT/$REGION"
+  }
+
   log "Base — CDK stacks"
   $CDK deploy "$PREFIX-security" "$PREFIX-agentcore" "$PREFIX-router" \
              "$PREFIX-gateway" "$PREFIX-shim" "$PREFIX-observability" \
@@ -57,15 +69,16 @@ phase2_runtime() {
 
   local role model memory shim mcp_arn mcp_url
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
-  model="$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['default_model_id'])")"
-  memory="$(uv run python -c "import json;print(json.load(open('cdk.json'))['context'].get('memory_id',''))" 2>/dev/null)"
+  # MODEL_ID from .env wins; else cdk.json's default_model_id.
+  model="${MODEL_ID:-$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['default_model_id'])")}"
+  memory="$(uv run python -c "import json,os;f='.cdk-state.json';print((json.load(open(f)) if os.path.isfile(f) else {}).get('memory_id',''))" 2>/dev/null)"
   shim="$(cfn_out "$PREFIX-shim" ShimReturnUrl)"
   # lark-cli MCP server runtime → its SigV4 MCP invocations URL (URL-encoded ARN).
   mcp_arn="$(aws bedrock-agentcore-control list-agent-runtimes \
-    --query "agentRuntimes[?agentRuntimeName=='lark_id_mcp'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
+    --query "agentRuntimes[?agentRuntimeName=='lark_agent_mcp'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
   mcp_url="https://bedrock-agentcore.$REGION.amazonaws.com/runtimes/$(uv run python -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$mcp_arn")/invocations?qualifier=DEFAULT"
   [ -n "$role" ] || { echo "missing execution role output — run --base first"; exit 1; }
-  [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || { echo "lark_id_mcp runtime not found — deploy the MCP server first (scripts/build-mcp.sh + create runtime)"; exit 1; }
+  [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || { echo "lark_agent_mcp runtime not found — deploy the MCP server first (scripts/build-mcp.sh + create runtime)"; exit 1; }
 
   # Configure once (idempotent; writes .bedrock_agentcore.yaml). Custom Dockerfile
   # in agent/ is respected. Allow the agent's own execution role to fetch per-user
@@ -80,16 +93,36 @@ phase2_runtime() {
     --env "BEDROCK_AGENTCORE_MEMORY_ID=$memory" \
     --env "LARK_MCP_URL=$mcp_url" \
     --env "SHIM_RETURN_URL=$shim" \
-    --env "LARK_OAUTH_PROVIDER=lark-id-3lo" \
-    --env "AGENT_WORKLOAD_NAME=lark-id-agent-wl" \
+    --env "LARK_OAUTH_PROVIDER=lark-agent-3lo" \
+    --env "AGENT_WORKLOAD_NAME=lark-agent-wl" \
     --env "LARK_SCOPES=drive:drive docx:document offline_access"
 
-  # Persist the runtime id back into cdk.json for the dependent stacks.
+  # Persist the runtime id into .cdk-state.json for the dependent stacks.
   local rid
   rid="$(aws bedrock-agentcore-control list-agent-runtimes \
     --query "agentRuntimes[?agentRuntimeName=='${PREFIX//-/_}_agent'].agentRuntimeId" \
     --output text 2>/dev/null | head -1)"
   [ -n "$rid" ] && [ "$rid" != "None" ] && ctx_set runtime_id "$rid"
+
+  # The router's AGENTCORE_RUNTIME_ARN was synthesised before the runtime existed
+  # (a PLACEHOLDER), so re-deploy it now that the real id is known — otherwise the
+  # webhook invokes a non-existent runtime.
+  log "Router — re-deploy with the real runtime ARN"
+  $CDK deploy "$PREFIX-router" --require-approval never
+
+  # AgentCore keeps serving existing sessions from the OLD container instance, so
+  # stored session ids would pin users to the previous image. Drop them: the next
+  # message starts a new session on the just-deployed version.
+  log "Sessions — drop stored ids so users land on the new version"
+  local n=0
+  for pk in $(aws dynamodb scan --table-name "$PREFIX-identity" \
+      --filter-expression "SK = :s" \
+      --expression-attribute-values '{":s":{"S":"SESSION"}}' \
+      --projection-expression "PK" --query 'Items[].PK.S' --output text 2>/dev/null); do
+    aws dynamodb delete-item --table-name "$PREFIX-identity" \
+      --key "{\"PK\":{\"S\":\"$pk\"},\"SK\":{\"S\":\"SESSION\"}}" >/dev/null 2>&1 && n=$((n+1))
+  done
+  echo "  dropped $n session(s)"
 }
 
 phase3_gateway() {

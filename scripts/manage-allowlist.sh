@@ -8,7 +8,7 @@ set -euo pipefail
 
 PROFILE="${PROFILE:-}"   # empty -> ambient creds (instance role / env), no named profile
 REGION="${REGION:-us-west-2}"
-TABLE="${TABLE:-lark-id-identity}"
+TABLE="${TABLE:-lark-agent-identity}"
 export AWS_REGION="$REGION"
 [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
 

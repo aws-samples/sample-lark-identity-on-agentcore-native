@@ -14,7 +14,9 @@ Deployment is hybrid:
                   (control-plane APIs), IDs fed back into cdk.json context
 """
 
+import json
 import os
+import pathlib
 
 import aws_cdk as cdk
 
@@ -26,6 +28,15 @@ from stacks.shim_stack import ShimStack
 from stacks.observability_stack import ObservabilityStack
 
 app = cdk.App()
+
+# Per-deployment state (runtime/gateway ids) lives outside version control —
+# deploy.sh writes it, we inject it so stacks read it via try_get_context as usual.
+_state = pathlib.Path(__file__).parent / ".cdk-state.json"
+if _state.is_file():
+    for k, v in json.loads(_state.read_text()).items():
+        if v:
+            app.node.set_context(k, v)
+
 ctx = app.node.try_get_context
 
 env = cdk.Environment(
@@ -59,6 +70,7 @@ shim = ShimStack(
     app,
     f"{prefix}-shim",
     lark_api_domain=ctx("lark_api_domain") or "https://open.larksuite.com",
+    lark_secret_name=security.lark_secret.secret_name,
     env=env,
 )
 
