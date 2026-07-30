@@ -2,7 +2,8 @@
 
   GET  /ping          -> {"status":"Healthy"}   (must respond within seconds)
   POST /invocations   -> action in {warmup, status, chat}
-      chat   : {action,actorId,message,email?} -> {reply}  (history via Memory)
+      chat       : {action,actorId,message,email?} -> {reply}  (history via Memory)
+      chat_async : same + chatId -> {accepted:true}; result is pushed to the chat
       warmup : {action} -> {ready:true}
       status : {action} -> {ready, uptime}
 
@@ -32,7 +33,10 @@ _HTTP_PORT = int(os.environ.get("PORT", "8080"))
 # ----------------------------- HTTP contract --------------------------------
 
 async def handle_ping(request: web.Request) -> web.Response:
-    return web.json_response({"status": "Healthy"})
+    # HealthyBusy tells AgentCore a background turn is still running, so the
+    # container isn't reclaimed out from under it.
+    status = "HealthyBusy" if agent_core.busy() else "Healthy"
+    return web.json_response({"status": status})
 
 
 async def handle_invocations(request: web.Request) -> web.Response:
@@ -59,6 +63,25 @@ async def handle_invocations(request: web.Request) -> web.Response:
             return web.json_response(result)
         except Exception as e:
             log.exception("reauth failed")
+            return web.json_response({"error": str(e)})
+
+    if action == "chat_async":
+        actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
+        message = payload.get("message", "")
+        chat_id = payload.get("chatId", "")
+        email = payload.get("email", "")
+        mem_sid = payload.get("memorySessionId", "")
+        if not (message and chat_id):
+            return web.json_response({"error": "message and chatId required"}, status=400)
+        try:
+            # Returns as soon as the work is accepted; the result is pushed to the
+            # chat later. Consent still comes back inline (see chat_async).
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, agent_core.chat_async, actor_id, message, chat_id, email, mem_sid
+            )
+            return web.json_response(result)
+        except Exception as e:
+            log.exception("chat_async failed")
             return web.json_response({"error": str(e)})
 
     if action == "chat":

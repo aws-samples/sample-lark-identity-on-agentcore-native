@@ -35,6 +35,7 @@ from strands import Agent
 from strands.models import BedrockModel
 
 import lark_3lo
+import lark_notify
 
 log = logging.getLogger("agent.core")
 
@@ -54,6 +55,22 @@ _model = BedrockModel(model_id=_MODEL_ID, streaming=True)
 # session_id -> {agent, mcp, created}. One microVM ≈ one session, so this is tiny.
 _sessions: dict[str, dict] = {}
 _lock = threading.Lock()
+
+# Background turns in flight. AgentCore may reclaim an idle container, which would
+# kill them, so /ping reports HealthyBusy while this is non-zero.
+_in_flight = 0
+_in_flight_lock = threading.Lock()
+
+
+def busy() -> bool:
+    with _in_flight_lock:
+        return _in_flight > 0
+
+
+def _track(delta: int) -> None:
+    global _in_flight
+    with _in_flight_lock:
+        _in_flight += delta
 
 
 def _session_id_for(actor_id: str) -> str:
@@ -97,7 +114,7 @@ def _build_session(actor_id: str, email: str, mem_sid: str) -> dict:
         mcp.__enter__()  # persistent connection for the session's lifetime
         tools = mcp.list_tools_sync()
     elif kind == "auth_url":
-        auth_url = value  # no tools this session; user must consent first
+        auth_url = value  # no Lark tools this session; user must consent first
     else:
         # Surface identity failures instead of running tool-less: an agent that
         # merely says "I have no tools" reads as model behaviour and hides the
@@ -165,6 +182,42 @@ def run_chat(actor_id: str, message: str, email: str = "",
              mem_sid: str = "") -> str:
     """Back-compat: assistant's final text (or the consent prompt)."""
     return chat_result(actor_id, message, email, mem_sid)["reply"]
+
+
+def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
+               mem_sid: str = "") -> dict:
+    """Accept the work and answer later.
+
+    A real task can outlast any request/response window (InvokeAgentRuntime caps at
+    15 min, the calling Lambda at less), and a turn that times out mid-way is the
+    worst outcome: the work often completed, but the user was told it failed. So we
+    return an acknowledgement now and push the result to the chat when it's ready.
+
+    Consent is the exception — it needs a synchronous answer, because the router
+    drives the wait-and-retry loop around it."""
+    s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id))
+    if s.get("auth_url"):
+        return {"reply": _AUTH_PROMPT.format(url=s["auth_url"]),
+                "needs_auth": True, "auth_url": s["auth_url"]}
+    if s.get("identity_error"):
+        return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
+                "needs_auth": False, "identity_error": s["identity_error"]}
+
+    def _run() -> None:
+        try:
+            reply = str(s["agent"](message))
+        except Exception as e:  # noqa: BLE001 — the caller is already gone
+            log.exception("async turn failed for %s", actor_id)
+            reply = f"Sorry, that didn't work out ({type(e).__name__})."
+        finally:
+            _track(-1)
+        if not lark_notify.send_text(chat_id, reply):
+            # Nothing else can reach the user — make sure it's in the logs.
+            log.error("could not deliver reply to %s: %s", chat_id, reply[:200])
+
+    _track(+1)
+    threading.Thread(target=_run, name=f"turn-{actor_id[:16]}", daemon=True).start()
+    return {"accepted": True, "needs_auth": False}
 
 
 def reauth(actor_id: str, idp: str = "lark") -> dict:

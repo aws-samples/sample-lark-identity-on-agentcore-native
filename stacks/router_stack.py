@@ -104,6 +104,12 @@ class RouterStack(Stack):
             log_group=log_group,
         )
 
+        # The sync phase self-invokes asynchronously, and Lambda counts a timeout as
+        # a function error — with the default 2 retries a slow turn would be replayed
+        # twice, so the agent would redo the work and the user would get duplicate
+        # replies. Deliver once; the user can always ask again.
+        self.router_fn.configure_async_invoke(retry_attempts=0)
+
         integration = apigwv2_integrations.HttpLambdaIntegration("Integration", handler=self.router_fn)
         self.http_api = apigwv2.HttpApi(
             self, "RouterApi", api_name=f"{prefix}-router",

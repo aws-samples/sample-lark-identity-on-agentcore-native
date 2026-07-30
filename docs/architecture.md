@@ -11,7 +11,7 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 | Component | What it is | Where |
 |---|---|---|
 | Router Lambda | Lark webhook ingestion (verify + AES decrypt, resolve user, invoke runtime); owns both session ids; handles the chat commands | `lambda/router/` |
-| Agent container | Strands agent on Bedrock; HTTP contract (8080); AgentCore Memory for continuity; agent-side 3LO; MCP client to the lark-cli server | `agent/` |
+| Agent container | Strands agent on Bedrock; HTTP contract (8080); AgentCore Memory for continuity; agent-side 3LO; MCP client to the lark-cli server; runs turns in the background and posts answers to the chat itself | `agent/` |
 | Lark OAuth shim | RFC-6749 façade over Lark's non-standard token endpoint, plus the 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) | `lambda/shim/` |
 | Lark MCP server | lark-cli engine on AgentCore Runtime; calls Lark with the per-user token from a custom passthrough header | `mcp-server/` |
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `lark-agent-3lo`, workload `lark-agent-wl` |
@@ -26,34 +26,37 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 ```
                     ┌──────────────────────────────┐        ┌──────────────────────────┐
   Lark message ───▶ │  Router Lambda               │◀──────▶│  DynamoDB identity table │
-  (bot chat)        │  verify / AES-decrypt        │        │  SESSION    → runtime id │
+   (webhook)        │  verify / AES-decrypt        │        │  SESSION    → runtime id │
                     │  resolve → lark:{open_id}    │        │  MEMSESSION → memory id  │
                     │  chat commands (/auth …)     │        │  ALLOW      → allowlist  │
                     └──────────────┬───────────────┘        └──────────────────────────┘
-                       InvokeAgentRuntime (SigV4)
-                       runtimeSessionId + memorySessionId + actorId
+                     InvokeAgentRuntime (SigV4) — returns "accepted" at once;
+                     carries runtimeSessionId + memorySessionId + actorId + chatId
                                    ▼
-        ┌───────────────────────────────────────────────────────┐
-        │  Agent container (ARM64, AgentCore Runtime)           │      AgentCore Identity
-        │    Strands agent, history in AgentCore Memory         │      Token Vault (3LO)
-        │    lark_3lo: GetResourceOauth2Token(USER_FEDERATION)  │◀────▶ stores / refreshes
-        └───────────────────────────┬───────────────────────────┘      THIS user's token
-                    MCP over SigV4, user's Lark token                          ▲
-                    in X-Amzn-…-Custom-Lark-Token                              │ RFC-6749
-                                    ▼                             ┌────────────┴────────────┐
-                    ┌──────────────────────────────┐              │  Lark OAuth shim        │
-                    │  Lark MCP server (lark-cli)  │              │  form ⇄ JSON, code≠0→4xx│
-                    │  runs lark-cli AS the user   │              │  /return: complete +    │
-                    └──────────────┬───────────────┘              │  DM the user            │
-                        Authorization: Bearer                     └────────────┬────────────┘
-                                   ▼                                           │ consent
-                              Lark REST API ◀──────────────────────────────────┘
-                              → only what THIS user can see. Lark adjudicates.
+        ┌────────────────────────────────────────────────────────┐
+        │  Agent container (ARM64, AgentCore Runtime)            │     AgentCore Identity
+        │   Strands agent, history in AgentCore Memory           │     Token Vault (3LO)
+        │   lark_3lo: GetResourceOauth2Token(USER_FEDERATION)    │◀───▶ stores / refreshes
+        │   the turn runs in the background; /ping = HealthyBusy │     THIS user's token
+        └───┬───────────────────────────────────────────┬────────┘            ▲
+            │ MCP over SigV4, user's Lark token         │ answer, when ready  │ RFC-6749
+            │ in X-Amzn-…-Custom-Lark-Token             │ (tenant token)      │
+            ▼                                           │          ┌──────────┴────────────┐
+    ┌──────────────────────────────┐                    │          │  Lark OAuth shim      │
+    │  Lark MCP server (lark-cli)  │                    │          │  form ⇄ JSON,         │
+    │  runs lark-cli AS the user   │                    │          │  code≠0 → 4xx         │
+    └──────────────┬───────────────┘                    │          │  /return: complete +  │
+         Authorization: Bearer                          │          │  DM the user          │
+                   ▼                                    ▼          └──────────┬────────────┘
+              Lark REST API ◀─────────────────────────────────────────────────┘
+              → only what THIS user can see. Lark adjudicates.       consent
 ```
 
 Identity is `lark:{open_id}` for every message, and the vaulted Lark token is keyed by it — so it survives any session change. The two session ids are separate on purpose (see [Conversation memory](#conversation-memory)): the runtime one picks the microVM, the memory one picks the history thread.
 
 First use (consent-wait): no vaulted token → the router posts a clickable 点击授权 link, holds while polling the vault, and re-invokes once consent lands, so the user gets their answer without re-sending. The shim also DMs them when consent completes, which matters for `/auth`-triggered re-consent — there the old token is still present, so polling cannot tell the difference.
+
+Answers come back asynchronously. A turn that researches something and writes it into a document outlasts any request/response window — `InvokeAgentRuntime` and the router's Lambda both cap out — and being cut off mid-way is the worst case, since the work often finished while the user was told it failed. So `chat_async` accepts the turn, returns at once, runs it on a background thread, and posts the result to the chat with the app's tenant token. `/ping` reports `HealthyBusy` for the duration, which is what stops AgentCore from reclaiming the container mid-turn; that defers idle reclamation but not the 8-hour instance ceiling. The router's async self-invocation also disables Lambda's default retries — a timeout counts as a function error there, so retries would replay the whole turn and duplicate both the work and the reply.
 
 ## Why Lark is wrapped in Cognito *(legacy — this variant has no Cognito/web UI)*
 

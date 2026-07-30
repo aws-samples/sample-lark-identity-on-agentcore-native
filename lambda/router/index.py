@@ -47,16 +47,30 @@ lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 # ------------------------------- invoke agent -------------------------------
 
 def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
-                 action: str = "chat", mem_sid: str = "") -> dict:
+                 action: str = "chat", mem_sid: str = "",
+                 budget: float | None = None, chat_id: str = "") -> dict:
     """Invoke the agent once. Returns the parsed response dict
-    {reply, needs_auth, auth_url?} (or {reply:<raw>} on non-JSON)."""
+    {reply, needs_auth, auth_url?} (or {reply:<raw>} on non-JSON).
+
+    `budget` overrides the read timeout for this call — the consent path spends
+    part of the Lambda's time waiting for the user, so the retry afterwards must
+    fit in what is left, not assume a full budget."""
     payload = json.dumps({
         "action": action, "userId": user_id, "actorId": actor_id,
         "channel": "lark", "message": message,
         # The router owns the Memory thread id (see identity.get_or_create_memory_session).
         "memorySessionId": mem_sid,
+        # Where the agent pushes the result when it answers asynchronously.
+        "chatId": chat_id,
     }).encode()
-    resp = agentcore.invoke_agent_runtime(
+    client = agentcore
+    if budget is not None:
+        client = boto3.client(
+            "bedrock-agentcore", region_name=AWS_REGION,
+            config=Config(read_timeout=max(int(budget), 10), connect_timeout=10,
+                          retries={"max_attempts": 0}),
+        )
+    resp = client.invoke_agent_runtime(
         agentRuntimeArn=RUNTIME_ARN, qualifier=QUALIFIER,
         runtimeSessionId=session_id, runtimeUserId=actor_id,
         payload=payload, contentType="application/json", accept="application/json",
@@ -143,7 +157,7 @@ def wait_for_consent(actor_id: str) -> bool:
 
 # ------------------------------- async processing ---------------------------
 
-def process_lark_event(body: str, headers: dict) -> None:
+def process_lark_event(body: str, headers: dict, context=None) -> None:
     """Runs in the async self-invocation. Decrypt (if needed), handle message."""
     try:
         event_data = json.loads(body)
@@ -311,7 +325,11 @@ def process_lark_event(body: str, headers: dict) -> None:
     logger.info("invoking agent: session=%s mem=%s msg=%r",
                 session_id, mem_sid, agent_message[:80])
     try:
-        result = invoke_agent(session_id, user_id, actor_id, agent_message, mem_sid=mem_sid)
+        # chat_async: the agent accepts the work, returns at once, and pushes the
+        # answer to the chat itself. A synchronous wait cannot cover real tasks —
+        # both InvokeAgentRuntime and this Lambda cap out long before they finish.
+        result = invoke_agent(session_id, user_id, actor_id, agent_message,
+                              action="chat_async", mem_sid=mem_sid, chat_id=chat_id)
         # First-use 3LO: post the consent link, then hold and poll the vault so
         # the user gets an answer without re-sending (bounded by AUTH_WAIT_SECONDS).
         if result.get("needs_auth"):
@@ -324,15 +342,28 @@ def process_lark_event(body: str, headers: dict) -> None:
             logger.info("awaiting consent for %s (<= %ds)", actor_id, AUTH_WAIT_SECONDS)
             if wait_for_consent(actor_id):
                 logger.info("consent complete for %s; re-invoking", actor_id)
+                # Waiting for consent already spent part of the budget.
+                left = (context.get_remaining_time_in_millis() / 1000 - 10
+                        if context else READ_TIMEOUT)
                 result = invoke_agent(session_id, user_id, actor_id, agent_message,
-                                      mem_sid=mem_sid)
+                                      action="chat_async", mem_sid=mem_sid,
+                                      budget=left, chat_id=chat_id)
             else:
                 logger.info("consent wait timed out for %s", actor_id)
                 return  # link already sent; user finishes later and re-sends
+        if result.get("accepted"):
+            logger.info("agent accepted the turn for %s; it will push the reply", actor_id)
+            return
         reply = result.get("reply", "")
+    except ReadTimeoutError:
+        # We stopped waiting; the agent keeps running and may still finish, so
+        # don't report failure — the doc it was writing might well exist.
+        logger.warning("agent read timeout for %s", actor_id)
+        reply = ("That took longer than I can wait for. It may still have "
+                 "completed — please check, or try a smaller request.")
     except Exception as e:  # noqa: BLE001
         logger.exception("agent invocation failed")
-        reply = f"抱歉，处理时出错了（{type(e).__name__}）。"
+        reply = f"Sorry, something went wrong ({type(e).__name__})."
 
     if reply:
         lark.send_message(chat_id, reply)
@@ -349,7 +380,7 @@ def handler(event, context):
     # Async self-invocation path
     if event.get("_async_dispatch"):
         logger.info("async dispatch: processing lark event")
-        process_lark_event(event["body"], event.get("headers", {}))
+        process_lark_event(event["body"], event.get("headers", {}), context)
         return {"ok": True}
 
     path = event.get("rawPath", event.get("requestContext", {}).get("http", {}).get("path", ""))

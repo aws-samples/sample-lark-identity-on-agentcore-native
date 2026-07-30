@@ -7,42 +7,28 @@ This is the **AgentCore Identity** variant: per-user Lark tokens live in the **A
 ## Architecture
 
 ```
-                     ┌──────────────────────┐      InvokeAgentRuntime (SigV4)
-                     │    Router Lambda     │      payload carries actorId
-  Lark message ────▶ │  verify / decrypt /  ├────────────────┐
-  (webhook)          │     resolve user     │                │
-                     └──────────────────────┘                ▼
-                              ┌───────────────────────────────────────────────┐
-                              │  Agent container (ARM64, AgentCore Runtime)   │
-                              │   :8080  /ping  /invocations(POST)            │
-                              │   Strands Agent + AgentCore Memory (per-user) │
-                              └───────────────────────┬───────────────────────┘
-                          agent-side 3LO: fetch THIS user's │ token from the vault
-                                        ▼
-                              ┌───────────────────────┐   ┌─────────────────────────┐
-                              │  agent_core.lark_3lo  │◀──┤   AgentCore Identity    │
-                              │ GetResourceOauth2Token│   │  Token Vault (3LO):     │
-                              │  (USER_FEDERATION)    │   │  stores / refreshes /   │
-                              └───────────┬───────────┘   │  THIS user's            │
-                                          │ SigV4 + token │  Lark user_access_token │
-                                          │ in custom hdr └────────────┬────────────┘
-                                          ▼                            │ RFC-6749 token calls
-                              ┌───────────────────────┐   ┌────────────▼────────────┐
-                              │   Lark MCP server     │   │     Lark OAuth shim     │
-                              │  (AgentCore Runtime,  │   │  (Lambda + API GW)      │
-                              │   lark-cli engine)    │   │  form ⇄ JSON translate, │
-                              └───────────┬───────────┘   │  code!=0 → 4xx          │
-                                          │ lark-cli as   └────────────┬────────────┘
-                                          │ user_access_token          │ JSON, code:0 envelope
-                                          ▼                            ▼
-                              ┌─────────────────────────────────────────────────────┐
-                              │  Lark REST API  →  returns only what THIS user can  │
-                              └─────────────────────────────────────────────────────┘
+                                            ┌──────────── AgentCore Identity ────────────┐
+                                            │  Token Vault: stores / refreshes / returns │
+                                            │  THIS user's Lark token (3LO)              │
+                                            └───────────────────┬────────────────────────┘
+                                                                │ the user's own token
+  Lark    ──webhook──▶  Router Lambda  ──▶  Agent (AgentCore Runtime)  ──▶  Lark MCP server
+  bot chat              verify/decrypt      Strands + Memory                acts AS the user
+     ▲                  resolve identity    fetches that user's token                │
+     │                                                                               ▼
+     └──────────────── the answer, posted when the turn finishes ───────────  Lark REST API
+                                                                        returns only what
+                                                                        THIS user can see
 
-  Identity: every message resolves to  lark:{open_id}.
-  First-time consent (consent-wait): the agent has no vaulted token → the router posts a
-  clickable "点击授权" link, holds and polls the vault, and re-invokes on approval — so the
-  user gets the answer WITHOUT re-sending. Later turns fetch the token silently.
+  Every message resolves to lark:{open_id}. That identity picks the token, and Lark — not
+  our code — decides what the tools may reach.
+
+  Delivery is asynchronous: the agent accepts the turn, returns at once, and posts the answer
+  when it's ready. Real tasks outlast any request/response window, and cutting one off is
+  worse than waiting — the work has usually already succeeded.
+
+  First use needs consent: with no vaulted token the router posts a 点击授权 link, waits for
+  approval, and continues on its own, so the user never re-sends.
 ```
 
 See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop auth, and the consent-wait sequence; **[docs/agentcore-behavior.md](docs/agentcore-behavior.md)** and **[docs/native-3lo-builtin-vendor.md](docs/native-3lo-builtin-vendor.md)** for why 3LO is agent-side (the Gateway can't do per-user 3LO for a `CustomOauth2` provider like Lark — agentcore-samples#1424) and how to add other downstream systems.
@@ -54,7 +40,7 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 | `app.py`, `cdk.json` | CDK app (uv-managed deps) — 6 stacks. Deployment state goes to `.cdk-state.json`, not here |
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
 | `stacks/` | security, agentcore, router, shim, gateway, observability |
-| `agent/` | Strands agent container: HTTP contract + AgentCore Memory + agent-side 3LO (`lark_3lo`) + MCP client to the lark-cli server |
+| `agent/` | Strands agent container: HTTP contract + AgentCore Memory + agent-side 3LO (`lark_3lo`) + MCP client to the lark-cli server; runs turns in the background and posts answers back (`lark_notify`) |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
 | `mcp-server/` | Lark MCP server (AgentCore Runtime, lark-cli engine) — calls Lark as the user |
@@ -150,6 +136,7 @@ This is a **reference implementation, not production-ready as-is**. Before any r
 ### Notes & limitations
 
 - **3LO is agent-side, not Gateway-mediated.** The Gateway does not do per-user 3LO for a `CustomOauth2` provider like Lark (AWS gap, agentcore-samples#1424), so the agent drives 3LO itself and delivers the vaulted token to the lark-cli MCP server in a custom passthrough header. See `docs/agentcore-behavior.md`.
+- **Answers arrive asynchronously.** A turn that researches a topic and writes a document takes longer than any request/response window allows — `InvokeAgentRuntime` and the router's Lambda both cap out, and a turn cut off mid-way is the worst outcome, because the work often completed while the user was told it failed. So the agent accepts the work, returns immediately, and posts the answer to the chat itself when it's done. Its `/ping` reports `HealthyBusy` while a turn is running, which is what keeps AgentCore from reclaiming the container underneath it (idle reclamation is deferred; the 8-hour instance ceiling still applies). Consent is the exception and stays synchronous, since the router drives the wait-and-retry loop around it.
 - **Consent-wait is time-bounded.** On first use the router posts the consent link, then holds and polls the vault up to `AUTH_WAIT_SECONDS` (45s) before falling back to "re-send after approving". A user who takes longer than that to approve just re-sends once; the token is already vaulted by then.
 - **Chat-only.** This variant has no web UI, no Cognito, and no Gateway on the tool path — the sibling `lark-agentcore-interceptor` is the Gateway/web-UI variant.
 - **Two Runtimes.** The agent and the lark-cli MCP server are separate AgentCore Runtimes, both built via CodeBuild (ARM64) and created out-of-band by the CLI.
