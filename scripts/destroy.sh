@@ -43,6 +43,8 @@ if [ "${1:-}" != "--yes" ]; then
   warn "  and CDK stacks (gateway, router, agentcore, observability, security)."
   warn "  Secrets include your Lark credentials ($PREFIX/channels/lark) — re-seedable"
   warn "  from .env via scripts/setup-lark.sh. Lark console app config is NOT touched."
+  warn "  The OAuth provider goes too, so every user's vaulted token is purged and the"
+  warn "  next deploy issues a NEW callbackUrl to register in the Lark console."
   read -r -p "Type the account id ($ACCOUNT) to proceed: " reply
   [ "$reply" = "$ACCOUNT" ] || { echo "aborted."; exit 1; }
 fi
@@ -97,16 +99,38 @@ $CDK destroy \
   "$PREFIX-agentcore" "$PREFIX-observability" "$PREFIX-security" \
   --force
 
-# NOTE (identity variant): per-user tokens live in the AgentCore Identity Token
-# Vault, not Secrets Manager — Phase 3 must extend this script to delete the
-# OAuth2 credential provider (which purges its vaulted tokens) and the shim.
+# --- 4. AgentCore Identity (CLI-created, region-scoped) ------------------
+# Deleting the provider purges every user's vaulted token, so a redeploy means
+# everyone consents again — and the new provider gets a NEW callbackUrl that must
+# be registered in the Lark console. Both are region-scoped: leaving them behind
+# is what litters an account after moving regions.
+log "AgentCore Identity — OAuth provider + workload identity"
+if aws bedrock-agentcore-control get-oauth2-credential-provider --name "$PREFIX-3lo" >/dev/null 2>&1; then
+  aws bedrock-agentcore-control delete-oauth2-credential-provider --name "$PREFIX-3lo" >/dev/null 2>&1 \
+    && echo "  deleted provider $PREFIX-3lo (vaulted tokens purged)" \
+    || warn "  (provider $PREFIX-3lo delete failed)"
+else
+  echo "  no provider named $PREFIX-3lo — skipping"
+fi
+if aws bedrock-agentcore-control get-workload-identity --name "$PREFIX-wl" >/dev/null 2>&1; then
+  aws bedrock-agentcore-control delete-workload-identity --name "$PREFIX-wl" >/dev/null 2>&1 \
+    && echo "  deleted workload identity $PREFIX-wl" \
+    || warn "  (workload $PREFIX-wl delete failed — service-linked ones can't be deleted)"
+else
+  echo "  no workload identity named $PREFIX-wl — skipping"
+fi
 
-# --- 4. leftover local state --------------------------------------------
+# --- 5. leftover local state --------------------------------------------
 log "Local — clear the AgentCore CLI config so a fresh deploy reconfigures"
 [ -f .bedrock_agentcore.yaml ] && { rm -f .bedrock_agentcore.yaml; echo "  removed .bedrock_agentcore.yaml"; }  # safe-rm-ok
 rm -rf .bedrock_agentcore 2>/dev/null || true  # safe-rm-ok
 
+# .cdk-state.json holds this deployment's ids; a stale one would point a fresh
+# deploy at resources that no longer exist.
+[ -f .cdk-state.json ] && { rm -f .cdk-state.json; echo "  removed .cdk-state.json"; }  # safe-rm-ok
+
 log "Done. Lark console app config is untouched; re-deploy with scripts/deploy.sh."
+warn "Re-register the new provider callbackUrl (scripts/setup-3lo.sh prints it)."
 warn "Note: CLI-created runtime/gateway are gone; CDK-managed secrets were destroyed"
 warn "with their stack. If any secret lingers (deletion is scheduled), it will purge"
 warn "after the recovery window, or force-delete with: aws secretsmanager delete-secret"

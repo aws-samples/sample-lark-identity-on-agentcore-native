@@ -186,7 +186,7 @@ wheels = [
 
 [[package]]
 name = "lark-agentcore-identity"
-version = "0.6.3"
+version = "0.6.4"
 source = { virtual = "." }
 dependencies = [
     { name = "aws-cdk-lib" },
