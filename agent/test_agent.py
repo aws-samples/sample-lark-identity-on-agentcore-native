@@ -82,5 +82,75 @@ def test_session_id_deterministic_per_user():
     assert sid("lark:ou_abc").startswith("sess-")
 
 
+# ------------------------------- busy tracking ------------------------------
+# /ping must report HealthyBusy while a background turn runs, or AgentCore
+# reclaims the container and kills it. The counter is shared mutable state
+# touched from two scopes, which is exactly where a missing `global` hides — an
+# earlier version raised UnboundLocalError only at runtime, in production.
+
+def _load_busy_helpers():
+    """Load busy()/_track() alone: agent_core imports strands, which isn't
+    installable on an x86 test host."""
+    import threading
+    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
+    ns = {"threading": threading, "_in_flight": 0, "_in_flight_lock": threading.Lock()}
+    for name in ("def busy(", "def _track("):
+        start = src.index(name)
+        end = src.index("\n\ndef ", start)
+        exec(src[start:end], ns)
+    return ns
+
+
+def test_busy_reflects_in_flight_turns():
+    ns = _load_busy_helpers()
+    busy, track = ns["busy"], ns["_track"]
+    assert busy() is False
+    track(+1)
+    assert busy() is True
+    track(+1)
+    track(-1)
+    assert busy() is True          # still one turn running
+    track(-1)
+    assert busy() is False         # idle again, so the container may be reclaimed
+
+
+def test_track_is_usable_from_a_thread():
+    """The decrement happens on the worker thread; a scoping bug shows up there."""
+    import threading
+    ns = _load_busy_helpers()
+    busy, track = ns["busy"], ns["_track"]
+    track(+1)
+    err = []
+
+    def worker():
+        try:
+            track(-1)
+        except Exception as e:  # noqa: BLE001
+            err.append(e)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    assert not err, f"_track failed off the main thread: {err}"
+    assert busy() is False
+
+
+# ------------------------------- web search ---------------------------------
+# Search is optional; with no gateway configured the agent must simply run
+# without the tool rather than failing to build a session.
+
+def test_websearch_gateway_contract():
+    """websearch imports mcp (not installable here), so assert the two things that
+    silently break the Gateway call: the protocol-version header, without which it
+    negotiates 2025-03-26 and rejects with -32022, and an access token rather than
+    an ID token, since the Gateway checks the client_id claim."""
+    src = open(os.path.join(os.path.dirname(__file__), "websearch.py"), encoding="utf-8").read()
+    assert "MCP-Protocol-Version" in src
+    assert "2025-11-25" in src
+    assert "get_user_jwt" in src        # identity.py returns the ACCESS token
+    # available() must be a pure config check, so an unset gateway just means no tool
+    assert 'os.environ.get("WEBSEARCH_GATEWAY_URL", "")' in src
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

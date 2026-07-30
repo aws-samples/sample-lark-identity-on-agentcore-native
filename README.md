@@ -44,7 +44,8 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
 | `mcp-server/` | Lark MCP server (AgentCore Runtime, lark-cli engine) — calls Lark as the user |
-| `scripts/` | deploy / build-mcp / setup-3lo / setup-lark / manage-allowlist / test / destroy |
+| `scripts/` | deploy / build-mcp / setup-3lo / setup-lark / manage-allowlist / destroy |
+| `tests/` | `run.sh` (all unit suites) + e2e smoke tests that need a deployed stack |
 | `docs/architecture.md` | full architecture (core flow updated to the native path; some sections marked legacy) |
 | `docs/agentcore-behavior.md` | measured AgentCore Gateway/Runtime behavior + the CustomOauth2 3LO gap (#1424) |
 | `docs/native-3lo-builtin-vendor.md` | reusable agent-driven 3LO reference (built-in vendors **and** CustomOauth2) — how to add a downstream system |
@@ -109,8 +110,10 @@ Authorization is a third, orthogonal dimension: the vaulted Lark token is keyed 
 ## Test
 
 ```bash
-scripts/test.sh              # agent + router unit suites
+tests/run.sh                 # unit suites (agent, router, shim) — no AWS needed
 ```
+
+Unit tests sit next to the code they cover and mock AWS; `tests/run.sh` walks them, one process per suite (several modules share filenames, so a single pytest session would import the wrong one). The e2e smoke tests in `tests/` exercise a **deployed** stack and stay skipped unless you point them at it — see `tests/README.md`.
 
 ## Cost
 
