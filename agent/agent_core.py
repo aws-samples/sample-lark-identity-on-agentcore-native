@@ -85,6 +85,7 @@ def _build_session(actor_id: str, email: str, mem_sid: str) -> dict:
     mcp = None
     tools = []
     auth_url = None
+    identity_error = None
     try:
         kind, value = lark_3lo.get_user_lark_token(actor_id)
     except Exception as e:  # noqa: BLE001 — never crash the turn on identity hiccups
@@ -97,17 +98,28 @@ def _build_session(actor_id: str, email: str, mem_sid: str) -> dict:
         tools = mcp.list_tools_sync()
     elif kind == "auth_url":
         auth_url = value  # no tools this session; user must consent first
+    else:
+        # Surface identity failures instead of running tool-less: an agent that
+        # merely says "I have no tools" reads as model behaviour and hides the
+        # real cause (a missing IAM permission, most likely).
+        identity_error = value
 
     agent = Agent(
         model=_model, system_prompt=_SYSTEM, tools=tools,
         session_manager=_make_session_manager(actor_id, mem_sid),
     )
-    return {"agent": agent, "mcp": mcp, "created": time.time(), "auth_url": auth_url}
+    return {"agent": agent, "mcp": mcp, "created": time.time(),
+            "auth_url": auth_url, "identity_error": identity_error}
 
 
 _AUTH_PROMPT = (
     "To do that I need access to your Lark account. Please authorize once here, "
     "then send your message again:\n{url}"
+)
+
+_IDENTITY_ERROR = (
+    "I can't reach your Lark account right now, so I have no Lark tools this turn "
+    "(other questions still work).\nDetails: {err}"
 )
 
 
@@ -126,8 +138,8 @@ def _get_session(actor_id: str, email: str, mem_sid: str) -> dict:
             except Exception:
                 pass
         s = _build_session(actor_id, email, mem_sid)
-        if not s.get("auth_url"):
-            _sessions[cache_key] = s  # only cache authorized sessions
+        if not s.get("auth_url") and not s.get("identity_error"):
+            _sessions[cache_key] = s  # cache only fully working sessions
         return s
 
 
@@ -141,6 +153,11 @@ def chat_result(actor_id: str, message: str, email: str = "",
     if s.get("auth_url"):
         return {"reply": _AUTH_PROMPT.format(url=s["auth_url"]),
                 "needs_auth": True, "auth_url": s["auth_url"]}
+    if s.get("identity_error"):
+        # Answer without tools, but say so — silently degrading is what made a
+        # missing IAM permission look like the model choosing not to help.
+        return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
+                "needs_auth": False, "identity_error": s["identity_error"]}
     return {"reply": str(s["agent"](message)), "needs_auth": False}
 
 
