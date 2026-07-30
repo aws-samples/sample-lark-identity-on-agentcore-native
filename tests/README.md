@@ -23,7 +23,7 @@ These hit real resources and skip themselves unless the required env vars are se
 |---|---|---|
 | `test_webhook_smoke.py` | Router accepts a signed Lark event and 200s fast; url_verification challenge echoes. | `WEBHOOK_URL`, `LARK_ENCRYPT_KEY` |
 
-Run after `scripts/deploy.sh`:
+Run after `./deploy.sh`:
 
 ```bash
 WEBHOOK_URL=... LARK_ENCRYPT_KEY=... \

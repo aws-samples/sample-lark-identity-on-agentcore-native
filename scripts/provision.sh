@@ -7,20 +7,24 @@
 #   --gateway   Web Search gateway in us-east-1 (only when WEB_SEARCH=true)
 #   (no arg)    run all steps in order
 #
-# Usage: [PROFILE=p REGION=r] scripts/deploy.sh [--base|--runtime|--gateway]
+# Step implementation — normally invoked through ./deploy.sh in the repo root,
+# which owns the ordering. Callable directly when iterating on one phase:
+# Usage: [PROFILE=p REGION=r] scripts/provision.sh [--base|--runtime|--gateway]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 # Deployment target: command-line env vars win over .env, which wins over defaults.
-_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}"
+_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEARCH:-}"
 [ -f .env ] && { set -a; . ./.env; set +a; }
 PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
+WEB_SEARCH="${_CLI_WEB_SEARCH:-${WEB_SEARCH:-false}}"
 PREFIX="lark-agent"
 export AWS_REGION="$REGION" UV_LINK_MODE=copy
-[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
+# Credentials already in the environment outrank .env's profile.
+[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT" CDK_DEFAULT_REGION="$REGION"
@@ -200,7 +204,7 @@ phase3_gateway() {
   ctx_set websearch_gateway_id "$gid"
   [ -n "$gurl" ] && [ "$gurl" != "None" ] && ctx_set websearch_gateway_url "$gurl"
   echo "  url: $gurl"
-  echo "  next: scripts/deploy.sh --runtime  (injects the URL into the agent)"
+  echo "  next: ./deploy.sh runtime  (injects the URL into the agent)"
 }
 
 case "${1:-all}" in

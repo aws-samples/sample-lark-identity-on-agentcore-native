@@ -8,7 +8,7 @@ Scope is deliberately small (this is a from-scratch simple agent, not OpenClaw):
 
 The Runtime itself is NOT a CloudFormation resource in this account/region
 (verified: no AWS::BedrockAgentCore::Runtime type). It is created out-of-band by
-scripts/deploy.sh via `aws bedrock-agentcore-control create-agent-runtime`, using
+scripts/provision.sh via `aws bedrock-agentcore-control create-agent-runtime`, using
 this stack's execution role ARN and the image URI below. The resulting runtime_id
 is written back into cdk.json context, from which runtime_arn is derived here for
 dependent stacks (Router, WebUI).

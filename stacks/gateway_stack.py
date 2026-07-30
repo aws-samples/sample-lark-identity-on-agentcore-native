@@ -1,7 +1,7 @@
 """Gateway stack — IAM service role for the MCP Gateway.
 
 The AgentCore Gateway itself is NOT a CloudFormation resource. It is created by
-scripts/deploy.sh via `aws bedrock-agentcore-control create-gateway` with a
+scripts/provision.sh via `aws bedrock-agentcore-control create-gateway` with a
 customJWTAuthorizer (Cognito) inbound and an mcpServer target (the lark-mcp
 Runtime) outbound. This stack only provisions the Gateway's service role.
 

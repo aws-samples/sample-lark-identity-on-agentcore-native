@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the Lark MCP server image natively on ARM64 via CodeBuild, then push to ECR.
-# Prints the image URI. runtime creation is a separate step (deploy.sh --mcp).
+# Prints the image URI, then creates/updates the MCP Runtime (./deploy.sh mcp).
 #
 # Local QEMU cross-builds aren't reliable for ARM64 native artifacts, so use CodeBuild's aarch64 image to build natively.
 # Provisions its own CodeBuild role; reuses the source bucket the agentcore CLI created in this account.
@@ -17,7 +17,8 @@ PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
 PREFIX="lark-agent"
 export AWS_REGION="$REGION"
-[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
+# Credentials already in the environment outrank .env's profile.
+[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 REPO="$PREFIX-mcp-server"
@@ -126,7 +127,7 @@ log "MCP server Runtime ($RUNTIME_NAME)"
 ROLE_ARN="$(aws cloudformation describe-stacks --stack-name "$PREFIX-agentcore" \
   --query "Stacks[0].Outputs[?OutputKey=='ExecutionRoleArn'].OutputValue" --output text 2>/dev/null)"
 [ -n "$ROLE_ARN" ] && [ "$ROLE_ARN" != "None" ] || {
-  echo "execution role not found — run scripts/deploy.sh --base first"; exit 1; }
+  echo "execution role not found — run ./deploy.sh base first"; exit 1; }
 
 ARTIFACT="{\"containerConfiguration\":{\"containerUri\":\"$ECR:$TAG\"}}"
 HEADERS='{"requestHeaderAllowlist":["X-Amzn-Bedrock-AgentCore-Runtime-Custom-Lark-Token"]}'
@@ -156,4 +157,4 @@ fi
 
 log "Done"
 echo "IMAGE_URI=$ECR:$TAG"
-echo "RUNTIME=$RUNTIME_NAME ($RID) — next: scripts/deploy.sh --runtime"
+echo "RUNTIME=$RUNTIME_NAME ($RID) — next: ./deploy.sh 3lo"

@@ -44,7 +44,8 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
 | `mcp-server/` | Lark MCP server (AgentCore Runtime, lark-cli engine) — calls Lark as the user |
-| `scripts/` | deploy / build-mcp / setup-3lo / setup-lark / manage-allowlist / destroy |
+| `deploy.sh` | the deploy entry point — orders the steps in `scripts/` |
+| `scripts/` | step implementations: deploy (base/runtime/gateway) / build-mcp / setup-3lo / setup-lark / manage-allowlist / destroy |
 | `tests/` | `run.sh` (all unit suites) + e2e smoke tests that need a deployed stack |
 | `docs/architecture.md` | full architecture (core flow updated to the native path; some sections marked legacy) |
 | `docs/agentcore-behavior.md` | measured AgentCore Gateway/Runtime behavior + the CustomOauth2 3LO gap (#1424) |
@@ -52,23 +53,33 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 
 ## Deploy
 
-Prereqs: `uv`, Docker, the AgentCore CLI (`npm i -g @aws/agentcore`), and AWS credentials. The deployment target lives in `.env` (`PROFILE`, `REGION`, `MODEL_ID`); command-line env vars override it (`REGION=... scripts/deploy.sh`). Resources deploy under the `lark-agent` prefix. The first deploy into a region runs `cdk bootstrap` automatically.
+Prereqs: `uv`, Docker, the AgentCore CLI (`npm i -g @aws/agentcore`), and AWS credentials. The deployment target lives in `.env` (`PROFILE`, `REGION`, `MODEL_ID`); command-line env vars override it (`REGION=... ./deploy.sh`). Resources deploy under the `lark-agent` prefix. The first deploy into a region runs `cdk bootstrap` automatically.
 
 ```bash
 cp .env.example .env          # deployment target (PROFILE/REGION/MODEL_ID) + Lark appId/appSecret/encryptKey/token + your open_id
-scripts/deploy.sh --base      # CDK base stacks (security, agentcore, router, shim, gateway, observability)
-scripts/build-mcp.sh          # build the lark-cli MCP server image (CodeBuild ARM64) + create/update its Runtime
-scripts/setup-3lo.sh          # workload identity + OAuth credential provider; prints the callbackUrl for the Lark console
-scripts/deploy.sh --gateway   # optional: Web Search gateway in us-east-1 (only when WEB_SEARCH=true)
-scripts/deploy.sh --runtime   # build the agent image (CodeBuild ARM64) + deploy the agent Runtime (wires it to the MCP server)
-scripts/setup-lark.sh         # read .env → Secrets Manager; print webhook URL; allowlist you
+./deploy.sh                   # everything, in order — ends by printing the two URLs to register in Lark
 ```
 
-`setup-3lo.sh` registers the `lark-agent-3lo` OAuth credential provider (Lark behind the RFC-6749 shim) plus the agent's workload identity, and prints the provider `callbackUrl` — register that in the Lark console (step 4 below) before the first 3LO consent. See `docs/native-3lo-builtin-vendor.md` to add other downstream systems.
+That's the whole deploy. It runs six steps in dependency order and nothing stops to ask you anything: the two values you must paste into the Lark console don't block the deploy, they only gate the bot at runtime, so they're printed together at the end (`./deploy.sh urls` reprints them).
+
+Individual steps, for iterating — each is idempotent, so re-running any of them is safe:
+
+| Step | What |
+|---|---|
+| `./deploy.sh base` | CDK stacks (security, agentcore, router, shim, gateway, observability) |
+| `./deploy.sh mcp` | build the lark-cli MCP server image (CodeBuild ARM64) + create/update its Runtime |
+| `./deploy.sh 3lo` | workload identity + the `lark-agent-3lo` OAuth credential provider |
+| `./deploy.sh gateway` | Web Search gateway in us-east-1 — skipped unless `WEB_SEARCH=true` |
+| `./deploy.sh runtime` | build the agent image + deploy the agent Runtime |
+| `./deploy.sh lark` | seed Lark credentials to Secrets Manager + allowlist your `open_id` |
+
+Order matters in one place: `3lo` and `gateway` precede `runtime`, because the agent Runtime is created with the provider name and the gateway URL baked into its environment. `deploy.sh` handles that; the underlying implementations are in `scripts/`.
+
+`setup-3lo.sh` registers the OAuth credential provider (Lark behind the RFC-6749 shim) plus the agent's workload identity, and prints the provider `callbackUrl` — register that in the Lark console (step 4 below) before the first 3LO consent. See `docs/native-3lo-builtin-vendor.md` to add other downstream systems.
 
 Per-deployment ids (runtime/gateway) go to `.cdk-state.json` (gitignored), so `cdk.json` stays free of environment state.
 
-Optional web search: set `WEB_SEARCH=true` in `.env` and run `scripts/deploy.sh --gateway` before `--runtime`. That provisions a Gateway fronting AgentCore's built-in Web Search connector — **in us-east-1, the only region offering it**, so the agent calls it cross-region. Search carries no end-user identity, so it uses `GATEWAY_IAM_ROLE` and never touches the per-user 3LO path the Lark tools have to avoid. Off by default; the agent just runs without the tool.
+Optional web search: set `WEB_SEARCH=true` in `.env` before deploying (or run `./deploy.sh gateway` then `./deploy.sh runtime`). That provisions a Gateway fronting AgentCore's built-in Web Search connector — **in us-east-1, the only region offering it**, so the agent calls it cross-region. Search carries no end-user identity, so it uses `GATEWAY_IAM_ROLE` and never touches the per-user 3LO path the Lark tools have to avoid. Off by default; the agent just runs without the tool.
 
 ### Tear down
 
@@ -150,6 +161,6 @@ This is a **reference implementation, not production-ready as-is**. Before any r
 - **Consent-wait is time-bounded.** On first use the router posts the consent link, then holds and polls the vault up to `AUTH_WAIT_SECONDS` (45s) before falling back to "re-send after approving". A user who takes longer than that to approve just re-sends once; the token is already vaulted by then.
 - **Chat-only.** This variant has no web UI — the sibling `lark-agentcore-interceptor` is the web-UI variant. The Lark tools don't go through the Gateway either (it can't do per-user 3LO for a CustomOauth2 provider); the Gateway is used only for web search, where no user identity is involved.
 - **Two Runtimes.** The agent and the lark-cli MCP server are separate AgentCore Runtimes, both built via CodeBuild (ARM64) and created out-of-band by the CLI.
-- **A new image doesn't reach existing users by itself.** AgentCore keeps serving stored sessions from the old container, so `deploy.sh --runtime` drops the saved session ids — the next message lands on the new version.
+- **A new image doesn't reach existing users by itself.** AgentCore keeps serving stored sessions from the old container, so `./deploy.sh runtime` drops the saved session ids — the next message lands on the new version.
 - **Message counts are approximate.** `/status` reads one page of Memory events (100) and reports `100+` beyond that; it counts only `conversational` payloads, since Strands also writes session/agent state events. `/clear` deletes at most `CLEAR_EVENT_LIMIT` (200) per run — deletion is one API call per event.
 - **Token Vault exposes no metadata.** `GetResourceOauth2Token` returns just the token (or a consent URL) — no issued-at, expiry, or granted scopes — so `/auth` reports presence only.

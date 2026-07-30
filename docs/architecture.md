@@ -17,7 +17,7 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `lark-agent-3lo`, workload `lark-agent-wl` |
 | AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `lark_agent_agent_mem` (STM) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
-| AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region). Not used for the Lark tools — it can't do per-user 3LO for a CustomOauth2 provider | `stacks/gateway_stack.py`, `deploy.sh --gateway` |
+| AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region). Not used for the Lark tools — it can't do per-user 3LO for a CustomOauth2 provider | `stacks/gateway_stack.py`, `deploy.sh gateway` |
 
 ## One entrypoint, one identity
 
@@ -181,4 +181,4 @@ sequenceDiagram
 
 ## Deploy shape
 
-CDK stacks: security, agentcore, router, shim, gateway, observability. On this variant the tool path is agent-side 3LO, so the gateway stack is reduced to its service role (no mcpServer target); the shim stack (Lark OAuth RFC-6749 façade + 3LO return-url) is what the 3LO flow actually uses. Two AgentCore **Runtimes** (the agent and the lark-cli MCP server) have no CloudFormation resources in this region, so `scripts/deploy.sh` builds them out-of-band: ARM64 images via CodeBuild, runtimes created via the AgentCore CLI / control-plane; ids fed back into `cdk.json`. See `README.md` for the deploy commands and Lark console setup.
+CDK stacks: security, agentcore, router, shim, gateway, observability. On this variant the tool path is agent-side 3LO, so the gateway stack is reduced to its service role (no mcpServer target); the shim stack (Lark OAuth RFC-6749 façade + 3LO return-url) is what the 3LO flow actually uses. Two AgentCore **Runtimes** (the agent and the lark-cli MCP server) have no CloudFormation resources in this region, so `deploy.sh` builds them out-of-band: ARM64 images via CodeBuild, runtimes created via the AgentCore CLI / control-plane; ids fed back into `.cdk-state.json`. See `README.md` for the deploy commands and Lark console setup.

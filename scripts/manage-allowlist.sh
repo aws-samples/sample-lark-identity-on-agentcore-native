@@ -10,7 +10,8 @@ PROFILE="${PROFILE:-}"   # empty -> ambient creds (instance role / env), no name
 REGION="${REGION:-us-west-2}"
 TABLE="${TABLE:-lark-agent-identity}"
 export AWS_REGION="$REGION"
-[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
+# Credentials already in the environment outrank .env's profile.
+[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
 
 cmd="${1:-list}"
 key="${2:-}"

@@ -27,7 +27,8 @@ PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance rol
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
 PREFIX="lark-agent"
 export AWS_REGION="$REGION"
-[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
+# Credentials already in the environment outrank .env's profile.
+[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
 TABLE="$PREFIX-identity"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }

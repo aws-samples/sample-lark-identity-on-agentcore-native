@@ -5,7 +5,7 @@
 #   2. OAuth2 credential provider (CustomOauth2) — Lark behind the RFC-6749 shim; the
 #                           Token Vault stores/refreshes each user's Lark token here.
 #
-# Idempotent: existing resources are updated, not recreated. Run after deploy.sh --base
+# Idempotent: existing resources are updated, not recreated. Run after ./deploy.sh base
 # (needs the shim stack outputs) and before the first Lark message.
 #
 # Prints the provider callbackUrl — register it in the Lark console under
@@ -25,7 +25,8 @@ PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance rol
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
 PREFIX="lark-agent"
 export AWS_REGION="$REGION"
-[ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
+# Credentials already in the environment outrank .env's profile.
+[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
 
 WORKLOAD="$PREFIX-wl"
 PROVIDER="$PREFIX-3lo"
@@ -48,7 +49,7 @@ SHIM_AUTHORIZE="$(cfn_out "$PREFIX-shim" ShimAuthorizeUrl)"
 SHIM_TOKEN="$(cfn_out "$PREFIX-shim" ShimTokenUrl)"
 SHIM_RETURN="$(cfn_out "$PREFIX-shim" ShimReturnUrl)"
 [ -n "$SHIM_ISSUER" ] && [ "$SHIM_ISSUER" != "None" ] || {
-  echo "shim stack outputs not found — run scripts/deploy.sh --base first"; exit 1; }
+  echo "shim stack outputs not found — run ./deploy.sh base first"; exit 1; }
 
 # --- 1. workload identity -------------------------------------------------
 # The return URL allowlist is exact-match: the URL passed at token time must
