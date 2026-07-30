@@ -36,6 +36,7 @@ from strands.models import BedrockModel
 
 import lark_3lo
 import lark_notify
+import websearch
 
 log = logging.getLogger("agent.core")
 
@@ -121,11 +122,24 @@ def _build_session(actor_id: str, email: str, mem_sid: str) -> dict:
         # real cause (a missing IAM permission, most likely).
         identity_error = value
 
+    # Search doesn't depend on the user's Lark grant, so add it even when the
+    # Lark tools are unavailable — an unauthorised user can still ask questions.
+    search_mcp = None
+    if websearch.available():
+        try:
+            search_mcp = websearch.client_for(actor_id)
+            search_mcp.__enter__()
+            tools = tools + search_mcp.list_tools_sync()
+        except Exception:  # noqa: BLE001 — search is optional, Lark tools are not
+            log.exception("web search unavailable for %s", actor_id)
+            search_mcp = None
+
     agent = Agent(
         model=_model, system_prompt=_SYSTEM, tools=tools,
         session_manager=_make_session_manager(actor_id, mem_sid),
     )
-    return {"agent": agent, "mcp": mcp, "created": time.time(),
+    return {"agent": agent, "mcp": mcp, "search_mcp": search_mcp,
+            "created": time.time(),
             "auth_url": auth_url, "identity_error": identity_error}
 
 
@@ -149,11 +163,13 @@ def _get_session(actor_id: str, email: str, mem_sid: str) -> dict:
         s = _sessions.get(cache_key)
         if s and not s.get("auth_url") and (time.time() - s["created"]) < _SESSION_TTL:
             return s
-        if s and s.get("mcp"):
-            try:
-                s["mcp"].__exit__(None, None, None)  # close the stale connection
-            except Exception:
-                pass
+        if s:
+            for key in ("mcp", "search_mcp"):
+                if s.get(key):
+                    try:
+                        s[key].__exit__(None, None, None)  # close the stale connection
+                    except Exception:
+                        pass
         s = _build_session(actor_id, email, mem_sid)
         if not s.get("auth_url") and not s.get("identity_error"):
             _sessions[cache_key] = s  # cache only fully working sessions

@@ -37,4 +37,26 @@ class GatewayStack(Stack):
             assumed_by=agentcore_principal,
         )
 
+        # Web Search connector. Its gateway lives in us-east-1 — the only region
+        # offering the connector — while this role is global, so both regions are
+        # allowed here. InvokeWebSearch targets a service-owned ARN: the account
+        # segment is the literal "aws", not this account.
+        account = Stack.of(self).account
+        ws_region = "us-east-1"
+        self.gateway_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["bedrock-agentcore:InvokeGateway"],
+                resources=[
+                    f"arn:aws:bedrock-agentcore:{region}:{account}:gateway/*",
+                    f"arn:aws:bedrock-agentcore:{ws_region}:{account}:gateway/*",
+                ],
+            )
+        )
+        self.gateway_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["bedrock-agentcore:InvokeWebSearch"],
+                resources=[f"arn:aws:bedrock-agentcore:{ws_region}:aws:tool/web-search.v1"],
+            )
+        )
+
         CfnOutput(self, "GatewayRoleArn", value=self.gateway_role.role_arn)

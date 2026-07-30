@@ -174,6 +174,10 @@ class AgentCoreStack(Stack):
                     "bedrock-agentcore:GetResourceOauth2Token",
                     "bedrock-agentcore:InvokeAgentRuntime",
                     "bedrock-agentcore:InvokeAgentRuntimeForUser",
+                    # Web search reaches the agent through a Gateway (in us-east-1,
+                    # the only region offering the connector), so the caller needs
+                    # this on top of the Gateway role's own permissions.
+                    "bedrock-agentcore:InvokeGateway",
                 ],
                 resources=["*"],
             )

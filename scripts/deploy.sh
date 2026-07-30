@@ -4,7 +4,7 @@
 # Steps (idempotent — re-runnable independently):
 #   --base      CDK base stacks (security, agentcore, router, gateway, observability)
 #   --runtime   create/update the AgentCore Runtime from the built image (CLI)
-#   --gateway   create/update the MCP Gateway + demo target (CLI)
+#   --gateway   Web Search gateway in us-east-1 (only when WEB_SEARCH=true)
 #   (no arg)    run all steps in order
 #
 # Usage: [PROFILE=p REGION=r] scripts/deploy.sh [--base|--runtime|--gateway]
@@ -67,8 +67,13 @@ phase2_runtime() {
   command -v agentcore >/dev/null || { echo "agentcore CLI not found: npm i -g @aws/agentcore"; exit 1; }
   export AGENTCORE_SUPPRESS_RECOMMENDATION=1
 
-  local role model memory shim mcp_arn mcp_url
+  local role model memory shim mcp_arn mcp_url pool client pwsecret ws_url
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
+  # Cognito lets the agent mint the access token the search Gateway authorises with.
+  pool="$(cfn_out "$PREFIX-security" UserPoolId)"
+  client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
+  pwsecret="$PREFIX/cognito-password-secret"
+  ws_url="$(uv run python -c "import json,os;f='.cdk-state.json';print((json.load(open(f)) if os.path.isfile(f) else {}).get('websearch_gateway_url',''))" 2>/dev/null)"
   # MODEL_ID from .env wins; else cdk.json's default_model_id.
   model="${MODEL_ID:-$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['default_model_id'])")}"
   memory="$(uv run python -c "import json,os;f='.cdk-state.json';print((json.load(open(f)) if os.path.isfile(f) else {}).get('memory_id',''))" 2>/dev/null)"
@@ -95,7 +100,13 @@ phase2_runtime() {
     --env "SHIM_RETURN_URL=$shim" \
     --env "LARK_OAUTH_PROVIDER=lark-agent-3lo" \
     --env "AGENT_WORKLOAD_NAME=lark-agent-wl" \
-    --env "LARK_SCOPES=drive:drive docx:document offline_access"
+    --env "LARK_SCOPES=drive:drive docx:document offline_access" \
+    --env "LARK_SECRET_ID=$PREFIX/channels/lark" \
+    --env "LARK_API_DOMAIN=$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['lark_api_domain'])")" \
+    --env "COGNITO_USER_POOL_ID=$pool" \
+    --env "COGNITO_CLIENT_ID=$client" \
+    --env "COGNITO_PASSWORD_SECRET_ID=$pwsecret" \
+    --env "WEBSEARCH_GATEWAY_URL=$ws_url"
 
   # Persist the runtime id into .cdk-state.json for the dependent stacks.
   local rid
@@ -126,41 +137,70 @@ phase2_runtime() {
 }
 
 phase3_gateway() {
-  log "Phase 3 — MCP Gateway (mcpServer target wired below)"
+  # The Web Search connector is only offered in us-east-1, while everything else
+  # here runs in $REGION — so this gateway lives there and the agent calls it
+  # cross-region. That is fine: web search needs no end-user identity, so
+  # it uses GATEWAY_IAM_ROLE outbound auth and never touches the per-user 3LO path
+  # that forced the Lark tools off the Gateway in the first place.
+  if [ "${WEB_SEARCH:-false}" != "true" ]; then
+    log "Gateway — skipped (WEB_SEARCH is not true)"
+    return 0
+  fi
+  # Not configurable: us-east-1 is the only region offering the connector.
+  local ws_region="us-east-1"
+  log "Gateway — Web Search connector in $ws_region"
+
   local issuer client grole gid
   issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
   client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
   grole="$(cfn_out "$PREFIX-gateway" GatewayRoleArn)"
+  [ -n "$issuer" ] && [ "$issuer" != "None" ] || { echo "security stack outputs missing — run --base first"; exit 1; }
 
-  gid="$(aws bedrock-agentcore-control list-gateways \
-    --query "items[?name=='${PREFIX}-gw'].gatewayId" --output text 2>/dev/null || true)"
-
+  # IAM roles are global, so the role from the main region is reused as-is.
+  gid="$(aws bedrock-agentcore-control list-gateways --region "$ws_region" \
+    --query "items[?name=='${PREFIX}-websearch-gw'].gatewayId" --output text 2>/dev/null || true)"
   if [ -z "$gid" ] || [ "$gid" = "None" ]; then
-    log "creating gateway"
-    # Identity variant: no interceptor. sessionConfiguration is REQUIRED for warm
-    # microVM reuse (measured — without it every tool call cold-starts). Protocol
-    # 2025-11-25 for the 3LO elicitation flow (lark-mcp negotiates it — measured).
-    gid="$(aws bedrock-agentcore-control create-gateway \
-      --name "${PREFIX}-gw" \
+    echo "  creating gateway"
+    gid="$(aws bedrock-agentcore-control create-gateway --region "$ws_region" \
+      --name "${PREFIX}-websearch-gw" \
       --protocol-type MCP \
       --protocol-configuration '{"mcp":{"supportedVersions":["2025-11-25"],"sessionConfiguration":{"sessionTimeoutInSeconds":3600}}}' \
       --role-arn "$grole" \
       --authorizer-type CUSTOM_JWT \
       --authorizer-configuration "{\"customJWTAuthorizer\":{\"discoveryUrl\":\"$issuer/.well-known/openid-configuration\",\"allowedClients\":[\"$client\"]}}" \
       --query gatewayId --output text)"
+    # A gateway is briefly CREATING; targets can't be added until it settles.
+    for _ in $(seq 1 30); do
+      [ "$(aws bedrock-agentcore-control get-gateway --region "$ws_region" \
+           --gateway-identifier "$gid" --query status --output text 2>/dev/null)" = "READY" ] && break
+      sleep 3
+    done
   fi
-  ctx_set gateway_id "$gid"
+  echo "  gateway: $gid"
+
+  # The tool name must be WebSearch and parameterValues must be present even when
+  # empty ({} = no domain filter); the API rejects a config entry without it.
+  local tid
+  tid="$(aws bedrock-agentcore-control list-gateway-targets --region "$ws_region" \
+    --gateway-identifier "$gid" --query "items[?name=='web-search-tool'].targetId" \
+    --output text 2>/dev/null || true)"
+  if [ -z "$tid" ] || [ "$tid" = "None" ]; then
+    echo "  creating web-search target"
+    tid="$(aws bedrock-agentcore-control create-gateway-target --region "$ws_region" \
+      --gateway-identifier "$gid" --name web-search-tool \
+      --target-configuration '{"mcp":{"connector":{"source":{"connectorId":"web-search"},"configurations":[{"name":"WebSearch","parameterValues":{}}]}}}' \
+      --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]' \
+      --query targetId --output text)"
+  fi
+  echo "  target: $tid"
 
   local gurl
-  gurl="$(aws bedrock-agentcore-control get-gateway --gateway-identifier "$gid" \
-    --query gatewayUrl --output text 2>/dev/null || true)"
-  [ -n "$gurl" ] && ctx_set gateway_url "$gurl"
-
-  # TODO(Phase 3): create the mcpServer target -> lark-mcp Runtime, bound to a 3LO
-  # AUTHORIZATION_CODE OAuth credential provider (the Lark shim). Endpoint must be
-  # the URL-encoded runtime ARN; outbound auth = OAUTH (not GATEWAY_IAM_ROLE, since
-  # SigV4 would occupy the Authorization header the vaulted Lark token needs).
-  echo "  gateway ready ($gid); mcpServer target + 3LO provider wired in Phase 3"
+  gurl="$(aws bedrock-agentcore-control get-gateway --region "$ws_region" \
+    --gateway-identifier "$gid" --query gatewayUrl --output text 2>/dev/null || true)"
+  ctx_set websearch_gateway_id "$gid"
+  [ -n "$gurl" ] && [ "$gurl" != "None" ] && ctx_set websearch_gateway_url "$gurl"
+  echo "  url: $gurl"
+  echo "  next: scripts/deploy.sh --runtime  (injects the URL into the agent)"
 }
 
 case "${1:-all}" in

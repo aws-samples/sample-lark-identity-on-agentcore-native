@@ -17,11 +17,11 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `lark-agent-3lo`, workload `lark-agent-wl` |
 | AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `lark_agent_agent_mem` (STM) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
-| AgentCore Gateway | Provisioned but **not on this variant's tool path** — the Gateway can't do per-user 3LO for a CustomOauth2 provider | `stacks/gateway_stack.py` |
+| AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region). Not used for the Lark tools — it can't do per-user 3LO for a CustomOauth2 provider | `stacks/gateway_stack.py`, `deploy.sh --gateway` |
 
 ## One entrypoint, one identity
 
-> **Status (2026-07): this variant is chat-only and drives 3LO agent-side.** There is no web UI and no Gateway on the tool path — the Gateway can't do per-user 3LO for a CustomOauth2 provider (AWS gap, agentcore-samples#1424), so the agent fetches each user's token from the Token Vault itself and calls a lark-cli MCP server directly. Sections marked *(legacy)* describe the interceptor/Gateway/web-UI baseline of the sibling variant and are kept for contrast.
+> **Status (2026-07): this variant is chat-only and drives 3LO agent-side.** There is no web UI, and the Lark tools don't go through the Gateway — it can't do per-user 3LO for a CustomOauth2 provider (AWS gap, agentcore-samples#1424), so the agent fetches each user's token from the Token Vault itself and calls a lark-cli MCP server directly. The Gateway *is* used for web search, where there's no user identity to forward (see [Two tool paths](#two-tool-paths-and-why)). Sections marked *(legacy)* describe the interceptor/web-UI baseline of the sibling variant and are kept for contrast.
 
 ```
                     ┌──────────────────────────────┐        ┌──────────────────────────┐
@@ -41,13 +41,13 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
         └───┬───────────────────────────────────────────┬────────┘            ▲
             │ MCP over SigV4, user's Lark token         │ answer, when ready  │ RFC-6749
             │ in X-Amzn-…-Custom-Lark-Token             │ (tenant token)      │
-            ▼                                           │          ┌──────────┴────────────┐
-    ┌──────────────────────────────┐                    │          │  Lark OAuth shim      │
-    │  Lark MCP server (lark-cli)  │                    │          │  form ⇄ JSON,         │
-    │  runs lark-cli AS the user   │                    │          │  code≠0 → 4xx         │
-    └──────────────┬───────────────┘                    │          │  /return: complete +  │
-         Authorization: Bearer                          │          │  DM the user          │
-                   ▼                                    ▼          └──────────┬────────────┘
+            ▼                                           │         ┌───────────┴───────────┐
+    ┌──────────────────────────────┐                    │         │  Lark OAuth shim      │
+    │  Lark MCP server (lark-cli)  │                    │         │  form ⇄ JSON,         │
+    │  runs lark-cli AS the user   │                    │         │  code≠0 → 4xx         │
+    └──────────────┬───────────────┘                    │         │  /return: complete +  │
+         Authorization: Bearer                          │         │  DM the user          │
+                   ▼                                    ▼         └───────────┬───────────┘
               Lark REST API ◀─────────────────────────────────────────────────┘
               → only what THIS user can see. Lark adjudicates.       consent
 ```
@@ -58,9 +58,11 @@ First use (consent-wait): no vaulted token → the router posts a clickable 点�
 
 Answers come back asynchronously. A turn that researches something and writes it into a document outlasts any request/response window — `InvokeAgentRuntime` and the router's Lambda both cap out — and being cut off mid-way is the worst case, since the work often finished while the user was told it failed. So `chat_async` accepts the turn, returns at once, runs it on a background thread, and posts the result to the chat with the app's tenant token. `/ping` reports `HealthyBusy` for the duration, which is what stops AgentCore from reclaiming the container mid-turn; that defers idle reclamation but not the 8-hour instance ceiling. The router's async self-invocation also disables Lambda's default retries — a timeout counts as a function error there, so retries would replay the whole turn and duplicate both the work and the reply.
 
-## Why Lark is wrapped in Cognito *(legacy — this variant has no Cognito/web UI)*
+## Why Lark is wrapped in Cognito *(the web-UI exchange is legacy; the pool itself is still used)*
 
-Lark is **not** a standard OIDC provider (no `id_token`, no discovery endpoint), so its login can't be plugged straight into an AgentCore/API-Gateway JWT authorizer. `web_api` performs a token exchange: Lark login code → Lark user info → Cognito `AdminCreateUser`/`AdminInitiateAuth` → a standard Cognito JWT (username = `lark:{open_id}`). Downstream, everything validates a normal Cognito JWT.
+Lark is **not** a standard OIDC provider (no `id_token`, no discovery endpoint), so its login can't be plugged straight into a JWT authorizer. The sibling variant's `web_api` exchanged a Lark login code for a Cognito JWT (username = `lark:{open_id}`) to authenticate its web UI — that path is gone here.
+
+The pool still earns its place, though: the search Gateway's `customJWTAuthorizer` needs a JWT, and `agent/identity.py` mints one per user on demand (`AdminInitiateAuth` with an HMAC-derived password, so nothing is user-chosen). It must be the **access** token — the Gateway validates the `client_id` claim, which only access tokens carry; an ID token 403s with `insufficient_scope`.
 
 ## The Gateway → Lark path (a common point of confusion) *(legacy — no Gateway on this variant's tool path)*
 
@@ -95,6 +97,27 @@ Note the deliberate split: the Runtime uses SigV4 inbound (so the webhook + web 
 - **Permission inheritance** (authorization): the MCP server calls Lark with that user's `user_access_token`, so Lark returns only what the user can see. Access is decided by Lark, not by our code. This is the stronger property: even a prompt-injected agent reaches only the user's own data, and only within the scopes they consented to (`drive:drive`, `docx:document`).
 
 Authorization is scoped per downstream system, not per bot: each one gets its own OAuth credential provider, and the vault keys tokens by `(provider, userId)`. The router carries that mapping in `IDP_REGISTRY` (written by `scripts/setup-3lo.sh`), which is what lets `/auth` report status per IdP and `/auth <idp>` re-consent just one of them. Adding a downstream system means registering a provider and appending a registry entry — see `docs/native-3lo-builtin-vendor.md`.
+
+## Two tool paths, and why
+
+| | Lark tools | Web search |
+|---|---|---|
+| Needs the end user's identity | yes — it reads *their* documents | no — it queries Amazon's web index |
+| How the agent reaches it | direct to the lark-cli Runtime (SigV4 + the user's token in a custom header) | through an AgentCore Gateway (MCP) |
+| Outbound credential | the user's vaulted Lark token | `GATEWAY_IAM_ROLE` |
+
+The split isn't stylistic. The Gateway is the natural home for tools, but it cannot inject a
+per-user token for a `CustomOauth2` provider (agentcore-samples#1424), which is why the Lark
+tools bypass it and the agent drives 3LO itself. Web search has no such problem: with no user
+identity to forward, `GATEWAY_IAM_ROLE` is all it needs, so it uses the Gateway as intended.
+
+The Web Search connector is only offered in **us-east-1**, so its gateway lives there even
+when the rest of the stack doesn't, and the agent calls it cross-region. Inbound auth is a
+Cognito **access** token (the Gateway validates the `client_id` claim, which ID tokens lack) —
+this is what the Cognito user pool is for on this variant. Two IAM actions are required:
+`InvokeGateway` on the gateway, and `InvokeWebSearch` on `…:aws:tool/web-search.v1`, whose
+account segment is the literal `aws`, not yours. Search is optional: `WEB_SEARCH=false` skips
+the gateway entirely, and the agent simply runs without that tool.
 
 ## Conversation memory
 
