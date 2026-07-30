@@ -49,15 +49,30 @@ async def handle_invocations(request: web.Request) -> web.Response:
     if action == "warmup":
         return web.json_response({"ready": True})
 
+    if action == "reauth":
+        actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
+        idp = payload.get("message", "") or "lark"   # router sends the idp key here
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, agent_core.reauth, actor_id, idp
+            )
+            return web.json_response(result)
+        except Exception as e:
+            log.exception("reauth failed")
+            return web.json_response({"error": str(e)})
+
     if action == "chat":
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
         message = payload.get("message", "")
         email = payload.get("email", "")
+        # Memory thread id is chosen by the caller (router) — that's what makes
+        # /reset and /new able to start a new thread without deleting anything.
+        mem_sid = payload.get("memorySessionId", "")
         if not message:
             return web.json_response({"error": "message required"}, status=400)
         try:
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.chat_result, actor_id, message, email
+                None, agent_core.chat_result, actor_id, message, email, mem_sid
             )
             # {reply, needs_auth, auth_url?} — router drives the consent wait.
             return web.json_response(result)

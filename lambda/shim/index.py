@@ -43,6 +43,9 @@ _TOKEN_URL = f"{_TOKEN_DOMAIN}/open-apis/authen/v2/oauth/token"
 _AUTHORIZE_URL = f"{_AUTHORIZE_DOMAIN}/open-apis/authen/v1/authorize"
 
 _agentcore = boto3.client("bedrock-agentcore", region_name=_REGION)
+_secrets = boto3.client("secretsmanager", region_name=_REGION)
+# Set to notify the user in chat once consent completes (see _notify_chat).
+_LARK_SECRET_ID = os.environ.get("LARK_SECRET_ID", "")
 
 
 # ------------------------------- helpers ------------------------------------
@@ -148,6 +151,12 @@ def handle_token(form: dict, headers: dict) -> dict:
         if body.get("refresh_token"):
             clean["refresh_token"] = body["refresh_token"]
             clean["refresh_token_expires_in"] = body.get("refresh_token_expires_in")
+        # Lifetimes only — never log the tokens themselves.
+        logger.info(
+            "token ok: grant=%s expires_in=%s refresh_expires_in=%s scope=%r",
+            payload.get("grant_type"), body.get("expires_in"),
+            body.get("refresh_token_expires_in"), body.get("scope", ""),
+        )
         return _resp(200, clean)
 
     # Error: force a non-2xx even if Lark answered HTTP 200 with a nonzero code.
@@ -197,8 +206,53 @@ def handle_return(qs: dict) -> dict:
         logger.exception("CompleteResourceTokenAuth failed")
         return {"statusCode": 502, "headers": {"Content-Type": "text/html"},
                 "body": f"<h3>Authorization failed</h3><p>{e}</p>"}
+    # Tell the user in chat — the browser only sees this static page, and the
+    # router can't reliably detect completion by polling (a re-auth keeps the old
+    # token until the new one lands). This is the precise signal.
+    _notify_chat(user_id, "✅ 授权成功，现在可以直接提问了。")
     return {"statusCode": 200, "headers": {"Content-Type": "text/html"},
             "body": "<h3>Authorized</h3><p>You can close this tab and return to the chat.</p>"}
+
+
+def _post_json(url: str, body: dict, bearer: str = "") -> dict:
+    """POST JSON, returning the parsed body (errors included — caller decides)."""
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return json.loads(e.read().decode() or "{}")
+
+
+def _notify_chat(actor_id: str, text: str) -> None:
+    """Best-effort DM to the user who just consented. actor_id is "lark:{open_id}";
+    Lark takes open_id directly as receive_id, so no chat_id lookup is needed."""
+    if not _LARK_SECRET_ID:
+        return
+    open_id = actor_id.split(":", 1)[1] if ":" in actor_id else actor_id
+    try:
+        secret = json.loads(
+            _secrets.get_secret_value(SecretId=_LARK_SECRET_ID)["SecretString"])
+        tok = _post_json(
+            f"{_TOKEN_DOMAIN}/open-apis/auth/v3/tenant_access_token/internal",
+            {"app_id": secret["appId"], "app_secret": secret["appSecret"]},
+        ).get("tenant_access_token", "")
+        if not tok:
+            logger.warning("notify: no tenant token")
+            return
+        _post_json(
+            f"{_TOKEN_DOMAIN}/open-apis/im/v1/messages?receive_id_type=open_id",
+            {"receive_id": open_id, "msg_type": "text",
+             "content": json.dumps({"text": text})},
+            bearer=tok,
+        )
+        logger.info("notify: told %s the consent completed", actor_id)
+    except Exception:
+        logger.exception("notify: failed to message %s", actor_id)
 
 
 # ------------------------------- entry --------------------------------------

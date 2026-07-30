@@ -5,7 +5,12 @@ profile/session is shared. Table layout (single-table):
   CHANNEL#lark:{open_id} / PROFILE   -> {userId}
   USER#{userId}          / PROFILE   -> profile
   USER#{userId}          / SESSION   -> {sessionId, lastActivity}
+  USER#{userId}          / MEMSESSION-> {memorySessionId, createdAt}
   ALLOW#lark:{open_id}   / ALLOW     -> allowlist entry
+
+The runtime session (which microVM serves a request) and the Memory thread (where
+history is stored) are separate ids so they can be rotated independently — see
+get_or_create_memory_session.
 """
 
 from __future__ import annotations
@@ -83,3 +88,102 @@ def get_or_create_session(user_id: str) -> str:
         "sessionId": session_id, "lastActivity": int(time.time()),
     })
     return session_id
+
+
+def drop_session(user_id: str) -> None:
+    """Forget the stored session id — the next message starts a new AgentCore
+    session (and therefore a new runtime instance)."""
+    _table.delete_item(Key={"PK": f"USER#{user_id}", "SK": "SESSION"})
+
+
+_MEMORY_ID: str | None = None
+
+
+def _memory_id() -> str:
+    """The agent's Memory id, discovered by name prefix (the AgentCore CLI creates
+    it as <runtime_name>_mem-<suffix>, so it isn't known at CDK synth time)."""
+    global _MEMORY_ID
+    if _MEMORY_ID is None:
+        prefix = os.environ.get("MEMORY_NAME_PREFIX", "lark_agent")
+        ctl = boto3.client("bedrock-agentcore-control", region_name=_REGION)
+        ids = [m["id"] for m in ctl.list_memories(maxResults=100).get("memories", [])
+               if m["id"].startswith(prefix)]
+        _MEMORY_ID = ids[0] if ids else ""
+    return _MEMORY_ID
+
+
+def session_info(user_id: str) -> dict:
+    """Current session id + lastActivity, or {} when no session is stored."""
+    item = _table.get_item(Key={"PK": f"USER#{user_id}", "SK": "SESSION"}).get("Item") or {}
+    return {"sessionId": item.get("sessionId", ""),
+            "lastActivity": int(item.get("lastActivity", 0) or 0)}
+
+
+def get_or_create_memory_session(user_id: str, actor_id: str) -> str:
+    """The Memory thread the agent writes history under. Stored separately from the
+    runtime session so the two can be rotated independently: /reset rotates only
+    this one, /reconnect rotates only the runtime one, /new rotates both. Rotating
+    means "use a new id" — no events are deleted."""
+    item = _table.get_item(Key={"PK": f"USER#{user_id}", "SK": "MEMSESSION"}).get("Item")
+    if item and item.get("memorySessionId"):
+        return item["memorySessionId"]
+    # Seed with the agent's legacy per-user id so existing history stays visible.
+    mem_sid = "sess-" + hashlib.sha256(actor_id.encode()).hexdigest()[:32]
+    _table.put_item(Item={"PK": f"USER#{user_id}", "SK": "MEMSESSION",
+                          "memorySessionId": mem_sid, "createdAt": int(time.time())})
+    return mem_sid
+
+
+def rotate_memory_session(user_id: str) -> str:
+    """Point the user at a brand-new Memory thread (old events are kept, just no
+    longer read). Returns the new id."""
+    mem_sid = f"sess-{uuid.uuid4().hex}"
+    _table.put_item(Item={"PK": f"USER#{user_id}", "SK": "MEMSESSION",
+                          "memorySessionId": mem_sid, "createdAt": int(time.time())})
+    return mem_sid
+
+
+_COUNT_PAGE = 100
+
+
+def count_events(actor_id: str, session_id: str) -> tuple[int, bool]:
+    """(messages, capped) for this Memory thread. Only `conversational` payloads
+    count — Strands also writes session/agent state blobs that would inflate the
+    number. Reads a single page: this is a diagnostic, and walking a long thread
+    would mean hundreds of API calls."""
+    memory_id = _memory_id()
+    if not memory_id or not session_id:
+        return 0, False
+    core = boto3.client("bedrock-agentcore", region_name=_REGION)
+    page = core.list_events(memoryId=memory_id, actorId=actor_id,
+                            sessionId=session_id, maxResults=_COUNT_PAGE)
+    n = sum(1 for ev in page.get("events", [])
+            if any("conversational" in p for p in ev.get("payload") or []))
+    return n, bool(page.get("nextToken"))
+
+
+# Deleting is one API call per event, so cap it — the caller reports what is left.
+_CLEAR_LIMIT = int(os.environ.get("CLEAR_EVENT_LIMIT", "200"))
+
+
+def clear_history(actor_id: str, session_id: str) -> tuple[int, bool]:
+    """Really delete this Memory thread's events (unlike rotating to a new thread,
+    which just stops reading the old one). Returns (deleted, more_left)."""
+    memory_id = _memory_id()
+    if not memory_id or not session_id:
+        return 0, False
+    core = boto3.client("bedrock-agentcore", region_name=_REGION)
+    deleted = 0
+    while deleted < _CLEAR_LIMIT:
+        page = core.list_events(memoryId=memory_id, actorId=actor_id,
+                               sessionId=session_id, maxResults=100)
+        events = page.get("events", [])
+        if not events:
+            return deleted, False
+        for ev in events:
+            if deleted >= _CLEAR_LIMIT:
+                return deleted, True
+            core.delete_event(memoryId=memory_id, actorId=actor_id,
+                              sessionId=session_id, eventId=ev["eventId"])
+            deleted += 1
+    return deleted, True

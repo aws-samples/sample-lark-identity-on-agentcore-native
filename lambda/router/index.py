@@ -10,6 +10,7 @@ Identity: lark:{open_id} — the same identity the web UI resolves to.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
@@ -42,12 +43,15 @@ lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 
 # ------------------------------- invoke agent -------------------------------
 
-def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str) -> dict:
+def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
+                 action: str = "chat", mem_sid: str = "") -> dict:
     """Invoke the agent once. Returns the parsed response dict
     {reply, needs_auth, auth_url?} (or {reply:<raw>} on non-JSON)."""
     payload = json.dumps({
-        "action": "chat", "userId": user_id, "actorId": actor_id,
+        "action": action, "userId": user_id, "actorId": actor_id,
         "channel": "lark", "message": message,
+        # The router owns the Memory thread id (see identity.get_or_create_memory_session).
+        "memorySessionId": mem_sid,
     }).encode()
     resp = agentcore.invoke_agent_runtime(
         agentRuntimeArn=RUNTIME_ARN, qualifier=QUALIFIER,
@@ -71,33 +75,55 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str) -> 
 # timeout we fall back to "send your message again".
 AUTH_WAIT_SECONDS = int(os.environ.get("AUTH_WAIT_SECONDS", "45"))
 AUTH_POLL_INTERVAL = float(os.environ.get("AUTH_POLL_INTERVAL", "2"))
-LARK_OAUTH_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "lark-id-3lo")
-AGENT_WORKLOAD_NAME = os.environ.get("AGENT_WORKLOAD_NAME", "lark-id-agent-wl")
+LARK_OAUTH_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "lark-agent-3lo")
+AGENT_WORKLOAD_NAME = os.environ.get("AGENT_WORKLOAD_NAME", "lark-agent-wl")
 LARK_SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
 SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # required by GetResourceOauth2Token
 
+# One runtime can front several IdPs — one OAuth provider per downstream system.
+# IDP_REGISTRY is a JSON list of {key, provider, scopes, label}; `key` is what the
+# user types (/auth lark). Falls back to the single-provider env vars.
+def _load_idps() -> dict:
+    raw = os.environ.get("IDP_REGISTRY", "").strip()
+    if raw:
+        try:
+            return {i["key"]: i for i in json.loads(raw)}
+        except Exception:
+            logger.exception("bad IDP_REGISTRY, falling back to single provider")
+    return {"lark": {"key": "lark", "provider": LARK_OAUTH_PROVIDER,
+                     "scopes": LARK_SCOPES, "label": "Lark"}}
 
-def user_token_vaulted(actor_id: str) -> bool:
-    """True once the user's Lark token is in the Token Vault (consent complete).
-    Same USER_FEDERATION sequence the agent uses; here we only check presence.
+
+IDPS = _load_idps()
+
+
+def user_token_vaulted(actor_id: str, idp_key: str = "lark") -> bool:
+    """True once this user's token for `idp_key` is in the Token Vault (consent
+    complete). Same USER_FEDERATION sequence the agent uses; presence check only.
     ResourceOauth2ReturnUrl is required even for a presence check — without a
     valid token AgentCore refuses the call rather than returning empty."""
+    idp = IDPS.get(idp_key)
+    if not idp:
+        return False
     try:
         wat = agentcore.get_workload_access_token_for_user_id(
             workloadName=AGENT_WORKLOAD_NAME, userId=actor_id
         )["workloadAccessToken"]
         kwargs = dict(
             workloadIdentityToken=wat,
-            resourceCredentialProviderName=LARK_OAUTH_PROVIDER,
-            scopes=LARK_SCOPES,
+            resourceCredentialProviderName=idp["provider"],
+            scopes=idp["scopes"],
             oauth2Flow="USER_FEDERATION",
         )
         if SHIM_RETURN_URL:
             kwargs["resourceOauth2ReturnUrl"] = SHIM_RETURN_URL
         resp = agentcore.get_resource_oauth2_token(**kwargs)
-        return bool(resp.get("accessToken"))
+        has = bool(resp.get("accessToken"))
+        logger.info("vault check %s (%s): token=%s authUrl=%s", actor_id, idp_key,
+                    has, bool(resp.get("authorizationUrl")))
+        return has
     except Exception:
-        logger.exception("vault check failed for %s", actor_id)
+        logger.exception("vault check failed for %s (%s)", actor_id, idp_key)
         return False
 
 
@@ -176,10 +202,113 @@ def process_lark_event(body: str, headers: dict) -> None:
         return
 
     agent_message = text.strip() or "hi"
+
+    cmd = agent_message.lower()
+    if cmd in ("/help", "/?"):
+        lark.send_message(chat_id, "\n".join([
+            "可用命令：",
+            "  /auth        查看各 IdP 的授权状态",
+            "  /auth <idp>  对该 IdP 授权或重新授权",
+            "  /status      当前身份、会话与对话记录",
+            "  /new         开启新的对话（切换运行实例）",
+            "  /reset       重置对话记录（运行实例不变）",
+            "  /clear       清除对话记录（运行实例不变）",
+            "  /reconnect   切换运行实例（对话记录保留）",
+        ]))
+        return
+    # The runtime session (which microVM serves you) and the Memory thread (your
+    # conversation history) are independent ids.
+    #
+    # /reset — same runtime instance, new Memory thread (history starts over).
+    if cmd == "/reset":
+        mem_sid = identity.rotate_memory_session(user_id)
+        logger.info("memory session rotated for %s -> %s", actor_id, mem_sid)
+        lark.send_message(chat_id, "已开始新的对话记录（运行实例不变）。")
+        return
+    # /new — new runtime instance AND new Memory thread: a fully fresh start.
+    if cmd == "/new":
+        identity.drop_session(user_id)
+        mem_sid = identity.rotate_memory_session(user_id)
+        logger.info("runtime + memory session rotated for %s -> %s", actor_id, mem_sid)
+        lark.send_message(chat_id, "已开启新会话：新的对话记录，且由新的运行实例处理。")
+        return
+    # /clear — actually delete this thread's events. Different from /reset, which
+    # just starts a new thread and leaves the old data in place.
+    if cmd == "/clear":
+        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
+        n, more = identity.clear_history(actor_id, mem_sid)
+        logger.info("history deleted for %s: %d events (more=%s)", actor_id, n, more)
+        lark.send_message(
+            chat_id, f"已删除对话记录 {n} 条{'（仍有剩余，可再执行一次 /clear）' if more else ''}。")
+        return
+    # /reconnect — new runtime instance, same Memory thread. Demonstrates that
+    # AgentCore Memory outlives the container: a fresh microVM still remembers.
+    if cmd == "/reconnect":
+        identity.drop_session(user_id)
+        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
+        n, capped = identity.count_events(actor_id, mem_sid)
+        logger.info("runtime session dropped (memory kept) for %s", actor_id)
+        lark.send_message(
+            chat_id, f"已切换运行实例，对话记录保留（{n}{'+' if capped else ''} 条）"
+                     "——记忆存放在 AgentCore Memory，不随容器生命周期消失。")
+        return
+    # /auth [idp] — authorization is per-IdP (one OAuth provider per downstream
+    # system). Bare /auth lists each IdP's status; /auth <idp> starts a fresh 3LO
+    # flow for that one (idempotent — each run hands out a new consent link).
+    if cmd == "/auth" or cmd.startswith("/auth "):
+        arg = agent_message[5:].strip().lower()
+        if not arg:
+            lines = ["各 IdP 的授权状态："]
+            for key, idp in IDPS.items():
+                ok = user_token_vaulted(actor_id, key)
+                lines.append(f"  {'✅' if ok else '❌'} {key} ({idp.get('label', key)})"
+                             f"{'' if ok else ' — 发送 /auth ' + key + ' 授权'}")
+            lark.send_message(chat_id, "\n".join(lines))
+            return
+        if arg not in IDPS:
+            lark.send_message(
+                chat_id, f"未知的 IdP：{arg}。可用：{', '.join(IDPS) or '（未配置）'}")
+            return
+        session_id = identity.get_or_create_session(user_id)
+        result = invoke_agent(session_id, user_id, actor_id, arg, action="reauth")
+        auth_url = result.get("auth_url")
+        if auth_url:
+            label = IDPS[arg].get("label", arg)
+            lark.send_link_message(
+                chat_id, f"请授权访问你的 {label} 账号：", "点击授权", auth_url)
+            logger.info("forced re-auth for %s (idp=%s)", actor_id, arg)
+        else:
+            lark.send_message(chat_id, result.get("reply") or result.get("error", "无法发起授权"))
+        return
+    # /status — read-only diagnostics. Shows BOTH ids so the two dimensions
+    # (which microVM serves you vs. which Memory thread holds your history) are
+    # visible and their independence is obvious.
+    if cmd == "/status":
+        info = identity.session_info(user_id)
+        rt_sid = info.get("sessionId", "")
+        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
+        events, capped = identity.count_events(actor_id, mem_sid)
+        last = info.get("lastActivity", 0)
+        last_str = (datetime.datetime.fromtimestamp(last, datetime.timezone.utc)
+                    .strftime("%Y-%m-%d %H:%M UTC") if last else "—")
+        lines = [
+            f"身份：{actor_id}",
+            f"运行实例会话：{rt_sid or '尚未建立（发一条普通消息后创建）'}",
+            f"记忆线程：{mem_sid}",
+            f"该线程对话记录：{events}{'+' if capped else ''} 条",
+            f"最近活跃：{last_str}",
+            "授权状态：发送 /auth 查看",
+        ]
+        lark.send_message(chat_id, "\n".join(lines))
+        logger.info("status for %s: events=%d", actor_id, events)
+        return
+
     session_id = identity.get_or_create_session(user_id)
-    logger.info("invoking agent: session=%s msg=%r", session_id, agent_message[:80])
+    mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
+    logger.info("invoking agent: session=%s mem=%s msg=%r",
+                session_id, mem_sid, agent_message[:80])
     try:
-        result = invoke_agent(session_id, user_id, actor_id, agent_message)
+        result = invoke_agent(session_id, user_id, actor_id, agent_message, mem_sid=mem_sid)
         # First-use 3LO: post the consent link, then hold and poll the vault so
         # the user gets an answer without re-sending (bounded by AUTH_WAIT_SECONDS).
         if result.get("needs_auth"):
@@ -192,7 +321,8 @@ def process_lark_event(body: str, headers: dict) -> None:
             logger.info("awaiting consent for %s (<= %ds)", actor_id, AUTH_WAIT_SECONDS)
             if wait_for_consent(actor_id):
                 logger.info("consent complete for %s; re-invoking", actor_id)
-                result = invoke_agent(session_id, user_id, actor_id, agent_message)
+                result = invoke_agent(session_id, user_id, actor_id, agent_message,
+                                      mem_sid=mem_sid)
             else:
                 logger.info("consent wait timed out for %s", actor_id)
                 return  # link already sent; user finishes later and re-sends

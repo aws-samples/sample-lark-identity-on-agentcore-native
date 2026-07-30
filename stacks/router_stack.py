@@ -91,9 +91,11 @@ class RouterStack(Stack):
                 "REGISTRATION_OPEN": registration_open,
                 "SELF_FUNCTION_NAME": fn_name,
                 # 3LO consent-wait: poll the vault so the user needn't re-send.
-                "LARK_OAUTH_PROVIDER": "lark-id-3lo",
-                "AGENT_WORKLOAD_NAME": f"{prefix}-agent-wl",
+                "LARK_OAUTH_PROVIDER": f"{prefix}-3lo",
+                "AGENT_WORKLOAD_NAME": f"{prefix}-wl",
                 "LARK_SCOPES": "drive:drive docx:document offline_access",
+                # Per-IdP registry for /auth; written by scripts/setup-3lo.sh.
+                "IDP_REGISTRY": self.node.try_get_context("idp_registry") or "",
                 "SHIM_RETURN_URL": shim_return_url,
             },
             log_group=log_group,
@@ -159,6 +161,18 @@ class RouterStack(Stack):
                     "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
                     "bedrock-agentcore:GetWorkloadAccessToken",
                     "bedrock-agentcore:GetResourceOauth2Token",
+                ],
+                resources=["*"],
+            )
+        )
+
+        # /status counts the Memory thread's messages; /clear deletes its events.
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "bedrock-agentcore:ListMemories",
+                    "bedrock-agentcore:ListEvents",
+                    "bedrock-agentcore:DeleteEvent",
                 ],
                 resources=["*"],
             )

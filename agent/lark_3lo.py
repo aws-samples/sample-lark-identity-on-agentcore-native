@@ -34,8 +34,8 @@ from mcp.client.streamable_http import streamablehttp_client
 from strands.tools.mcp.mcp_client import MCPClient
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
-_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "lark-id-3lo")
-_WORKLOAD = os.environ.get("AGENT_WORKLOAD_NAME", "lark-id-agent-wl")
+_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "lark-agent-3lo")
+_WORKLOAD = os.environ.get("AGENT_WORKLOAD_NAME", "lark-agent-wl")
 _SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # bare, allowlisted on the workload
 _LARK_MCP_URL = os.environ.get("LARK_MCP_URL", "")        # SigV4 Runtime MCP invocations URL
 _SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
@@ -48,11 +48,12 @@ def _b64url(s: str) -> str:
     return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
 
 
-def get_user_lark_token(actor_id: str) -> tuple[str, str]:
+def get_user_lark_token(actor_id: str, force: bool = False) -> tuple[str, str]:
     """Return ("token", <lark token>) if vaulted, else ("auth_url", <url>).
 
     actor_id is "lark:{open_id}" — the same id the token was (or will be) vaulted
     under, carried through as customState so the shim /return can complete it.
+    force=True always starts a fresh 3LO flow, ignoring any vaulted token.
     """
     wat = _agentcore.get_workload_access_token_for_user_id(
         workloadName=_WORKLOAD, userId=actor_id
@@ -63,6 +64,7 @@ def get_user_lark_token(actor_id: str) -> tuple[str, str]:
         scopes=_SCOPES,
         oauth2Flow="USER_FEDERATION",
         customState=_b64url(actor_id),
+        forceAuthentication=force,
     )
     if _SHIM_RETURN_URL:
         kwargs["resourceOauth2ReturnUrl"] = _SHIM_RETURN_URL

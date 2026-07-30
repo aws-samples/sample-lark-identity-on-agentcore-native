@@ -77,12 +77,11 @@ def _make_session_manager(actor_id: str, session_id: str):
     return AgentCoreMemorySessionManager(cfg, region_name=_REGION)
 
 
-def _build_session(actor_id: str, email: str) -> dict:
+def _build_session(actor_id: str, email: str, mem_sid: str) -> dict:
     """Build a session for this user. Agent-side 3LO: if the user's Lark token is
     vaulted, open an MCP client to lark-mcp (SigV4 + token in the custom header)
     and list tools; if not, carry the auth_url so run_chat can prompt the user.
     The MCP client is entered once and kept open for the session."""
-    session_id = _session_id_for(actor_id)
     mcp = None
     tools = []
     auth_url = None
@@ -101,7 +100,7 @@ def _build_session(actor_id: str, email: str) -> dict:
 
     agent = Agent(
         model=_model, system_prompt=_SYSTEM, tools=tools,
-        session_manager=_make_session_manager(actor_id, session_id),
+        session_manager=_make_session_manager(actor_id, mem_sid),
     )
     return {"agent": agent, "mcp": mcp, "created": time.time(), "auth_url": auth_url}
 
@@ -112,13 +111,13 @@ _AUTH_PROMPT = (
 )
 
 
-def _get_session(actor_id: str, email: str) -> dict:
+def _get_session(actor_id: str, email: str, mem_sid: str) -> dict:
     """Return the cached session for this user, rebuilding it if absent or near
     token expiry. A pending-authorization session (no token yet) is NOT cached —
     so the next turn re-checks the vault and picks up a freshly consented token."""
-    session_id = _session_id_for(actor_id)
+    cache_key = f"{actor_id}|{mem_sid}"
     with _lock:
-        s = _sessions.get(session_id)
+        s = _sessions.get(cache_key)
         if s and not s.get("auth_url") and (time.time() - s["created"]) < _SESSION_TTL:
             return s
         if s and s.get("mcp"):
@@ -126,34 +125,58 @@ def _get_session(actor_id: str, email: str) -> dict:
                 s["mcp"].__exit__(None, None, None)  # close the stale connection
             except Exception:
                 pass
-        s = _build_session(actor_id, email)
+        s = _build_session(actor_id, email, mem_sid)
         if not s.get("auth_url"):
-            _sessions[session_id] = s  # only cache authorized sessions
+            _sessions[cache_key] = s  # only cache authorized sessions
         return s
 
 
-def chat_result(actor_id: str, message: str, email: str = "") -> dict:
+def chat_result(actor_id: str, message: str, email: str = "",
+                mem_sid: str = "") -> dict:
     """Non-streaming chat → {reply, needs_auth, auth_url}. History via Memory.
     When the user hasn't authorized Lark yet, needs_auth is True and auth_url is
     the raw consent URL, so the caller (router) can drive the wait-for-consent
     loop instead of asking the user to re-send."""
-    s = _get_session(actor_id, email)
+    s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id))
     if s.get("auth_url"):
         return {"reply": _AUTH_PROMPT.format(url=s["auth_url"]),
                 "needs_auth": True, "auth_url": s["auth_url"]}
     return {"reply": str(s["agent"](message)), "needs_auth": False}
 
 
-def run_chat(actor_id: str, message: str, email: str = "") -> str:
+def run_chat(actor_id: str, message: str, email: str = "",
+             mem_sid: str = "") -> str:
     """Back-compat: assistant's final text (or the consent prompt)."""
-    return chat_result(actor_id, message, email)["reply"]
+    return chat_result(actor_id, message, email, mem_sid)["reply"]
+
+
+def reauth(actor_id: str, idp: str = "lark") -> dict:
+    """Start a fresh 3LO flow for `idp` even when a token is already vaulted →
+    {auth_url}. Authorization is per-IdP; only "lark" is wired up so far (add a
+    module like lark_3lo for each new downstream system)."""
+    if idp not in ("", "lark"):
+        return {"reply": f"IdP 尚未接入：{idp}", "needs_auth": False}
+    # Drop every cached session for this user so the next turn re-reads the vault.
+    with _lock:
+        for key in [k for k in _sessions if k.startswith(f"{actor_id}|")]:
+            s = _sessions.pop(key, None)
+            if s and s.get("mcp"):
+                try:
+                    s["mcp"].__exit__(None, None, None)
+                except Exception:
+                    pass
+    kind, value = lark_3lo.get_user_lark_token(actor_id, force=True)
+    if kind == "auth_url":
+        return {"reply": _AUTH_PROMPT.format(url=value),
+                "needs_auth": True, "auth_url": value}
+    return {"reply": "Already authorized.", "needs_auth": False}
 
 
 def stream_chat(actor_id: str, message: str, email: str = "") -> Iterator[str]:
     """Streaming chat for the WebSocket path. Yields text deltas."""
     import asyncio
 
-    s = _get_session(actor_id, email)
+    s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id))
     if s.get("auth_url"):
         yield _AUTH_PROMPT.format(url=s["auth_url"])
         return
