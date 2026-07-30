@@ -8,12 +8,16 @@
 # Usage: [PROFILE=p REGION=r] scripts/build-mcp.sh
 set -euo pipefail
 
-PROFILE="${PROFILE:-}"   # empty -> ambient creds
-REGION="${REGION:-us-west-2}"
-PREFIX="lark-id"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
+
+# Deployment target: command-line env vars win over .env, which wins over defaults.
+_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}"
+[ -f .env ] && { set -a; . ./.env; set +a; }
+PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds
+REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
+PREFIX="lark-agent"
 export AWS_REGION="$REGION"
 [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 REPO="$PREFIX-mcp-server"
@@ -23,6 +27,9 @@ TAG="cli-$LARK_CLI_VERSION"
 PROJECT="$PREFIX-mcp-builder"
 SRC_BUCKET="bedrock-agentcore-codebuild-sources-$ACCOUNT-$REGION"
 CB_ROLE_NAME="$PREFIX-mcp-builder-role"
+RUNTIME_NAME="${PREFIX//-/_}_mcp"        # AgentCore runtime names use underscores
+LARK_API_DOMAIN="${LARK_API_DOMAIN:-https://open.larksuite.com}"   # CN: open.feishu.cn
+: "${LARK_APP_ID:?set LARK_APP_ID in .env}"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 
@@ -46,6 +53,11 @@ aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 || \
 echo "  $ECR"
 
 log "Upload build source to S3"
+# The agentcore CLI normally creates this bucket, but it may not have run yet in 
+# the target region — create it on demand so the first build in a fresh region works.
+aws s3api head-bucket --bucket "$SRC_BUCKET" >/dev/null 2>&1 || \
+  aws s3api create-bucket --bucket "$SRC_BUCKET" \
+    --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null
 SRC_KEY="$PREFIX-mcp/source.zip"
 TMPZIP="$(mktemp -u).zip"   # -u: name only, let zip create it (zip rejects a pre-existing empty file)
 ( cd mcp-server && zip -qr "$TMPZIP" . -x '*.pyc' '__pycache__/*' )  # Dockerfile + proxy.py + any other source
@@ -94,12 +106,54 @@ rm -f "$PROJ_FILE"  # safe-rm-ok
 log "Start build"
 BID="$(aws codebuild start-build --project-name "$PROJECT" --query 'build.id' --output text)"
 echo "  build: $BID"
+ph=""
 while :; do
   ph="$(aws codebuild batch-get-builds --ids "$BID" --query 'builds[0].buildStatus' --output text)"
-  [ "$ph" = "IN_PROGRESS" ] || { echo "  build status: $ph"; break; }
+  if [ "$ph" != "IN_PROGRESS" ]; then
+    echo "  build status: $ph"
+    break
+  fi
   sleep 10
 done
-[ "$ph" = "SUCCEEDED" ] || { echo "build failed — see CodeBuild logs for $BID"; exit 1; }
+if [ "$ph" != "SUCCEEDED" ]; then
+  echo "build failed — see CodeBuild logs for $BID"
+  exit 1
+fi
+
+log "MCP server Runtime ($RUNTIME_NAME)"
+# The per-user Lark token reaches the container in a custom passthrough header —
+# it is stripped at the edge unless listed in requestHeaderAllowlist.
+ROLE_ARN="$(aws cloudformation describe-stacks --stack-name "$PREFIX-agentcore" \
+  --query "Stacks[0].Outputs[?OutputKey=='ExecutionRoleArn'].OutputValue" --output text 2>/dev/null)"
+[ -n "$ROLE_ARN" ] && [ "$ROLE_ARN" != "None" ] || {
+  echo "execution role not found — run scripts/deploy.sh --base first"; exit 1; }
+
+ARTIFACT="{\"containerConfiguration\":{\"containerUri\":\"$ECR:$TAG\"}}"
+HEADERS='{"requestHeaderAllowlist":["X-Amzn-Bedrock-AgentCore-Runtime-Custom-Lark-Token"]}'
+ENVVARS="APP_ID=$LARK_APP_ID,LARK_DOMAIN=$LARK_API_DOMAIN"
+
+RID="$(aws bedrock-agentcore-control list-agent-runtimes \
+  --query "agentRuntimes[?agentRuntimeName=='$RUNTIME_NAME'].agentRuntimeId" \
+  --output text 2>/dev/null | head -1)"
+if [ -n "$RID" ] && [ "$RID" != "None" ]; then
+  aws bedrock-agentcore-control update-agent-runtime --agent-runtime-id "$RID" \
+    --agent-runtime-artifact "$ARTIFACT" --role-arn "$ROLE_ARN" \
+    --network-configuration '{"networkMode":"PUBLIC"}' \
+    --protocol-configuration '{"serverProtocol":"MCP"}' \
+    --environment-variables "$ENVVARS" \
+    --request-header-configuration "$HEADERS" >/dev/null
+  echo "  updated $RUNTIME_NAME ($RID)"
+else
+  RID="$(aws bedrock-agentcore-control create-agent-runtime --agent-runtime-name "$RUNTIME_NAME" \
+    --agent-runtime-artifact "$ARTIFACT" --role-arn "$ROLE_ARN" \
+    --network-configuration '{"networkMode":"PUBLIC"}' \
+    --protocol-configuration '{"serverProtocol":"MCP"}' \
+    --environment-variables "$ENVVARS" \
+    --request-header-configuration "$HEADERS" \
+    --query agentRuntimeId --output text)"
+  echo "  created $RUNTIME_NAME ($RID)"
+fi
 
 log "Done"
 echo "IMAGE_URI=$ECR:$TAG"
+echo "RUNTIME=$RUNTIME_NAME ($RID) — next: scripts/deploy.sh --runtime"
