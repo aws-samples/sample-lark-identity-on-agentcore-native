@@ -90,6 +90,9 @@ class RouterStack(Stack):
                 "LARK_API_DOMAIN": lark_api_domain,
                 "REGISTRATION_OPEN": registration_open,
                 "SELF_FUNCTION_NAME": fn_name,
+                # Without this the code assumed 60s and cut the agent off early,
+                # leaving part of the Lambda's budget unused.
+                "LAMBDA_TIMEOUT_SECONDS": str(timeout),
                 # 3LO consent-wait: poll the vault so the user needn't re-send.
                 "LARK_OAUTH_PROVIDER": f"{prefix}-3lo",
                 "AGENT_WORKLOAD_NAME": f"{prefix}-wl",

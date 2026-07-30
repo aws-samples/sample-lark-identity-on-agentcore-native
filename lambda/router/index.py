@@ -18,6 +18,7 @@ import re
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ReadTimeoutError
 
 import lark
 import identity
@@ -33,9 +34,11 @@ LAMBDA_TIMEOUT = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "60"))
 
 _CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_\-.]{1,200}$")
 
+# Leave a margin so the Lambda can still send a reply after a timeout.
+READ_TIMEOUT = max(LAMBDA_TIMEOUT - 10, 30)
 agentcore = boto3.client(
     "bedrock-agentcore", region_name=AWS_REGION,
-    config=Config(read_timeout=max(LAMBDA_TIMEOUT - 10, 30), connect_timeout=10,
+    config=Config(read_timeout=READ_TIMEOUT, connect_timeout=10,
                   retries={"max_attempts": 0}),
 )
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
@@ -329,7 +332,7 @@ def process_lark_event(body: str, headers: dict) -> None:
         reply = result.get("reply", "")
     except Exception as e:  # noqa: BLE001
         logger.exception("agent invocation failed")
-        reply = f"Sorry, something went wrong: {e}"
+        reply = f"抱歉，处理时出错了（{type(e).__name__}）。"
 
     if reply:
         lark.send_message(chat_id, reply)
