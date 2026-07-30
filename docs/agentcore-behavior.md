@@ -53,7 +53,7 @@ Registering a non-standard IdP (e.g. behind an RFC-6749 shim) yields a `CustomOa
 2. **A `:` in `customState`** (raw `lark:userAAA`) made AgentCore reject the authorize request with a misleading "requestUri regex" error. Fix: base64url-encode the userId into state; decode at the return endpoint.
 3. **URL mangling in transit** (double-encoded `%3A`→`%253A` / stray whitespace from copy-paste). Fix: hand the URL as one unbroken line.
 
-With all three avoided (base64url state, no server-side curl, clean URL) the identical flow succeeds — first proven with `GoogleOauth2` (built-in), then reproduced with `lark-id-3lo` (CustomOauth2). So the agent-driven path (`GetWorkloadAccessTokenForUserId` → `GetResourceOauth2Token USER_FEDERATION` → surface URL → `CompleteResourceTokenAuth`) works for **both** built-in and custom providers.
+With all three avoided (base64url state, no server-side curl, clean URL) the identical flow succeeds — first proven with `GoogleOauth2` (built-in), then reproduced with `lark-agent-3lo` (CustomOauth2). So the agent-driven path (`GetWorkloadAccessTokenForUserId` → `GetResourceOauth2Token USER_FEDERATION` → surface URL → `CompleteResourceTokenAuth`) works for **both** built-in and custom providers.
 
 **The one real, remaining AWS gap:** the **Gateway-mediated** per-user elicitation at `tools/call` still returns `{isError:true,"An internal error occurred"}` instead of `-32042` for `CustomOauth2` (awslabs/agentcore-samples #1424, "not planned"). That only means you cannot rely on the *Gateway auto-prompting* the user for a custom provider — you drive the 3LO from the agent instead (which we do). Vaulting itself is fine.
 

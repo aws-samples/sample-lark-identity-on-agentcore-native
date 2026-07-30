@@ -10,45 +10,50 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 
 | Component | What it is | Where |
 |---|---|---|
-| Router Lambda | Lark webhook ingestion (verify + AES decrypt, resolve user, invoke runtime) | `lambda/router/` |
-| web_api Lambda | Lark login-code → Cognito JWT; session bootstrap (presigned WSS); stores the user's Lark token bundle | `lambda/web_api/` |
-| Agent container | Strands agent on Bedrock; HTTP contract (8080) + WebSocket (/ws); AgentCore Memory for continuity; MCP client to the Gateway | `agent/` |
-| AgentCore Gateway | An MCP server with a Cognito JWT authorizer + a Request Interceptor | created by `scripts/deploy.sh` (control-plane CLI) |
-| Interceptor Lambda | Reads identity from the verified JWT, injects it (and a per-tenant downstream key) into the tool call | `lambda/interceptor/` |
-| Tool Lambda | MCP tool targets behind the Gateway: `whoami` (identity proof) and `list_my_docs` (acts as the user against Lark) | `lambda/tools/` |
-| Web SPA | Lark-embedded UI: h5sdk 免登 → JWT (cached in sessionStorage) → streaming chat over WSS | `web-ui/` |
+| Router Lambda | Lark webhook ingestion (verify + AES decrypt, resolve user, invoke runtime); owns both session ids; handles the chat commands | `lambda/router/` |
+| Agent container | Strands agent on Bedrock; HTTP contract (8080); AgentCore Memory for continuity; agent-side 3LO; MCP client to the lark-cli server | `agent/` |
+| Lark OAuth shim | RFC-6749 façade over Lark's non-standard token endpoint, plus the 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) | `lambda/shim/` |
+| Lark MCP server | lark-cli engine on AgentCore Runtime; calls Lark with the per-user token from a custom passthrough header | `mcp-server/` |
+| AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `lark-agent-3lo`, workload `lark-agent-wl` |
+| AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `lark_agent_agent_mem` (STM) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
-| AgentCore Memory | Per-user short-term memory (conversation history), keyed by `(actor_id, session)` | `lark_agent_agent_mem` (STM) |
+| AgentCore Gateway | Provisioned but **not on this variant's tool path** — the Gateway can't do per-user 3LO for a CustomOauth2 provider | `stacks/gateway_stack.py` |
 
 ## One entrypoint, one identity
 
-> **Status (2026-07): this variant is chat-only and drives 3LO agent-side.** There is no web UI, no Cognito, and no Gateway on the tool path — the Gateway can't do per-user 3LO for a CustomOauth2 provider (AWS gap, agentcore-samples#1424), so the agent fetches each user's token from the Token Vault itself and calls a lark-cli MCP server directly. The sections below marked *(legacy)* still describe the interceptor/Gateway/web-UI baseline and are being updated.
+> **Status (2026-07): this variant is chat-only and drives 3LO agent-side.** There is no web UI and no Gateway on the tool path — the Gateway can't do per-user 3LO for a CustomOauth2 provider (AWS gap, agentcore-samples#1424), so the agent fetches each user's token from the Token Vault itself and calls a lark-cli MCP server directly. Sections marked *(legacy)* describe the interceptor/Gateway/web-UI baseline of the sibling variant and are kept for contrast.
 
 ```
-  Lark message  ────▶  Router Lambda ──────────┐
-  (bot chat)           verify/decrypt          │  first-use 3LO (consent-wait):
-                       resolve user             │  post "点击授权" link, poll the vault,
-                       InvokeAgentRuntime SigV4 │  then re-invoke — no re-send
-                       payload carries actorId  ▼
-                             ┌─────────────────────────────────────────────────────┐
-                             │  Agent container (ARM64, AgentCore Runtime)          │
-                             │    Strands agent + AgentCore Memory (per-user STM)   │
-                             │    lark_3lo: GetResourceOauth2Token(USER_FEDERATION) │◀── AgentCore Identity
-                             └───────────────────────┬─────────────────────────────┘     Token Vault (3LO):
-                                       │ MCP (streamable HTTP), SigV4               │     stores/refreshes THIS
-                                       │ + user's Lark token in a custom header     │     user's user_access_token
-                                       ▼                                            │     (shim ⇄ Lark OAuth)
-                             ┌───────────────────┐
-                             │  Lark MCP server  │  AgentCore Runtime; lark-cli engine.
-                             │  (lark-cli)       │  Reads the custom header, runs lark-cli
-                             └─────────┬─────────┘  AS the user (LARKSUITE_CLI_USER_ACCESS_TOKEN).
-                                       │ HTTPS, Authorization: Bearer <user_access_token>
-                                       ▼
-                                  Lark REST API
-                                  → returns only what THIS user can see. Lark adjudicates.
+                    ┌──────────────────────────────┐        ┌──────────────────────────┐
+  Lark message ───▶ │  Router Lambda               │◀──────▶│  DynamoDB identity table │
+  (bot chat)        │  verify / AES-decrypt        │        │  SESSION    → runtime id │
+                    │  resolve → lark:{open_id}    │        │  MEMSESSION → memory id  │
+                    │  chat commands (/auth …)     │        │  ALLOW      → allowlist  │
+                    └──────────────┬───────────────┘        └──────────────────────────┘
+                       InvokeAgentRuntime (SigV4)
+                       runtimeSessionId + memorySessionId + actorId
+                                   ▼
+        ┌───────────────────────────────────────────────────────┐
+        │  Agent container (ARM64, AgentCore Runtime)           │      AgentCore Identity
+        │    Strands agent, history in AgentCore Memory         │      Token Vault (3LO)
+        │    lark_3lo: GetResourceOauth2Token(USER_FEDERATION)  │◀────▶ stores / refreshes
+        └───────────────────────────┬───────────────────────────┘      THIS user's token
+                    MCP over SigV4, user's Lark token                          ▲
+                    in X-Amzn-…-Custom-Lark-Token                              │ RFC-6749
+                                    ▼                             ┌────────────┴────────────┐
+                    ┌──────────────────────────────┐              │  Lark OAuth shim        │
+                    │  Lark MCP server (lark-cli)  │              │  form ⇄ JSON, code≠0→4xx│
+                    │  runs lark-cli AS the user   │              │  /return: complete +    │
+                    └──────────────┬───────────────┘              │  DM the user            │
+                        Authorization: Bearer                     └────────────┬────────────┘
+                                   ▼                                           │ consent
+                              Lark REST API ◀──────────────────────────────────┘
+                              → only what THIS user can see. Lark adjudicates.
 ```
 
-Identity is `lark:{open_id}` for every message; session, memory, and the vaulted Lark token are keyed by it.
+Identity is `lark:{open_id}` for every message, and the vaulted Lark token is keyed by it — so it survives any session change. The two session ids are separate on purpose (see [Conversation memory](#conversation-memory)): the runtime one picks the microVM, the memory one picks the history thread.
+
+First use (consent-wait): no vaulted token → the router posts a clickable 点击授权 link, holds while polling the vault, and re-invokes once consent lands, so the user gets their answer without re-sending. The shim also DMs them when consent completes, which matters for `/auth`-triggered re-consent — there the old token is still present, so polling cannot tell the difference.
 
 ## Why Lark is wrapped in Cognito *(legacy — this variant has no Cognito/web UI)*
 
@@ -83,12 +88,32 @@ Note the deliberate split: the Runtime uses SigV4 inbound (so the webhook + web 
 
 ## Identity pass-through vs permission inheritance
 
-- **Identity pass-through** (authentication): the `whoami` tool reports `lark:{open_id}` + tenant, injected by the interceptor from the verified JWT. Proves the tool learns *who* is calling, while the agent holds no downstream key.
-- **Permission inheritance** (authorization): `list_my_docs` acts *as* the user — it uses that user's Lark `user_access_token`, so Lark returns only the documents that user can see. Access is decided by Lark, not by our code. This is the stronger property: even a prompt-injected agent can only reach the user's own data, and only within the scopes the user consented to (`drive:drive`, `docx:document`).
+- **Identity pass-through** (authentication): the router resolves every message to `lark:{open_id}` and the agent fetches *that* user's token from the vault. The tool learns who is calling, while the agent itself holds no downstream credential.
+- **Permission inheritance** (authorization): the MCP server calls Lark with that user's `user_access_token`, so Lark returns only what the user can see. Access is decided by Lark, not by our code. This is the stronger property: even a prompt-injected agent reaches only the user's own data, and only within the scopes they consented to (`drive:drive`, `docx:document`).
+
+Authorization is scoped per downstream system, not per bot: each one gets its own OAuth credential provider, and the vault keys tokens by `(provider, userId)`. The router carries that mapping in `IDP_REGISTRY` (written by `scripts/setup-3lo.sh`), which is what lets `/auth` report status per IdP and `/auth <idp>` re-consent just one of them. Adding a downstream system means registering a provider and appending a registry entry — see `docs/native-3lo-builtin-vendor.md`.
 
 ## Conversation memory
 
-The agent is a Strands agent with an `AgentCoreMemorySessionManager` (STM) keyed by `(actor_id, session)`, `session_id` derived from `actor_id` — one long thread per user. History persists across reconnects and both entrypoints (30-day retention), independent of the microVM. Per-session `(agent, MCP client)` are cached and reused across messages (rebuilding per message re-handshakes the Gateway and re-lists tools, ~15–20s of avoidable latency).
+The agent is a Strands agent with an `AgentCoreMemorySessionManager` (STM) keyed by `(actor_id, memory_session_id)`. History lives in AgentCore Memory (30-day retention), so it outlives the microVM: a fresh container still reads the same thread. Per-session `(agent, MCP client)` are cached and reused across messages — rebuilding per message re-handshakes MCP and re-lists tools, ~15–20s of avoidable latency.
+
+### Two session ids, deliberately separate
+
+| Id | Decides | Owned by | Stored |
+|---|---|---|---|
+| **runtime session id** | which microVM serves the request (AgentCore binds them 1:1) | router | DynamoDB `USER#{id} / SESSION` |
+| **memory session id** | which conversation thread the agent reads and appends to | router, passed to the agent as `memorySessionId` | DynamoDB `USER#{id} / MEMSESSION` |
+
+Keeping them apart is what makes the three chat commands possible — rotating an id is instant and non-destructive, so each command just switches ids rather than deleting anything:
+
+- `/reset` → new memory thread, same instance (start over, old events kept)
+- `/reconnect` → new instance, same memory thread (proves memory outlives the container)
+- `/new` → both (a genuinely fresh start)
+- `/clear` → deletes the current thread's events (the only destructive one)
+
+Earlier the agent derived the memory id from `actor_id` itself and ignored what the router sent, which welded the two dimensions together: switching instances could never start a new thread, and the router's own reads of the thread always missed. Message counts come from `ListEvents` filtered to `conversational` payloads — Strands also writes session/agent state events, which would otherwise inflate the number.
+
+Authorization is a third, orthogonal dimension: the vaulted Lark token is keyed to `lark:{open_id}`, not to either session, so rotating sessions never forces a re-consent.
 
 ## Sequence: a web-UI turn that reads the user's docs *(legacy — no web UI; see the consent-wait flow above)*
 
