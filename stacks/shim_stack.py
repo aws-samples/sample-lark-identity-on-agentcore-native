@@ -25,10 +25,11 @@ from stacks import retention_days
 
 
 class ShimStack(Stack):
-    def __init__(self, scope: Construct, construct_id: str, *, lark_api_domain: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, *, lark_api_domain: str,
+                 lark_secret_name: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        prefix = self.node.try_get_context("resource_prefix") or "lark-id"
+        prefix = self.node.try_get_context("resource_prefix") or "lark-agent"
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
 
         log_group = logs.LogGroup(
@@ -45,13 +46,27 @@ class ShimStack(Stack):
             code=_lambda.Code.from_asset("lambda/shim"),  # stdlib + boto3 only, no deps
             timeout=Duration.seconds(15),
             memory_size=256,
-            environment={"LARK_API_DOMAIN": lark_api_domain},
+            environment={"LARK_API_DOMAIN": lark_api_domain,
+                         # Lets /return DM the user once consent completes.
+                         "LARK_SECRET_ID": lark_secret_name},
             log_group=log_group,
         )
         # The return-url handler completes the 3LO auth session.
         self.shim_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["bedrock-agentcore:CompleteResourceTokenAuth"],
             resources=["*"],
+        ))
+        # CompleteResourceTokenAuth reads the provider's Identity-managed client
+        # secret AS THE CALLER, so this role needs GetSecretValue on it.
+        self.shim_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+            resources=[
+                f"arn:aws:secretsmanager:{Stack.of(self).region}:{Stack.of(self).account}"
+                ":secret:bedrock-agentcore-identity!default/oauth2/*",
+                # Lark app credentials — used to DM the user after consent.
+                f"arn:aws:secretsmanager:{Stack.of(self).region}:{Stack.of(self).account}"
+                f":secret:{prefix}/*",
+            ],
         ))
 
         integration = apigwv2_integrations.HttpLambdaIntegration("ShimIntegration", handler=self.shim_fn)

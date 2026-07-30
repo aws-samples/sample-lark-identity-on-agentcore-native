@@ -1,6 +1,6 @@
 [project]
 name = "lark-agentcore-identity"
-version = "0.5.2"
+version = "0.5.3"
 description = "CDK app for lark-agent on Bedrock AgentCore"
 requires-python = ">=3.10"
 dependencies = [

@@ -25,7 +25,7 @@ class GatewayStack(Stack):
         super().__init__(scope, construct_id, **kwargs)
 
         region = Stack.of(self).region
-        prefix = self.node.try_get_context("resource_prefix") or "lark-id"
+        prefix = self.node.try_get_context("resource_prefix") or "lark-agent"
         agentcore_principal = iam.ServicePrincipal("bedrock-agentcore.amazonaws.com")
 
         # Gateway service role — assumed by the Gateway to sign SigV4 calls to its

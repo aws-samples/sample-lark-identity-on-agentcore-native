@@ -103,18 +103,44 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # CloudWatch logs
+        # CloudWatch logs — AgentCore Runtime writes to /aws/bedrock-agentcore/runtimes/*,
+        # so that path must be allowed or the log group is never created.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
                     "logs:CreateLogGroup",
                     "logs:CreateLogStream",
                     "logs:PutLogEvents",
+                    "logs:DescribeLogGroups",
+                    "logs:DescribeLogStreams",
                 ],
                 resources=[
                     f"arn:aws:logs:{region}:{account}:log-group:/{prefix}/*",
                     f"arn:aws:logs:{region}:{account}:log-group:/{prefix}/*:*",
+                    f"arn:aws:logs:{region}:{account}:log-group:/aws/bedrock-agentcore/runtimes/*",
+                    f"arn:aws:logs:{region}:{account}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*",
+                    f"arn:aws:logs:{region}:{account}:log-group:*",
                 ],
+            )
+        )
+
+        # Observability — traces and metrics from the runtime.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets",
+                ],
+                resources=["*"],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["cloudwatch:PutMetricData"],
+                resources=["*"],
+                conditions={"StringEquals": {"cloudwatch:namespace": "bedrock-agentcore"}},
             )
         )
 
@@ -133,6 +159,23 @@ class AgentCoreStack(Stack):
                 resources=[
                     f"arn:aws:bedrock-agentcore:{region}:{account}:memory/*",
                 ],
+            )
+        )
+
+        # Agent-side 3LO + downstream MCP. The agent fetches THIS user's Lark token
+        # from the Identity Token Vault, then invokes the lark-cli MCP Runtime with it.
+        # These data-plane actions don't support resource-level scoping.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "bedrock-agentcore:GetWorkloadAccessToken",
+                    "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+                    "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
+                    "bedrock-agentcore:GetResourceOauth2Token",
+                    "bedrock-agentcore:InvokeAgentRuntime",
+                    "bedrock-agentcore:InvokeAgentRuntimeForUser",
+                ],
+                resources=["*"],
             )
         )
 
