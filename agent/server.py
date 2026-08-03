@@ -5,7 +5,7 @@
       chat       : {action,actorId,message,email?} -> {reply}  (history via Memory)
       chat_async : same + chatId -> {accepted:true}; result is pushed to the chat
       warmup : {action} -> {ready:true}
-      status : {action} -> {ready, uptime}
+      status : {action} -> {ready, instance, uptime, sessionAge, + clock diagnostics}
 
 Chat-only scope: the sibling interceptor variant also served a WebSocket path
 for the Lark-embedded web UI; this variant's sole entrypoint is the Lark bot
@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 
 from aiohttp import web
 
@@ -26,7 +27,37 @@ import agent_core
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("agent.server")
 
-_START = time.time()
+# monotonic, not time.time(): the wall clock inherits its base from the image the
+# microVM is restored from, so time.time() at import can be minutes off — measured
+# once at 777 s of "process age" inside a kernel that had been up for 25 s.
+_START = time.monotonic()
+# Identifies the process serving a request, generated per start-up. AgentCore has no
+# instance-level API, so self-reporting is the only way to see turnover at all. It is
+# per PROCESS, not per microVM. Note what it cannot do: prove isolation. Anything
+# baked into the image or snapshot is copied to every restore — the kernel boot_id is
+# identical across concurrent sessions for exactly that reason — so only post-start
+# writes distinguish environments (verified separately: concurrent sessions cannot
+# see each other's files).
+_INSTANCE = uuid.uuid4().hex[:8]
+
+
+def _kernel_uptime() -> float | None:
+    """Seconds since the kernel booted, i.e. the microVM's own age — maintained by
+    the kernel, not by this process. Comparing it with the process's `uptime` is what
+    tells the two apart: process age can never exceed it, so a process claiming to be
+    older than its kernel would mean the probe (or the guest clock) is wrong."""
+    try:
+        with open("/proc/uptime") as f:
+            return round(float(f.read().split()[0]), 1)
+    except Exception:
+        return None
+
+# When each session was first seen here, so /status can report how long this compute
+# has served this session — distinct from the microVM's own age (/proc/uptime) and
+# from this process's age. Bounded: a long-lived process can see many sessions and
+# this is only a diagnostic.
+_SESSIONS_TRACKED = 256
+_session_first_seen: dict[str, float] = {}
 _HTTP_PORT = int(os.environ.get("PORT", "8080"))
 
 
@@ -47,8 +78,29 @@ async def handle_invocations(request: web.Request) -> web.Response:
 
     action = payload.get("action", "chat")
 
+    # AgentCore passes the runtime session id on every request (verified), which is
+    # what lets this process report per-session age rather than only its own.
+    sid = request.headers.get("x-amzn-bedrock-agentcore-runtime-session-id", "")
+    now = time.monotonic()
+    if sid:
+        if sid not in _session_first_seen and len(_session_first_seen) >= _SESSIONS_TRACKED:
+            _session_first_seen.pop(next(iter(_session_first_seen)))  # oldest inserted
+        _session_first_seen.setdefault(sid, now)
+
     if action == "status":
-        return web.json_response({"ready": True, "uptime": round(time.time() - _START, 1)})
+        return web.json_response({
+            "ready": True,
+            "instance": _INSTANCE,
+            # This process's age. Not the microVM's — a process starts after the
+            # microVM does — and not "how long you have been served" either.
+            "uptime": round(now - _START, 1),
+            # The microVM's own age, from the kernel. This is the only field that
+            # answers "how long has this compute been running".
+            "kernelUptime": _kernel_uptime(),
+            # How long THIS session has been served by THIS process, counted from its
+            # first request. Independent of when the microVM booted.
+            "sessionAge": round(now - _session_first_seen[sid], 1) if sid else None,
+        })
 
     if action == "warmup":
         return web.json_response({"ready": True})

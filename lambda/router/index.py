@@ -85,6 +85,58 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
     return data
 
 
+# ------------------------- execution environment probe -----------------------
+
+# Measured: probing a session id with no live microVM provisions one (a fresh id
+# answered in 1.4 s), so this is NOT a passive read — /status materialises what it
+# reports. That is a fair trade for making turnover visible, but it does mean the
+# id shown may have been created by the command itself. Budget is kept short so a
+# slow cold start degrades to "unknown" instead of stalling the command.
+_PROBE_SECONDS = int(os.environ.get("STATUS_PROBE_SECONDS", "8"))
+
+
+def _microvm_line(session_id: str, user_id: str, actor_id: str) -> str:
+    """One line describing the microVM currently bound to this session id.
+
+    AgentCore's terms: a session (keyed by runtimeSessionId) is served by a
+    dedicated execution environment, realised as a microVM. The mapping is 1:1 but
+    not permanent — once the microVM is terminated (idleRuntimeSessionTimeout,
+    default 15 min; maxLifetime, default 8 h; both configurable — or
+    StopRuntimeSession; or a failed health check) the same session id gets a brand
+    new microVM with sanitized memory, not the old one back. The session id does not
+    change then, which is why it alone can't show this and the microVM reports its
+    own id (agent/server.py:_INSTANCE)."""
+    if not session_id:
+        return "无（尚未建立会话）"
+    try:
+        data = invoke_agent(session_id, user_id, actor_id, "",
+                            action="status", budget=_PROBE_SECONDS)
+    except Exception as e:  # noqa: BLE001 — diagnostics must not fail the command
+        logger.info("microVM probe failed for %s: %s", actor_id, type(e).__name__)
+        return "未知（探测超时；下条消息仍会正常处理）"
+    inst = data.get("instance")
+    if not inst:
+        return "运行中（旧镜像，未上报实例信息）"
+    # Two distinct figures, both meaningful; the process's own uptime is neither, and
+    # is deliberately not shown. kernelUptime is the microVM's age (from the kernel,
+    # the only trustworthy source); sessionAge is how long it has served this session.
+    parts = []
+    kup = data.get("kernelUptime")
+    if kup is not None:
+        parts.append(f"已运行 {_secs(kup)}")
+    age = data.get("sessionAge")
+    if age is not None:
+        parts.append(f"服务本会话 {_secs(age)}")
+    return f"{inst}（{'，'.join(parts)}）" if parts else f"{inst}（运行中）"
+
+
+def _secs(seconds) -> str:
+    """Always seconds, never minutes. The two figures shown together are meant to be
+    compared (microVM age vs. how long it has served this session), and mixed units
+    make that arithmetic awkward — this is a lifecycle demo, not a status page."""
+    return f"{int(float(seconds))} 秒"
+
+
 # ------------------------------- consent wait -------------------------------
 
 # How long the async Lambda holds, waiting for the user to finish 3LO consent.
@@ -297,9 +349,9 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
         else:
             lark.send_message(chat_id, result.get("reply") or result.get("error", "无法发起授权"))
         return
-    # /status — read-only diagnostics. Shows BOTH ids so the two dimensions
-    # (which microVM serves you vs. which Memory thread holds your history) are
-    # visible and their independence is obvious.
+    # /status — read-only diagnostics over the three independent dimensions: the
+    # session id that routes you, the container currently serving that id, and the
+    # Memory thread holding your history.
     if cmd == "/status":
         info = identity.session_info(user_id)
         rt_sid = info.get("sessionId", "")
@@ -310,7 +362,8 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
                     .strftime("%Y-%m-%d %H:%M UTC") if last else "—")
         lines = [
             f"身份：{actor_id}",
-            f"运行实例会话：{rt_sid or '尚未建立（发一条普通消息后创建）'}",
+            f"会话路由键：{rt_sid or '尚未建立（发一条普通消息后创建）'}",
+            f"当前 microVM：{_microvm_line(rt_sid, user_id, actor_id)}",
             f"记忆线程：{mem_sid}",
             f"该线程对话记录：{events}{'+' if capped else ''} 条",
             f"最近活跃：{last_str}",

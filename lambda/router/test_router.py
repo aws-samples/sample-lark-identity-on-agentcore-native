@@ -165,16 +165,19 @@ def test_memory_session_is_stable_then_rotates():
 # event count reads far higher than the number of messages (5 for one exchange).
 # Only `conversational` payloads may be counted.
 
-def _count_with(events, next_token=None):
+def _count_with(*pages):
+    """Drive count_events over a sequence of {events, nextToken?} pages, and hand
+    back the boto3 mock so callers can assert on the request itself."""
     import identity
-    page = {"events": events}
-    if next_token:
-        page["nextToken"] = next_token
     fake = mock.Mock()
-    fake.list_events.return_value = page
+    fake.list_events.side_effect = list(pages)
     with mock.patch.object(identity, "_memory_id", return_value="mem-1"), \
          mock.patch.object(identity.boto3, "client", return_value=fake):
-        return identity.count_events("lark:ou_x", "sess-1")
+        return identity.count_events("lark:ou_x", "sess-1"), fake
+
+
+def _conv(role="USER"):
+    return {"payload": [{"conversational": {"role": role}}]}
 
 
 def test_count_events_ignores_state_events():
@@ -184,18 +187,105 @@ def test_count_events_ignores_state_events():
         {"payload": [{"conversational": {"role": "USER"}}]},
         {"payload": [{"conversational": {"role": "ASSISTANT"}}]},
     ]
-    assert _count_with(events) == (2, False)       # one exchange, not four
+    (n, capped), _ = _count_with({"events": events})
+    assert (n, capped) == (2, False)               # one exchange, not four
 
 
-def test_count_events_flags_more_pages():
-    events = [{"payload": [{"conversational": {"role": "USER"}}]}]
-    assert _count_with(events, next_token="t") == (1, True)
+def test_count_events_filters_state_events_server_side():
+    """maxResults is a scan window, not a result count: without this filter the
+    page spends its budget on state events and stops early, which is how a
+    70-message thread reported "67+"."""
+    _, fake = _count_with({"events": [_conv()]})
+    sent = fake.list_events.call_args.kwargs["filter"]
+    assert sent["eventMetadata"][0]["left"]["metadataKey"] == "stateType"
+    assert sent["eventMetadata"][0]["operator"] == "NOT_EXISTS"
+
+
+def test_count_events_walks_pages_for_an_exact_number():
+    """A nextToken is not "capped" — ordinary threads must report an exact count."""
+    (n, capped), fake = _count_with(
+        {"events": [_conv(), _conv()], "nextToken": "t1"},
+        {"events": [_conv()]},                      # no token -> done
+    )
+    assert (n, capped) == (3, False)
+    assert fake.list_events.call_count == 2
+    assert fake.list_events.call_args.kwargs["nextToken"] == "t1"
+
+
+def test_count_events_caps_runaway_threads():
+    """Past the page budget it gives up and says so, rather than making unbounded
+    calls for a diagnostic."""
+    import identity
+    pages = [{"events": [_conv()], "nextToken": f"t{i}"}
+             for i in range(identity._COUNT_MAX_PAGES + 2)]
+    (n, capped), fake = _count_with(*pages)
+    assert capped is True
+    assert n == identity._COUNT_MAX_PAGES
+    assert fake.list_events.call_count == identity._COUNT_MAX_PAGES
 
 
 def test_count_events_without_memory_is_zero():
     import identity
     with mock.patch.object(identity, "_memory_id", return_value=""):
         assert identity.count_events("lark:ou_x", "sess-1") == (0, False)
+
+
+# --------------------------- microVM diagnostics ----------------------------
+# /status exposes the compute layer for developers evaluating AgentCore. Two traps
+# were hit getting here: reporting the process's own age (which the wall clock made
+# nonsensical — 777 s inside a 25 s-old kernel), and mixing units so the two
+# durations couldn't be compared.
+
+def _microvm_line_with(response, session_id="ses_x"):
+    import index
+    with mock.patch.object(index, "invoke_agent", return_value=response) as inv:
+        return index._microvm_line(session_id, "user_1", "lark:ou_x"), inv
+
+
+def test_microvm_line_reports_kernel_age_and_session_age():
+    import index
+    line, inv = _microvm_line_with(
+        {"instance": "abc12345", "kernelUptime": 1830.4, "sessionAge": 65.9, "uptime": 777.0})
+    assert "abc12345" in line
+    assert "1830 秒" in line and "65 秒" in line
+    # The process's own uptime is untrustworthy (wall clock inherits the image's
+    # base), so it must not appear.
+    assert "777" not in line
+    # Probing must not spend the whole Lambda budget on a cold start.
+    assert inv.call_args.kwargs["action"] == "status"
+    assert inv.call_args.kwargs["budget"] == index._PROBE_SECONDS
+
+
+def test_microvm_line_uses_one_unit_so_the_two_are_comparable():
+    """Both durations in seconds: the point is to subtract them (equal → this microVM
+    started for you; age >> sessionAge → an existing one took over)."""
+    line, _ = _microvm_line_with(
+        {"instance": "abc12345", "kernelUptime": 7200, "sessionAge": 30})
+    assert "7200 秒" in line and "30 秒" in line
+    assert "分钟" not in line and "小时" not in line
+
+
+def test_microvm_line_without_a_session_does_not_probe():
+    """No session id means no microVM to ask about — and probing would create one."""
+    import index
+    with mock.patch.object(index, "invoke_agent") as inv:
+        line = index._microvm_line("", "user_1", "lark:ou_x")
+    assert inv.call_count == 0
+    assert "尚未建立会话" in line
+
+
+def test_microvm_line_survives_a_probe_failure():
+    """Diagnostics must never break the command that carries them."""
+    import index
+    with mock.patch.object(index, "invoke_agent", side_effect=RuntimeError("timeout")):
+        line = index._microvm_line("ses_x", "user_1", "lark:ou_x")
+    assert "未知" in line
+
+
+def test_microvm_line_tolerates_an_older_image():
+    """A microVM running a previous image reports no instance field."""
+    line, _ = _microvm_line_with({"reply": "pong"})
+    assert "旧镜像" in line
 
 
 if __name__ == "__main__":
