@@ -274,6 +274,45 @@ def test_microvm_line_without_a_session_does_not_probe():
     assert "尚未建立会话" in line
 
 
+def test_microvm_line_retries_a_provisioning_conflict():
+    """AgentCore returns a retryable 409 while it provisions a session. The chat path
+    disables retries on purpose (a timeout must not replay a turn), so this path has
+    to handle it itself or /status reports "unknown" during a cold start."""
+    import index
+
+    class RetryableConflictException(Exception):
+        pass
+
+    calls = []
+
+    def flaky(*a, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RetryableConflictException("Session operation in progress")
+        return {"instance": "abc12345", "kernelUptime": 30, "sessionAge": 5}
+
+    with mock.patch.object(index, "invoke_agent", side_effect=flaky), \
+         mock.patch.object(index.time, "sleep"):
+        line = index._microvm_line("ses_x", "user_1", "lark:ou_x")
+    assert len(calls) == 2
+    assert "abc12345" in line
+
+
+def test_microvm_line_gives_up_after_one_retry():
+    """Bounded: /status must not stall on a session stuck mid-provision."""
+    import index
+
+    class RetryableConflictException(Exception):
+        pass
+
+    with mock.patch.object(index, "invoke_agent",
+                           side_effect=RetryableConflictException("busy")) as inv, \
+         mock.patch.object(index.time, "sleep"):
+        line = index._microvm_line("ses_x", "user_1", "lark:ou_x")
+    assert inv.call_count == 2
+    assert "未知" in line
+
+
 def test_microvm_line_survives_a_probe_failure():
     """Diagnostics must never break the command that carries them."""
     import index

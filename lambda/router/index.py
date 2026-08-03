@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import boto3
 from botocore.config import Config
@@ -36,10 +37,15 @@ _CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_\-.]{1,200}$")
 
 # Leave a margin so the Lambda can still send a reply after a timeout.
 READ_TIMEOUT = max(LAMBDA_TIMEOUT - 10, 30)
+# `standard` rather than no retries at all. What must never be retried is a read
+# timeout — the turn may well have succeeded, and replaying it would duplicate both
+# the work and the pushed answer — and standard mode does not retry those (only
+# connection errors, throttling and 5xx). Disabling retries outright also gave up on
+# those, which are safe and worth retrying.
+_RETRIES = {"mode": "standard", "max_attempts": 3}
 agentcore = boto3.client(
     "bedrock-agentcore", region_name=AWS_REGION,
-    config=Config(read_timeout=READ_TIMEOUT, connect_timeout=10,
-                  retries={"max_attempts": 0}),
+    config=Config(read_timeout=READ_TIMEOUT, connect_timeout=10, retries=_RETRIES),
 )
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 
@@ -68,7 +74,7 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
         client = boto3.client(
             "bedrock-agentcore", region_name=AWS_REGION,
             config=Config(read_timeout=max(int(budget), 10), connect_timeout=10,
-                          retries={"max_attempts": 0}),
+                          retries=_RETRIES),
         )
     resp = client.invoke_agent_runtime(
         agentRuntimeArn=RUNTIME_ARN, qualifier=QUALIFIER,
@@ -108,12 +114,23 @@ def _microvm_line(session_id: str, user_id: str, actor_id: str) -> str:
     own id (agent/server.py:_INSTANCE)."""
     if not session_id:
         return "无（尚未建立会话）"
-    try:
-        data = invoke_agent(session_id, user_id, actor_id, "",
-                            action="status", budget=_PROBE_SECONDS)
-    except Exception as e:  # noqa: BLE001 — diagnostics must not fail the command
-        logger.info("microVM probe failed for %s: %s", actor_id, type(e).__name__)
-        return "未知（探测超时；下条消息仍会正常处理）"
+    data = None
+    for attempt in range(2):
+        try:
+            data = invoke_agent(session_id, user_id, actor_id, "",
+                                action="status", budget=_PROBE_SECONDS)
+            break
+        except Exception as e:  # noqa: BLE001 — diagnostics must not fail the command
+            # A 409 RetryableConflictException means the service is mid-provision for
+            # this session; AWS documents a short backoff. Retried only here: the chat
+            # path deliberately disables retries so a timeout can't replay a turn.
+            retryable = "RetryableConflict" in type(e).__name__ or "409" in str(e)
+            if retryable and attempt == 0:
+                logger.info("microVM probe conflicted, retrying once")
+                time.sleep(1)
+                continue
+            logger.info("microVM probe failed for %s: %s", actor_id, type(e).__name__)
+            return "未知（探测未返回；下条消息仍会正常处理）"
     inst = data.get("instance")
     if not inst:
         return "运行中（旧镜像，未上报实例信息）"

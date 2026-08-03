@@ -20,17 +20,22 @@ import os
 import time
 import uuid
 
+_T_IMPORT_START = time.monotonic()
+
 from aiohttp import web
 
-import agent_core
+import agent_core   # pulls in strands, boto3 and mcp — the bulk of start-up
+
+_T_IMPORT_DONE = time.monotonic()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("agent.server")
 
-# monotonic, not time.time(): the wall clock inherits its base from the image the
-# microVM is restored from, so time.time() at import can be minutes off — measured
-# once at 777 s of "process age" inside a kernel that had been up for 25 s.
-_START = time.monotonic()
+# The earliest point this module can observe, so process age includes the imports
+# above. monotonic, not time.time(): the wall clock inherits its base from the image
+# the microVM is restored from, so time.time() at import can be minutes off —
+# measured once at 777 s of "process age" inside a kernel up for 25 s.
+_START = _T_IMPORT_START
 # Identifies the process serving a request, generated per start-up. AgentCore has no
 # instance-level API, so self-reporting is the only way to see turnover at all. It is
 # per PROCESS, not per microVM. Note what it cannot do: prove isolation. Anything
@@ -170,11 +175,30 @@ def build_http_app() -> web.Application:
     return app
 
 
+def _log_startup_breakdown() -> None:
+    """Break down the cold start, since AgentCore documents none of it and X-Ray
+    can't see it (its trace root is this process, so everything before OTel starts is
+    invisible). Log-only on purpose: /status stays readable, and whoever is measuring
+    cold starts is reading CloudWatch anyway.
+
+    kernel age is the microVM's; the gap between it and this process's age is what
+    AgentCore spent booting and pulling the image before we got control."""
+    kernel = _kernel_uptime()
+    proc = time.monotonic() - _START
+    imports = _T_IMPORT_DONE - _T_IMPORT_START
+    before_us = round(kernel - proc, 1) if kernel is not None else None
+    log.info(
+        "startup breakdown: microVM=%ss process=%.1fs imports=%.1fs before-our-code=%ss "
+        "instance=%s", kernel, proc, imports, before_us, _INSTANCE,
+    )
+
+
 async def main() -> None:
     http_runner = web.AppRunner(build_http_app())
     await http_runner.setup()
     await web.TCPSite(http_runner, "0.0.0.0", _HTTP_PORT).start()
     log.info("HTTP contract on :%d", _HTTP_PORT)
+    _log_startup_breakdown()
 
     while True:
         await asyncio.sleep(3600)
