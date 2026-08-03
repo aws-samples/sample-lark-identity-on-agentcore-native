@@ -54,7 +54,8 @@ lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 
 def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
                  action: str = "chat", mem_sid: str = "",
-                 budget: float | None = None, chat_id: str = "") -> dict:
+                 budget: float | None = None, chat_id: str = "",
+                 message_id: str = "", reaction_id: str = "") -> dict:
     """Invoke the agent once. Returns the parsed response dict
     {reply, needs_auth, auth_url?} (or {reply:<raw>} on non-JSON).
 
@@ -68,6 +69,10 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
         "memorySessionId": mem_sid,
         # Where the agent pushes the result when it answers asynchronously.
         "chatId": chat_id,
+        # The in-progress reaction this router added, for the agent to remove when
+        # the turn ends — only the identity that added one may delete it.
+        "messageId": message_id,
+        "reactionId": reaction_id,
     }).encode()
     client = agentcore
     if budget is not None:
@@ -257,6 +262,7 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
     open_id = sender.get("sender_id", {}).get("open_id")
     message = event.get("message", {})
     chat_id = message.get("chat_id")
+    message_id = message.get("message_id", "")
     msg_type = message.get("message_type")
     content_str = message.get("content", "{}")
     logger.info("message from open_id=%s chat_id=%s type=%s", open_id, chat_id, msg_type)
@@ -394,12 +400,18 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
     mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
     logger.info("invoking agent: session=%s mem=%s msg=%r",
                 session_id, mem_sid, agent_message[:80])
+    # Acknowledge before doing anything slow: the first token is seconds away
+    # (session assembly, MCP handshake, model latency), and until then the user has
+    # no way to tell "working on it" from "my message never arrived". The agent
+    # removes this when the turn ends.
+    reaction_id = lark.add_reaction(message_id)
     try:
         # chat_async: the agent accepts the work, returns at once, and pushes the
         # answer to the chat itself. A synchronous wait cannot cover real tasks —
         # both InvokeAgentRuntime and this Lambda cap out long before they finish.
         result = invoke_agent(session_id, user_id, actor_id, agent_message,
-                              action="chat_async", mem_sid=mem_sid, chat_id=chat_id)
+                              action="chat_async", mem_sid=mem_sid, chat_id=chat_id,
+                              message_id=message_id, reaction_id=reaction_id)
         # First-use 3LO: post the consent link, then hold and poll the vault so
         # the user gets an answer without re-sending (bounded by AUTH_WAIT_SECONDS).
         if result.get("needs_auth"):
@@ -417,7 +429,8 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
                         if context else READ_TIMEOUT)
                 result = invoke_agent(session_id, user_id, actor_id, agent_message,
                                       action="chat_async", mem_sid=mem_sid,
-                                      budget=left, chat_id=chat_id)
+                                      budget=left, chat_id=chat_id,
+                                      message_id=message_id, reaction_id=reaction_id)
             else:
                 logger.info("consent wait timed out for %s", actor_id)
                 return  # link already sent; user finishes later and re-sends

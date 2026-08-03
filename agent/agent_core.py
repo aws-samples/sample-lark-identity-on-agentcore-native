@@ -21,7 +21,7 @@ model actually reaches for a Lark tool. We drive 3LO from the agent because the
 Gateway does not do per-user 3LO injection for a CustomOauth2 provider (AWS gap,
 agentcore-samples#1424).
 
-`run_chat` returns the final text; `stream_chat` yields text deltas.
+`chat_result` returns the final text; `chat_async` streams it into a Lark card.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ import os
 import time
 import logging
 import threading
-from typing import Iterator
 
 from strands import Agent
 from strands.models import BedrockModel
@@ -252,7 +251,7 @@ def run_chat(actor_id: str, message: str, email: str = "",
 
 
 def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
-               mem_sid: str = "") -> dict:
+               mem_sid: str = "", message_id: str = "", reaction_id: str = "") -> dict:
     """Accept the work and answer later.
 
     A real task can outlast any request/response window (InvokeAgentRuntime caps at
@@ -271,21 +270,85 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
 
     def _run() -> None:
         try:
-            reply = str(s["agent"](message))
+            _stream_to_chat(s, message, chat_id)
             if _hit_auth_wall(s):
-                reply = _AUTH_PROMPT.format(url=s["auth_url"])
+                lark_notify.send_text(chat_id, _AUTH_PROMPT.format(url=s["auth_url"]))
         except Exception as e:  # noqa: BLE001 — the caller is already gone
             log.exception("async turn failed for %s", actor_id)
-            reply = f"Sorry, that didn't work out ({type(e).__name__})."
+            lark_notify.send_text(chat_id, f"Sorry, that didn't work out ({type(e).__name__}).")
         finally:
+            # Clear the router's marker whatever happened — leaving it on a failed
+            # turn would read as "still working". If the container dies outright
+            # nobody clears it, which is cosmetic only.
+            lark_notify.remove_reaction(message_id, reaction_id)
             _track(-1)
-        if not lark_notify.send_text(chat_id, reply):
-            # Nothing else can reach the user — make sure it's in the logs.
-            log.error("could not deliver reply to %s: %s", chat_id, reply[:200])
 
     _track(+1)
     threading.Thread(target=_run, name=f"turn-{actor_id[:16]}", daemon=True).start()
     return {"accepted": True, "needs_auth": False}
+
+
+# Throttle card updates: whichever threshold trips first flushes the accumulated
+# text. Not a rate-limit concern — CardKit updates don't count against QPS while
+# streaming, which is why it beats editing a message. The real cost is the round
+# trip: each flush is an HTTPS call that blocks this loop, so an interval below it
+# just adds calls without making the typing look smoother.
+_STREAM_MIN_INTERVAL = float(os.environ.get("STREAM_MIN_INTERVAL", "0.4"))
+_STREAM_MIN_CHARS = int(os.environ.get("STREAM_MIN_CHARS", "60"))
+
+
+def _iter_deltas(agent, message: str):
+    """Yield text chunks from Strands' async stream on a private event loop. Kept
+    here (not stream_chat) because chat_async is the only streaming caller now."""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        agen = agent.stream_async(message)
+        while True:
+            try:
+                event = loop.run_until_complete(agen.__anext__())
+            except StopAsyncIteration:
+                break
+            if isinstance(event, dict) and "data" in event:
+                yield event["data"]
+    finally:
+        loop.close()
+
+
+def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
+    """Run the turn, typing the answer into a streaming card as it is produced, and
+    return the full text. If the card can't be created or an update fails (e.g. the
+    cardkit:card:write scope isn't granted), fall back to posting the final text —
+    the answer must survive regardless. Consent replies are handled by the caller."""
+    agent = session["agent"]
+    card = lark_notify.StreamingCard(chat_id)
+    streaming = card.open()
+
+    acc = []
+    pending = 0
+    last_flush = time.monotonic()
+    for delta in _iter_deltas(agent, message):
+        acc.append(delta)
+        pending += len(delta)
+        now = time.monotonic()
+        if streaming and (pending >= _STREAM_MIN_CHARS
+                          or (now - last_flush) >= _STREAM_MIN_INTERVAL):
+            if not card.update("".join(acc)):
+                streaming = False  # a failed update drops us to the fallback below
+            pending = 0
+            last_flush = now
+    text = "".join(acc)
+
+    if streaming:
+        if not card.close(text):
+            streaming = False
+    if not streaming:
+        # Either CardKit was never available or it failed mid-stream. Post the whole
+        # answer as plain text so the user still gets it.
+        if not lark_notify.send_text(chat_id, text):
+            log.error("could not deliver reply to %s: %s", chat_id, text[:200])
+    return text
 
 
 def reauth(actor_id: str, idp: str = "lark") -> dict:
@@ -308,28 +371,3 @@ def reauth(actor_id: str, idp: str = "lark") -> dict:
         return {"reply": _AUTH_PROMPT.format(url=value),
                 "needs_auth": True, "auth_url": value}
     return {"reply": "Already authorized.", "needs_auth": False}
-
-
-def stream_chat(actor_id: str, message: str, email: str = "",
-                mem_sid: str = "") -> Iterator[str]:
-    """Streaming chat for the WebSocket path. Yields text deltas."""
-    import asyncio
-
-    s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id))
-    if s.get("auth_url"):
-        yield _AUTH_PROMPT.format(url=s["auth_url"])
-        return
-    agent = s["agent"]
-    loop = asyncio.new_event_loop()
-    try:
-        agen = agent.stream_async(message)
-        while True:
-            try:
-                event = loop.run_until_complete(agen.__anext__())
-            except StopAsyncIteration:
-                break
-            # Strands emits {"data": "<text chunk>"} for streamed model text.
-            if isinstance(event, dict) and "data" in event:
-                yield event["data"]
-    finally:
-        loop.close()

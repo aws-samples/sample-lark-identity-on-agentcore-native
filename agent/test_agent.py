@@ -217,5 +217,91 @@ def test_unauthorized_session_still_connects_and_lists_tools():
     assert "elif kind ==" not in build, "auth_url should no longer skip the MCP client"
 
 
+# ----------------------------- streaming to a card --------------------------
+# chat_async types the answer into a CardKit streaming card so the user isn't left
+# staring at silence for the ~7.5 s before the first token. Two things must hold:
+# updates are throttled (not one call per token), and any CardKit failure falls back
+# to send_text so the answer is never lost.
+
+def _load_stream_to_chat(fake_deltas, card, notify_sent):
+    """Exec _stream_to_chat in isolation with fakes for its module deps — importing
+    agent_core needs strands/mcp (ARM64), unavailable on the test host."""
+    import time as _time
+    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
+    start = src.index("def _stream_to_chat(")
+    end = src.index("\n\ndef reauth(", start)
+    ns = {
+        "time": _time,
+        "log": mock.Mock(),
+        "lark_notify": mock.Mock(StreamingCard=lambda chat_id: card,
+                                 send_text=lambda cid, t: notify_sent.append(t) or True),
+        "_iter_deltas": lambda agent, message: iter(fake_deltas),
+        "_STREAM_MIN_CHARS": 80,
+        "_STREAM_MIN_INTERVAL": 0.6,
+    }
+    exec(src[start:end], ns)
+    return ns["_stream_to_chat"]
+
+
+class FakeCard:
+    def __init__(self, open_ok=True, update_ok=True, close_ok=True):
+        self._open_ok, self._update_ok, self._close_ok = open_ok, update_ok, close_ok
+        self.ok = False
+        self.updates = []
+        self.closed_with = None
+
+    def open(self):
+        self.ok = self._open_ok
+        return self._open_ok
+
+    def update(self, full_text):
+        if not self.ok:
+            return False
+        self.updates.append(full_text)
+        self.ok = self._update_ok
+        return self._update_ok
+
+    def close(self, final_text):
+        self.closed_with = final_text
+        return self._close_ok
+
+
+def test_stream_updates_are_throttled_and_cumulative():
+    """Many small deltas must not become many calls, and each update carries the full
+    text so far (CardKit renders the appended tail; a non-prefix would flash)."""
+    card = FakeCard()
+    deltas = ["a" * 30, "b" * 30, "c" * 30, "d" * 30]   # 120 chars in 30-char steps
+    fn = _load_stream_to_chat(deltas, card, [])
+    text = fn({"agent": object()}, "msg", "oc_1")
+    assert text == "a"*30 + "b"*30 + "c"*30 + "d"*30
+    # Flushes only when the 80-char threshold is crossed, not once per delta.
+    assert len(card.updates) < len(deltas)
+    for u in card.updates:
+        assert text.startswith(u)          # cumulative, always a prefix of the whole
+    assert card.closed_with == text
+
+
+def test_stream_falls_back_to_text_when_card_cannot_open():
+    """No cardkit:card:write scope → open() fails → the answer still arrives as text."""
+    card = FakeCard(open_ok=False)
+    sent = []
+    fn = _load_stream_to_chat(["hello ", "world"], card, sent)
+    text = fn({"agent": object()}, "msg", "oc_1")
+    assert text == "hello world"
+    assert card.updates == []              # never tried to stream
+    assert sent == ["hello world"]         # delivered as plain text instead
+
+
+def test_stream_falls_back_when_an_update_fails_midway():
+    """A card that dies mid-stream must still deliver the full answer via text."""
+    card = FakeCard(update_ok=False)       # first update flips ok to False
+    sent = []
+    fn = _load_stream_to_chat(["x" * 100, "y" * 100], card, sent)
+    text = fn({"agent": object()}, "msg", "oc_1")
+    assert text == "x"*100 + "y"*100
+    assert sent == [text]                  # fell back after the failed update
+    assert card.closed_with is None        # never reached a clean close
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

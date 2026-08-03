@@ -178,6 +178,36 @@ def send_message(receive_id: str, text: str, receive_id_type: str = "chat_id") -
     return ok
 
 
+def add_reaction(message_id: str, emoji: str = "OnIt") -> str:
+    """Mark the user's message as being worked on. Returns the reaction_id (needed to
+    remove it) or "".
+
+    Done here rather than in the agent because the point is speed: one call, before
+    the runtime is even invoked, so the user gets feedback in ~200 ms instead of
+    waiting on session assembly. The agent removes it when the turn ends — only the
+    identity that added a reaction may delete it, and both are the bot. Needs no new
+    scope; `im:message` covers reactions."""
+    token = get_tenant_token()
+    if not (token and message_id):
+        return ""
+    api = f"{_API_DOMAIN}/open-apis/im/v1/messages/{message_id}/reactions"
+    body = json.dumps({"reaction_type": {"emoji_type": emoji}}).encode()
+    try:
+        req = urllib.request.Request(api, data=body, method="POST", headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {token}",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+    except Exception as e:  # noqa: BLE001 — a missing marker must not fail the turn
+        log.warning("add_reaction failed: %s", e)
+        return ""
+    if result.get("code") != 0:
+        log.warning("add_reaction error: %s", result)
+        return ""
+    return result.get("data", {}).get("reaction_id", "")
+
+
 def send_link_message(receive_id: str, text: str, link_text: str, url: str,
                        receive_id_type: str = "chat_id") -> bool:
     """Send a rich-text (post) message: `text` followed by a clickable `link_text`

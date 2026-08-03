@@ -4,6 +4,7 @@
   POST /invocations   -> action in {warmup, status, chat}
       chat       : {action,actorId,message,email?} -> {reply}  (history via Memory)
       chat_async : same + chatId -> {accepted:true}; result is pushed to the chat
+                   (messageId/reactionId: the router's progress marker, cleared at the end)
       warmup : {action} -> {ready:true}
       status : {action} -> {ready, instance, uptime, sessionAge, + clock diagnostics}
 
@@ -128,13 +129,17 @@ async def handle_invocations(request: web.Request) -> web.Response:
         chat_id = payload.get("chatId", "")
         email = payload.get("email", "")
         mem_sid = payload.get("memorySessionId", "")
+        # The router's in-progress reaction, for us to clear when the turn ends.
+        msg_id = payload.get("messageId", "")
+        reaction_id = payload.get("reactionId", "")
         if not (message and chat_id):
             return web.json_response({"error": "message and chatId required"}, status=400)
         try:
             # Returns as soon as the work is accepted; the result is pushed to the
             # chat later. Consent still comes back inline (see chat_async).
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.chat_async, actor_id, message, chat_id, email, mem_sid
+                None, agent_core.chat_async, actor_id, message, chat_id, email,
+                mem_sid, msg_id, reaction_id,
             )
             return web.json_response(result)
         except Exception as e:

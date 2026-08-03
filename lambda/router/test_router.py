@@ -327,5 +327,35 @@ def test_microvm_line_tolerates_an_older_image():
     assert "旧镜像" in line
 
 
+def test_add_reaction_returns_id_and_never_raises():
+    """The progress marker is best-effort: the reaction_id is needed to remove it
+    later, but a failure must not stop the turn."""
+    import lark
+    ok = {"code": 0, "data": {"reaction_id": "RE_1"}}
+
+    class FakeResp:
+        def __init__(self, d): self._d = d
+        def read(self): return json.dumps(self._d).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    with mock.patch.object(lark, "get_tenant_token", return_value="t"), \
+         mock.patch.object(lark.urllib.request, "urlopen", lambda *a, **k: FakeResp(ok)):
+        assert lark.add_reaction("om_1") == "RE_1"
+
+    # Lark rejecting it, and the call blowing up, both degrade to "" rather than raise.
+    with mock.patch.object(lark, "get_tenant_token", return_value="t"), \
+         mock.patch.object(lark.urllib.request, "urlopen",
+                           lambda *a, **k: FakeResp({"code": 99, "msg": "nope"})):
+        assert lark.add_reaction("om_1") == ""
+    with mock.patch.object(lark, "get_tenant_token", return_value="t"), \
+         mock.patch.object(lark.urllib.request, "urlopen",
+                           mock.Mock(side_effect=OSError("boom"))):
+        assert lark.add_reaction("om_1") == ""
+    # No message id (or no token) means nothing to react to.
+    with mock.patch.object(lark, "get_tenant_token", return_value="t"):
+        assert lark.add_reaction("") == ""
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -40,7 +40,7 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 | `app.py`, `cdk.json` | CDK app (uv-managed deps) — 6 stacks. Deployment state goes to `.cdk-state.json`, not here |
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
 | `stacks/` | security, agentcore, router, shim, gateway, observability |
-| `agent/` | Strands agent container: HTTP contract + AgentCore Memory + agent-side 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and posts answers back (`lark_notify`) |
+| `agent/` | Strands agent container: HTTP contract + AgentCore Memory + agent-side 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers back into a card (`lark_notify`) |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
 | `mcp-server/` | Lark MCP server (AgentCore Runtime, lark-cli engine) — calls Lark as the user |
@@ -95,7 +95,29 @@ Two consequences worth knowing: deleting the provider **purges every user's vaul
 ## Lark console setup
 
 1. **Add features**: enable **Bot**.
-2. **Permissions & Scopes**: `im:message`, `im:message:readonly`, **`im:message.p2p_msg:readonly`** (required for single-chat), `im:message:send_as_bot`, `im:resource`, `contact:user.base:readonly`. Under **User Token Scopes** (needs admin approval): `drive:drive`, `docx:document`, `offline_access`.
+2. **Permissions & Scopes** — two groups, and the split is the whole point of this sample: the bot speaks with its own identity, while anything touching a user's data acts as that user.
+
+   **Tenant token scopes** (the bot acting as itself — receiving webhooks, replying, reacting):
+
+   | Scope | Used for |
+   |---|---|
+   | `im:message` | receive events, send replies, and the in-progress emoji reaction (no separate reaction scope needed) |
+   | `im:message:readonly` | read message content |
+   | `im:message.p2p_msg:readonly` | **required for single (p2p) chats** — without it the bot never sees direct messages |
+   | `im:message:send_as_bot` | post as the bot |
+   | `im:resource` | download images the user sends |
+   | `contact:user.base:readonly` | resolve the sender's basic profile |
+   | `cardkit:card:write` | create and update the streaming reply card ("Create and update cards") |
+
+   **User token scopes** (the *user's* identity, via 3LO — this is what the Lark MCP server uses, so tools reach only what that user can). Needs admin approval:
+
+   | Scope | Used for |
+   |---|---|
+   | `drive:drive` | list and read the user's Drive |
+   | `docx:document` | read/write the user's documents |
+   | `offline_access` | issue a refresh token, so the vaulted grant survives without re-consent |
+
+   Nothing in the first group can read a user's documents, and nothing in the second is ever used to speak as the bot — `LARKSUITE_CLI_DEFAULT_AS=user` keeps the MCP server on the user's token exclusively.
 3. **Events & Callbacks**: Request URL = the webhook URL from deploy output; enable Encryption; add `im.message.receive_v1`.
 4. **Security Settings → Redirect URLs**: add the OAuth credential provider's `callbackUrl` (`https://bedrock-agentcore.<region>.amazonaws.com/identities/oauth2/callback/<uuid>`, from `get-oauth2-credential-provider --name lark-agent-3lo`). This is where AgentCore Identity receives the 3LO code — not the shim URL.
 5. **Publish** a version (re-publish after any scope/event change).
@@ -159,7 +181,7 @@ This is a **reference implementation, not production-ready as-is**. Before any r
 ### Notes & limitations
 
 - **3LO is agent-side, not Gateway-mediated.** The Gateway does not do per-user 3LO for a `CustomOauth2` provider like Lark (AWS gap, agentcore-samples#1424), so the agent drives 3LO itself and delivers the vaulted token to the lark-cli MCP server in a custom passthrough header. See `docs/agentcore-behavior.md`.
-- **Answers arrive asynchronously.** A turn that researches a topic and writes a document takes longer than any request/response window allows — `InvokeAgentRuntime` and the router's Lambda both cap out, and a turn cut off mid-way is the worst outcome, because the work often completed while the user was told it failed. So the agent accepts the work, returns immediately, and posts the answer to the chat itself when it's done. Its `/ping` reports `HealthyBusy` while a turn is running, which defers *idle* reclamation (`idleRuntimeSessionTimeout`, a session-inactivity timer). It does **not** defer `maxLifetime` — the microVM's wall-clock age cap (default 8 h, configurable) that never resets — so that is the hard ceiling on a single background turn. Consent is the exception and stays synchronous, since the router drives the wait-and-retry loop around it.
+- **Answers arrive asynchronously.** A turn that researches a topic and writes a document takes longer than any request/response window allows — `InvokeAgentRuntime` and the router's Lambda both cap out, and a turn cut off mid-way is the worst outcome, because the work often completed while the user was told it failed. So the agent accepts the work, returns immediately, and types the answer into a CardKit streaming card as it is produced — a placeholder appears at once (the first token takes several seconds: session assembly, MCP handshake, model latency), then fills in. If CardKit is unavailable the answer is posted as plain text instead, so it is never lost. Its `/ping` reports `HealthyBusy` while a turn is running, which defers *idle* reclamation (`idleRuntimeSessionTimeout`, a session-inactivity timer). It does **not** defer `maxLifetime` — the microVM's wall-clock age cap (default 8 h, configurable) that never resets — so that is the hard ceiling on a single background turn. Consent is the exception and stays synchronous, since the router drives the wait-and-retry loop around it.
 - **Consent-wait is time-bounded.** On first use the router posts the consent link, then holds and polls the vault up to `AUTH_WAIT_SECONDS` (45s) before falling back to "re-send after approving". A user who takes longer than that to approve just re-sends once; the token is already vaulted by then.
 - **Chat-only.** This variant has no web UI — the sibling `lark-agentcore-interceptor` is the web-UI variant. The Lark tools don't go through the Gateway either (it can't do per-user 3LO for a CustomOauth2 provider); the Gateway is used only for web search, where no user identity is involved.
 - **Two Runtimes.** The agent and the lark-cli MCP server are separate AgentCore Runtimes, both built via CodeBuild (ARM64) and created out-of-band by the CLI.
