@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sys
 from unittest import mock
 
@@ -150,6 +151,70 @@ def test_websearch_gateway_contract():
     assert "get_user_jwt" in src        # identity.py returns the ACCESS token
     # available() must be a pure config check, so an unset gateway just means no tool
     assert 'os.environ.get("WEBSEARCH_GATEWAY_URL", "")' in src
+
+
+# --------------------------- deferred authorization -------------------------
+# A user without a vaulted Lark token still gets a working session: lark-mcp lists
+# its tools without one and only rejects tools/call. Consent is raised when a tool
+# is actually reached, so plain chat ("hello") is never gated on it.
+
+def test_auth_marker_matches_the_mcp_server():
+    """The client detects the auth wall by matching lark-mcp's rejection text. It is
+    a cross-process string contract: if the server's wording changes and this does
+    not, the user silently stops being offered a consent link."""
+    here = os.path.dirname(__file__)
+    core = open(os.path.join(here, "agent_core.py"), encoding="utf-8").read()
+    server = open(os.path.join(here, "..", "mcp-server", "server.js"), encoding="utf-8").read()
+    marker = re.search(r'_NEEDS_TOKEN_MARKER = "([^"]+)"', core).group(1)
+    assert marker in server, (
+        f"agent_core expects {marker!r} but mcp-server/server.js no longer says it"
+    )
+
+
+def test_hit_auth_wall_reads_tool_results_not_the_final_reply():
+    """The check must inspect tool-result blocks, not the model's text answer: the
+    model paraphrases errors, so 'no user token is available' in the reply slips
+    past a string check on the reply — verified end-to-end before this fix."""
+    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
+    ns = {}
+    for name in ('_NEEDS_TOKEN_MARKER = ', 'def _hit_auth_wall('):
+        start = src.index(name)
+        end = src.index("\n\n\n", start)
+        exec(src[start:end], ns)
+    hit = ns["_hit_auth_wall"]
+
+    class FakeAgent:
+        def __init__(self, messages): self.messages = messages
+
+    def sess(msgs): return {"auth_url": "https://consent", "agent": FakeAgent(msgs)}
+
+    # 1. No agent → nothing to inspect, so no auth wall.
+    assert hit({"auth_url": "https://consent"}) is False
+    # 2. Text reply that paraphrases the error but no toolResult → NOT a wall.
+    #    This is exactly the case that fooled the first version of this function.
+    paraphrased = [{"role": "assistant", "content": [
+        {"text": "It looks like no user token is available — please authorize"}]}]
+    assert hit(sess(paraphrased)) is False
+    # 3. Real toolResult carrying the marker → wall.
+    real = [
+        {"role": "assistant", "content": [{"toolUse": {"toolUseId": "1", "name": "lark_whoami"}}]},
+        {"role": "user", "content": [{"toolResult": {"content": [
+            {"text": "no user token (authorize first)"}]}}]},
+    ]
+    assert hit(sess(real)) is True
+    # 4. Same tool history but the session is authorized → no wall (auth_url absent).
+    assert hit({"agent": FakeAgent(real)}) is False
+
+
+def test_unauthorized_session_still_connects_and_lists_tools():
+    """The token is passed as an empty header rather than skipping the connection —
+    verified against the deployed Runtime, which returns the full tool list for an
+    empty token. Skipping it would leave the model unaware of its Lark tools."""
+    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
+    build = src[src.index("def _build_session"):src.index("_AUTH_PROMPT =")]
+    assert 'mcp_client_for(value if kind == "token" else "")' in build
+    # auth_url must not short-circuit the connection any more.
+    assert "elif kind ==" not in build, "auth_url should no longer skip the MCP client"
 
 
 if __name__ == "__main__":

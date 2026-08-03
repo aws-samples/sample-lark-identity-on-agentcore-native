@@ -14,10 +14,12 @@ and is keyed by (actor_id, session_id) — one long thread per user.
 Per-user Lark access (agent-side 3LO): for each end-user the agent fetches that
 user's vaulted Lark token from AgentCore Identity (GetResourceOauth2Token,
 USER_FEDERATION) and connects directly to the lark-mcp Runtime, passing the token
-in a custom header (the lark-mcp sidecar copies it to Authorization). If the user
-hasn't consented yet, the agent replies with the 3LO auth link instead (see
-lark_3lo.py). We drive 3LO from the agent because the Gateway does not do per-user
-3LO injection for a CustomOauth2 provider (AWS gap, agentcore-samples#1424).
+in a custom header (the lark-mcp sidecar copies it to Authorization). The token
+gates tool *calls*, not the connection — lark-mcp lists its tools without one — so
+an unauthorized user gets a working session and is only asked to consent if the
+model actually reaches for a Lark tool. We drive 3LO from the agent because the
+Gateway does not do per-user 3LO injection for a CustomOauth2 provider (AWS gap,
+agentcore-samples#1424).
 
 `run_chat` returns the final text; `stream_chat` yields text deltas.
 """
@@ -50,6 +52,9 @@ _SYSTEM = os.environ.get(
 )
 # Rebuild a cached session before its Cognito access token (~1h) expires.
 _SESSION_TTL = int(os.environ.get("SESSION_TTL_SECONDS", "3000"))  # 50 min
+# An unauthorized session is cached only briefly: it works, but the moment the user
+# consents we want the next turn to pick up the token.
+_UNAUTH_TTL = int(os.environ.get("UNAUTH_SESSION_TTL_SECONDS", "60"))
 
 _model = BedrockModel(model_id=_MODEL_ID, streaming=True)
 
@@ -96,10 +101,16 @@ def _make_session_manager(actor_id: str, session_id: str):
 
 
 def _build_session(actor_id: str, email: str, mem_sid: str) -> dict:
-    """Build a session for this user. Agent-side 3LO: if the user's Lark token is
-    vaulted, open an MCP client to lark-mcp (SigV4 + token in the custom header)
-    and list tools; if not, carry the auth_url so run_chat can prompt the user.
-    The MCP client is entered once and kept open for the session."""
+    """Build a session for this user. Agent-side 3LO: fetch the user's vaulted Lark
+    token if there is one and open an MCP client to lark-mcp (SigV4 + token in the
+    custom header), entered once and kept open for the session.
+
+    The token gates tool *calls*, not the connection: lark-mcp answers initialize
+    and tools/list without it and only rejects tools/call with "authorize first"
+    (verified against the deployed Runtime — an empty header returns the full tool
+    list). So an unauthorized user still gets a session with the Lark tools listed,
+    and can chat freely; consent is asked for when a tool is actually reached,
+    which is the point at which the user can see what it is for."""
     mcp = None
     tools = []
     auth_url = None
@@ -110,17 +121,22 @@ def _build_session(actor_id: str, email: str, mem_sid: str) -> dict:
         log.exception("3LO token lookup failed for %s", actor_id)
         kind, value = "error", str(e)
 
-    if kind == "token":
-        mcp = lark_3lo.mcp_client_for(value)
-        mcp.__enter__()  # persistent connection for the session's lifetime
-        tools = mcp.list_tools_sync()
-    elif kind == "auth_url":
-        auth_url = value  # no Lark tools this session; user must consent first
-    else:
+    if kind == "auth_url":
+        auth_url = value  # remembered for the tool-call path, not returned upfront
+    elif kind not in ("token", "auth_url"):
         # Surface identity failures instead of running tool-less: an agent that
         # merely says "I have no tools" reads as model behaviour and hides the
         # real cause (a missing IAM permission, most likely).
         identity_error = value
+
+    if identity_error is None:
+        try:
+            mcp = lark_3lo.mcp_client_for(value if kind == "token" else "")
+            mcp.__enter__()
+            tools = mcp.list_tools_sync()
+        except Exception:  # noqa: BLE001 — chat without Lark tools beats no reply
+            log.exception("lark-mcp unavailable for %s", actor_id)
+            mcp = None
 
     # Search doesn't depend on the user's Lark grant, so add it even when the
     # Lark tools are unavailable — an unauthorised user can still ask questions.
@@ -148,6 +164,36 @@ _AUTH_PROMPT = (
     "then send your message again:\n{url}"
 )
 
+# lark-mcp's reply when a tools/call arrives without a user token. It shows up as a
+# tool-result content block, not necessarily in the model's final reply — the model
+# may paraphrase or translate. Scanning the tool history is what makes this robust.
+_NEEDS_TOKEN_MARKER = "no user token (authorize first)"
+
+
+def _hit_auth_wall(session: dict) -> bool:
+    """True if this turn produced a lark-mcp tool result asking the user to
+    authorize. Reads the agent's most-recent messages rather than the final reply,
+    because the model paraphrases errors — 'no user token is available' would slip
+    through a string check on the reply, and did in end-to-end testing."""
+    if not session.get("auth_url"):
+        return False
+    agent = session.get("agent")
+    if agent is None:
+        return False
+    # Only the current turn matters. The model's text answer follows any tool use,
+    # so it is always the last message; the tool result that produced it is just
+    # before. Cap at 4 to leave headroom for parallel tool calls in one turn.
+    for m in getattr(agent, "messages", [])[-4:]:
+        for c in m.get("content", []) or []:
+            tr = c.get("toolResult") if isinstance(c, dict) else None
+            if not tr:
+                continue
+            for block in tr.get("content", []) or []:
+                if isinstance(block, dict) and _NEEDS_TOKEN_MARKER in (block.get("text") or ""):
+                    return True
+    return False
+
+
 _IDENTITY_ERROR = (
     "I can't reach your Lark account right now, so I have no Lark tools this turn "
     "(other questions still work).\nDetails: {err}"
@@ -161,9 +207,13 @@ def _get_session(actor_id: str, email: str, mem_sid: str) -> dict:
     cache_key = f"{actor_id}|{mem_sid}"
     with _lock:
         s = _sessions.get(cache_key)
-        if s and not s.get("auth_url") and (time.time() - s["created"]) < _SESSION_TTL:
-            return s
         if s:
+            # An unauthorized session works (tools listed, calls rejected), so it is
+            # worth caching — but only briefly, or the user consents and keeps being
+            # told to authorize until the full TTL lapses.
+            ttl = _UNAUTH_TTL if s.get("auth_url") else _SESSION_TTL
+            if (time.time() - s["created"]) < ttl:
+                return s
             for key in ("mcp", "search_mcp"):
                 if s.get(key):
                     try:
@@ -171,8 +221,8 @@ def _get_session(actor_id: str, email: str, mem_sid: str) -> dict:
                     except Exception:
                         pass
         s = _build_session(actor_id, email, mem_sid)
-        if not s.get("auth_url") and not s.get("identity_error"):
-            _sessions[cache_key] = s  # cache only fully working sessions
+        if not s.get("identity_error"):
+            _sessions[cache_key] = s
         return s
 
 
@@ -183,15 +233,16 @@ def chat_result(actor_id: str, message: str, email: str = "",
     the raw consent URL, so the caller (router) can drive the wait-for-consent
     loop instead of asking the user to re-send."""
     s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id))
-    if s.get("auth_url"):
-        return {"reply": _AUTH_PROMPT.format(url=s["auth_url"]),
-                "needs_auth": True, "auth_url": s["auth_url"]}
     if s.get("identity_error"):
         # Answer without tools, but say so — silently degrading is what made a
         # missing IAM permission look like the model choosing not to help.
         return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
                 "needs_auth": False, "identity_error": s["identity_error"]}
-    return {"reply": str(s["agent"](message)), "needs_auth": False}
+    reply = str(s["agent"](message))
+    if _hit_auth_wall(s):
+        return {"reply": _AUTH_PROMPT.format(url=s["auth_url"]),
+                "needs_auth": True, "auth_url": s["auth_url"]}
+    return {"reply": reply, "needs_auth": False}
 
 
 def run_chat(actor_id: str, message: str, email: str = "",
@@ -209,12 +260,11 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     worst outcome: the work often completed, but the user was told it failed. So we
     return an acknowledgement now and push the result to the chat when it's ready.
 
-    Consent is the exception — it needs a synchronous answer, because the router
-    drives the wait-and-retry loop around it."""
+    An unauthorized user is not stopped here: the Lark tools are listed even without
+    a token, so the turn runs and consent is only raised if the model actually calls
+    one. By then the router has returned, so the prompt is pushed to the chat like
+    any other answer and the user re-sends after approving."""
     s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id))
-    if s.get("auth_url"):
-        return {"reply": _AUTH_PROMPT.format(url=s["auth_url"]),
-                "needs_auth": True, "auth_url": s["auth_url"]}
     if s.get("identity_error"):
         return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
                 "needs_auth": False, "identity_error": s["identity_error"]}
@@ -222,6 +272,8 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     def _run() -> None:
         try:
             reply = str(s["agent"](message))
+            if _hit_auth_wall(s):
+                reply = _AUTH_PROMPT.format(url=s["auth_url"])
         except Exception as e:  # noqa: BLE001 — the caller is already gone
             log.exception("async turn failed for %s", actor_id)
             reply = f"Sorry, that didn't work out ({type(e).__name__})."
@@ -258,7 +310,8 @@ def reauth(actor_id: str, idp: str = "lark") -> dict:
     return {"reply": "Already authorized.", "needs_auth": False}
 
 
-def stream_chat(actor_id: str, message: str, email: str = "") -> Iterator[str]:
+def stream_chat(actor_id: str, message: str, email: str = "",
+                mem_sid: str = "") -> Iterator[str]:
     """Streaming chat for the WebSocket path. Yields text deltas."""
     import asyncio
 
