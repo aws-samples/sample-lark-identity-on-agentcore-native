@@ -28,7 +28,7 @@ export AWS_REGION="$REGION"
 [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-LARK_CLI_VERSION="${LARK_CLI_VERSION:-1.0.68}"   # engine = official lark-cli (not lark-mcp)
+LARK_CLI_VERSION="${LARK_CLI_VERSION:-1.0.86}"   # engine = official lark-cli (not lark-mcp)
 # One CodeBuild project and role for every server — only the source zip differs.
 PROJECT="$PREFIX-mcp-builder"
 SRC_BUCKET="bedrock-agentcore-codebuild-sources-$ACCOUNT-$REGION"

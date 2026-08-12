@@ -11,7 +11,7 @@
 # the custom header directly. lark-cli install follows ddpie/lark-mcp-on-agentcore
 # (the `install` subcommand + ca-certificates, not plain `npm install -g`, which
 # can't fetch the binary in a clean container).
-FROM public.ecr.aws/docker/library/node:20-bookworm-slim
+FROM public.ecr.aws/docker/library/node:24-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Official Lark CLI (pinned). The `install` subcommand fetches the platform binary;
 # fall back to -g. Provides `lark-cli api <method> <path>` for every Lark endpoint,
 # with per-invocation token via env var.
-ARG LARK_CLI_VERSION=1.0.68
+ARG LARK_CLI_VERSION=1.0.86
 RUN npx -y @larksuite/cli@${LARK_CLI_VERSION} install 2>/dev/null || npm install -g @larksuite/cli@${LARK_CLI_VERSION}
 RUN npx -y skills add larksuite/cli -y -g 2>/dev/null || true
 

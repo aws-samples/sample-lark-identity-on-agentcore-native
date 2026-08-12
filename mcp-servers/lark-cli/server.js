@@ -115,4 +115,11 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(PORT, '0.0.0.0', () => console.log(`lark-cli-mcp on :${PORT} (${TOOLS.length} tools)`));
+// Report the engine versions actually running, not the ones the build asked for: the
+// image tag records the build argument, which is a different claim.
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`lark-cli-mcp on :${PORT} (${TOOLS.length} tools) node=${process.version}`);
+  execFile('lark-cli', ['--version'], { timeout: 10000 }, (err, stdout) => {
+    console.log(`lark-cli=${err ? `unavailable (${err.message})` : stdout.trim()}`);
+  });
+});

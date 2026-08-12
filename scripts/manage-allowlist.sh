@@ -6,8 +6,15 @@
 #   scripts/manage-allowlist.sh list
 set -euo pipefail
 
-PROFILE="${PROFILE:-}"   # empty -> ambient creds (instance role / env), no named profile
-REGION="${REGION:-us-west-2}"
+cd "$(cd "$(dirname "$0")/.." && pwd)"
+
+# Read the deployment target from .env like every other script here: without it this
+# defaulted to us-west-2 and reported "Requested resource not found" for a table that
+# exists — in another region.
+_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}"
+[ -f .env ] && { set -a; . ./.env; set +a; }
+PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds, no named profile
+REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
 TABLE="${TABLE:-lark-agent-identity}"
 export AWS_REGION="$REGION"
 # Credentials already in the environment outrank .env's profile.
