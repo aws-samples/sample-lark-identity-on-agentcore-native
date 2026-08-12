@@ -71,12 +71,18 @@ def _tenant_token() -> str:
         return tok
 
 
+def _rid_type(receive_id: str) -> str:
+    """`ou_` means an open_id — a DM to that person rather than a chat. Event-driven
+    turns (an approval task landing) have no chat to reply in, only the person."""
+    return "open_id" if receive_id.startswith("ou_") else "chat_id"
+
+
 def send_text(chat_id: str, text: str) -> bool:
     """Post text to a chat, splitting to stay under Lark's length limit."""
     tok = _tenant_token()
     if not (tok and chat_id):
         return False
-    url = f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type=chat_id"
+    url = f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={_rid_type(chat_id)}"
     ok = True
     for i in range(0, len(text) or 1, _MAX_TEXT_LEN):
         chunk = text[i:i + _MAX_TEXT_LEN]
@@ -100,7 +106,7 @@ def send_link(chat_id: str, text: str, link_text: str, url: str) -> bool:
         {"tag": "text", "text": (text + " ") if text else ""},
         {"tag": "a", "text": link_text, "href": url},
     ]]}}
-    body = _post(f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type=chat_id",
+    body = _post(f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={_rid_type(chat_id)}",
                  {"receive_id": chat_id, "msg_type": "post",
                   "content": json.dumps(post)}, bearer=tok)
     if body.get("code") not in (0, "0"):
@@ -202,7 +208,7 @@ class StreamingCard:
         self.card_id = created.get("data", {}).get("card_id", "")
         if not self.card_id:
             return False
-        sent = _post(f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type=chat_id",
+        sent = _post(f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={_rid_type(self.chat_id)}",
                      {"receive_id": self.chat_id, "msg_type": "interactive",
                       "content": json.dumps({"type": "card",
                                              "data": {"card_id": self.card_id}})},

@@ -45,7 +45,7 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
 | `mcp-servers/` | One directory per MCP server, one Runtime each: `lark-cli/` acts as the user against Lark, `approval/` runs approval decisions on the app identity. Each declares its own build/runtime config in `runtime.env`, so adding a server needs no script change |
 | `deploy.sh` | the deploy entry point — orders the steps in `scripts/` |
-| `scripts/` | step implementations: provision (base/runtime/gateway) / build-mcp / setup-3lo / setup-lark / manage-allowlist / destroy |
+| `scripts/` | step implementations: preflight / provision (base/runtime/gateway) / build-mcp / setup-3lo / setup-lark / subscribe-approvals / manage-allowlist / destroy |
 | `tests/` | `run.sh` (all unit suites) + e2e smoke tests that need a deployed stack |
 | `docs/architecture.md` | full architecture (core flow updated to the native path; some sections marked legacy) |
 | `docs/agentcore-behavior.md` | measured AgentCore Gateway/Runtime behavior + the CustomOauth2 3LO gap (#1424) |
@@ -72,6 +72,7 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 | `./deploy.sh gateway` | Web Search gateway in us-east-1 — skipped unless `WEB_SEARCH=true` |
 | `./deploy.sh runtime` | build the agent image + deploy the agent Runtime |
 | `./deploy.sh lark` | seed Lark credentials to Secrets Manager + allowlist your `open_id` |
+| `./deploy.sh approvals` | subscribe to Lark approval events for each `AGENT_DECIDE_APPROVAL_CODES` definition — no-op when that is empty. Ticking the event in the console is **not** sufficient; Lark delivers approval events only for definitions also subscribed through the API |
 
 Order matters in one place: `3lo` and `gateway` precede `runtime`, because the agent Runtime is created with the provider name and the gateway URL baked into its environment. `deploy.sh` handles that; the underlying implementations are in `scripts/`.
 
@@ -104,6 +105,7 @@ Two consequences worth knowing: deleting the provider **purges every user's vaul
    | `im:message` | receive events, send replies, and the in-progress emoji reaction (no separate reaction scope needed) |
    | `im:message:readonly` | read message content |
    | `im:message.p2p_msg:readonly` | **required for single (p2p) chats** — without it the bot never sees direct messages |
+   | `im:message.group_at_msg:readonly` | see @mentions in group chats (the router strips the mention before passing the text on) |
    | `im:message:send_as_bot` | post as the bot |
    | `im:resource` | download images the user sends |
    | `contact:user.base:readonly` | resolve the sender's basic profile |
@@ -118,9 +120,48 @@ Two consequences worth knowing: deleting the provider **purges every user's vaul
    | `offline_access` | issue a refresh token, so the vaulted grant survives without re-consent |
 
    Nothing in the first group can read a user's documents, and nothing in the second is ever used to speak as the bot — `LARKSUITE_CLI_DEFAULT_AS=user` keeps the MCP server on the user's token exclusively.
-3. **Events & Callbacks**: Request URL = the webhook URL from deploy output; enable Encryption; add `im.message.receive_v1`.
+3. **Events & Callbacks**: Request URL = the webhook URL from deploy output; enable Encryption; add `im.message.receive_v1`. For the approval demo also add **审批任务状态变更** (`approval_task`) — and note that ticking it here is not enough on its own, see below.
 4. **Security Settings → Redirect URLs**: add the OAuth credential provider's `callbackUrl` (`https://bedrock-agentcore.<region>.amazonaws.com/identities/oauth2/callback/<uuid>`, from `get-oauth2-credential-provider --name lark-agent-3lo`). This is where AgentCore Identity receives the 3LO code — not the shim URL.
 5. **Publish** a version (re-publish after any scope/event change).
+
+### Optional: the approval demo
+
+Off by default. It shows what to do when a downstream API *refuses* to accept the user's identity — Lark's approval endpoints take only an app token, so a decision is made by the app with a `user_id` saying whose name to record it under. Read [docs/architecture.md](docs/architecture.md#a-third-path-approvals-where-the-users-identity-cannot-be-passed-through) before switching it on: the limits are self-imposed, and what they can and cannot prevent is the point of the demo.
+
+To enable:
+
+1. Add the approval scopes and the `approval_task` event from step 3 above, then re-publish. The console lists these by display name, so both are given here:
+
+   | Scope | Type | Display name | Used for |
+   |---|---|---|---|
+   | `approval:approval` | tenant | View, create, update, and delete info of Approval app | making decisions (approve/reject/transfer) |
+   | `approval:approval:readonly` | tenant | Access Approval | reading instances and queues |
+
+   The `approval_task` event accepts **either** of those two (the console shows "any one suffices"), so nothing extra is needed to receive events.
+2. Set the limits in `.env` — the agent decides nothing until you do:
+   ```
+   AGENT_DECIDE_APPROVAL_CODES="<definitionCode>, ..."   # empty = decide nothing
+   AGENT_DECIDE_MAX_AMOUNT=1000                          # 0 = kill switch
+   ```
+   The definition code is the `definitionCode=` query parameter in the URL of a form's edit page in the Lark approval admin.
+3. `./deploy.sh mcp approval` (builds the approval Runtime — gated on that variable so it costs nothing when unused), then `./deploy.sh approvals` to subscribe. **Both the console tick and this API subscription are required**; Lark delivers approval events only for definitions subscribed through the API.
+4. Authorize as the approver (`/auth lark` in the bot chat). The server refuses to decide for anyone without their own grant on record, so an approver who never consented gets a 点击授权 card instead — after which the turn resumes on its own.
+
+One tool is deliberately left unusable: `approval_add_sign` (加签) is the single approval endpoint that takes the *user's* token instead of the app's, but the vaulted token carries only the scopes `LARK_SCOPES` requests (`drive:drive docx:document offline_access`), and the only user-token approval scope on offer is `approval:approval:readonly` — a read scope, while add_sign writes. So it fails on permissions by construction. It stays exposed because that boundary is the lesson: Lark's approval API admits a user identity for exactly one operation, and not one this sample can reach.
+
+Then submit an approval assigned to that approver. Both outcomes are worth trying: within the limits the agent decides and comments `[AI 自动处理]`; over the amount ceiling it refuses to decide and hands the case back.
+
+### Letting more people in
+
+The bot answers only allowlisted users; `./deploy.sh lark` adds you and nobody else. An unlisted user who messages the bot is told their own id, which is the easiest way to collect one:
+
+```bash
+PROFILE=... REGION=... scripts/manage-allowlist.sh add lark:ou_...
+scripts/manage-allowlist.sh list
+scripts/manage-allowlist.sh remove lark:ou_...
+```
+
+The allowlist gates *conversations*. It also gates whether an approval event is acted on at all: an approver who isn't listed is left alone silently. Note the asymmetry — deciding for someone needs their own 3LO grant, but DMing them does not (that runs on the app's token), so the allowlist is the only thing standing between an approval event and a stranger's chat window.
 
 ## Chat commands
 

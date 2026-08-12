@@ -276,6 +276,89 @@ def resume_consented_turn(actor_id: str) -> None:
                  fresh_session=True)
 
 
+# ---------------------------- approval events -------------------------------
+
+# Both arrive in the legacy 1.0 schema. `approval_task` is the actionable one: it names
+# an approver (open_id) and the task, which is exactly what a decision needs.
+# `approval_instance` reports the instance's own status and is accepted only so the log
+# shows it was seen — deciding from it would take another call to learn whose task it is.
+_APPROVAL_EVENT_TYPES = {"approval_task", "approval_instance"}
+
+
+def _approval_prompt(instance_code: str, task_id: str, open_id: str,
+                     approval_code: str) -> str:
+    """The turn the agent wakes up to. The ids are handed over rather than left to be
+    discovered: an event-driven turn has no user to ask, and `user_id` decides whose
+    name the decision is recorded under — too consequential to let the model guess."""
+    return "\n".join([
+        "【审批事件】有一条待审批任务分配给了你，请代为处理。",
+        f"approval_code: {approval_code}",
+        f"instance_code: {instance_code}",
+        f"task_id: {task_id}",
+        f"user_id（审批归属人，就是你）: {open_id}",
+        "",
+        "请先查看审批详情，然后判断是否符合可自动决定的范围：",
+        "符合就直接批准或拒绝，并说明理由；",
+        "不符合（例如金额超限、不在允许的审批类型内、或信息不足）就不要决定，"
+        "把关键信息和你的建议列出来，等我人工处理。",
+    ])
+
+
+def process_approval_event(ev: dict, context=None) -> None:
+    """Event-driven approval: a task lands, the agent decides it with nobody present.
+
+    Which definitions reach here is already decided by what we subscribed to
+    (scripts/subscribe-approvals.sh), and whether a decision is *allowed* is enforced
+    in the approval MCP server. So this function deliberately re-checks neither — it
+    only establishes that there is a real pending task, for a known user, once."""
+    # Logged whole: the payload shape for these events is thinly documented, so this is
+    # the ground truth for whoever extends it next.
+    logger.info("approval event: %s", json.dumps(ev, ensure_ascii=False)[:900])
+
+    status = str(ev.get("status", "")).upper()
+    # `open_id` appears in the doc's sample payload but not in its field table, which
+    # documents only `user_id` ("operator id", and empty on auto-approve tasks) — in the
+    # tenant user_id format, not the open_id this project keys identity on. So open_id
+    # is what we need and the less documented of the two. Guessing wrong fails closed:
+    # an id that isn't the approver's resolves to no allowlisted user, or to someone
+    # with no vaulted grant, and the approval server refuses either way.
+    open_id = str(ev.get("open_id", "") or "")
+    task_id = str(ev.get("task_id", "") or "")
+    instance_code = str(ev.get("instance_code", "") or "")
+    approval_code = str(ev.get("approval_code", "") or "")
+
+    # Only a task still awaiting a decision is actionable. This is also what stops the
+    # obvious loop: the agent's own approve emits another event, with a settled status.
+    if status != "PENDING":
+        logger.info("approval: status=%s — nothing to decide", status or "(none)")
+        return
+    if not (open_id and task_id and instance_code):
+        logger.info("approval: no per-approver task in this event, skipping")
+        return
+    # Lark redelivers until acked, and the ack goes out long before the agent decides.
+    if not identity.claim_approval_task(task_id):
+        logger.info("approval: task %s already claimed — redelivery", task_id)
+        return
+
+    actor_id = f"lark:{open_id}"
+    user_id, _ = identity.resolve_user("lark", open_id)
+    if not user_id:
+        # Someone outside the demo's allowlist. Their approval is their own business —
+        # staying silent is the right move, not an error.
+        logger.info("approval: %s not in the allowlist, leaving it alone", actor_id)
+        return
+
+    message = _approval_prompt(instance_code, task_id, open_id, approval_code)
+    # No chat here — an approval event carries none — so the approver's open_id is the
+    # delivery address, which the senders read as "DM this person".
+    if not user_token_vaulted(actor_id):
+        # The approval server refuses to decide without this person's own grant, so the
+        # turn will wall. Park it, and consent-resume replays it once they authorize.
+        identity.park_pending_auth(user_id, message, open_id)
+    logger.info("approval: dispatching task %s for %s", task_id, actor_id)
+    _dispatch_turn(user_id, actor_id, message, open_id, context=context)
+
+
 # ------------------------------- async processing ---------------------------
 
 def process_lark_event(body: str, headers: dict, context=None) -> None:
@@ -296,8 +379,14 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
 
     header = event_data.get("header", {})
     event = event_data.get("event", {})
-    event_type = header.get("event_type")
+    # Message events use schema 2.0 (type in `header`); approval events still use 1.0,
+    # where the type sits inside `event`. Reading both is what lets one webhook URL
+    # serve both kinds.
+    event_type = header.get("event_type") or event.get("type", "")
     logger.info("event_type=%s", event_type)
+    if event_type in _APPROVAL_EVENT_TYPES:
+        process_approval_event(event, context)
+        return
     if event_type != "im.message.receive_v1":
         logger.info("ignoring non-message event")
         return

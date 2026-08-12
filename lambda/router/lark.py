@@ -146,14 +146,24 @@ def get_tenant_token() -> str:
 _MAX_TEXT_LEN = 20000
 
 
-def send_message(receive_id: str, text: str, receive_id_type: str = "chat_id") -> bool:
+def _receive_id_type(receive_id: str, explicit: str = "") -> str:
+    """Lark wants the id's kind alongside the id itself. An `ou_` prefix is an open_id
+    (a DM to that person); anything else is a chat. Inferring it lets a caller holding
+    only the person reuse these senders — an approval event carries no chat_id."""
+    if explicit:
+        return explicit
+    return "open_id" if receive_id.startswith("ou_") else "chat_id"
+
+
+def send_message(receive_id: str, text: str, receive_id_type: str = "") -> bool:
     """Send a text message, chunking to stay under Lark's length limit."""
     token = get_tenant_token()
     if not token:
         log.error("cannot send: no tenant token")
         return False
 
-    url = f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
+    rid_type = _receive_id_type(receive_id, receive_id_type)
+    url = f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={rid_type}"
     chunks = [text[i:i + _MAX_TEXT_LEN] for i in range(0, len(text), _MAX_TEXT_LEN)] or [""]
     ok = True
     for chunk in chunks:
@@ -209,7 +219,7 @@ def add_reaction(message_id: str, emoji: str = "OnIt") -> str:
 
 
 def send_link_message(receive_id: str, text: str, link_text: str, url: str,
-                       receive_id_type: str = "chat_id") -> bool:
+                       receive_id_type: str = "") -> bool:
     """Send a rich-text (post) message: `text` followed by a clickable `link_text`
     hyperlink, so the user sees "点击授权" instead of a long raw URL."""
     token = get_tenant_token()
@@ -217,7 +227,8 @@ def send_link_message(receive_id: str, text: str, link_text: str, url: str,
         log.error("cannot send: no tenant token")
         return False
 
-    api = f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
+    rid_type = _receive_id_type(receive_id, receive_id_type)
+    api = f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type={rid_type}"
     # post content: zh_cn locale, one paragraph = [text run, link run].
     post = {"zh_cn": {"content": [[
         {"tag": "text", "text": (text + " ") if text else ""},

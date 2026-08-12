@@ -22,6 +22,7 @@ import uuid
 import logging
 
 import boto3
+from botocore.exceptions import ClientError
 
 log = logging.getLogger("router.identity")
 
@@ -126,6 +127,29 @@ def take_pending_auth(user_id: str) -> dict | None:
     if int(item.get("ttl", 0) or 0) < int(time.time()):
         return None
     return {"message": item.get("message", ""), "chatId": item.get("chatId", "")}
+
+
+# Lark redelivers an event until it is acked, and acking happens before the agent has
+# decided anything — so without a claim the same approval task would be decided twice.
+_APPROVAL_TASK_TTL = int(os.environ.get("APPROVAL_TASK_TTL_SECONDS", "86400"))
+
+
+def claim_approval_task(task_id: str) -> bool:
+    """True only for the first caller to claim this approval task. A conditional put
+    is what makes it a claim rather than a check: two concurrent redeliveries both
+    read "unseen" if you get-then-put, and both go on to decide."""
+    now = int(time.time())
+    try:
+        _table.put_item(
+            Item={"PK": f"APPROVALTASK#{task_id}", "SK": "CLAIM",
+                  "claimedAt": now, "ttl": now + _APPROVAL_TASK_TTL},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
 
 
 _MEMORY_ID: str | None = None

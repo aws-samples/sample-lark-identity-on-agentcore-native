@@ -14,7 +14,7 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 | Agent container | Strands agent on Bedrock; HTTP contract (8080); AgentCore Memory for continuity; agent-side 3LO; MCP clients to the lark-cli server, the approval server when deployed, and optionally web search; runs turns in the background and posts answers to the chat itself | `agent/` |
 | Lark OAuth shim | RFC-6749 façade over Lark's non-standard token endpoint, plus the 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) | `lambda/shim/` |
 | Lark MCP server | lark-cli engine on AgentCore Runtime; calls Lark with the per-user token from a custom passthrough header | `mcp-servers/lark-cli/` |
-| Approval MCP server | Lark approvals on AgentCore Runtime. Two identities in one server: approve/reject/transfer run on the app's tenant token (Lark accepts no user token there), add_sign on the user's. Decision limits are enforced in code, not by the model | `mcp-servers/approval/` |
+| Approval MCP server | Lark approvals on AgentCore Runtime — the case where the user's identity *cannot* be forwarded: every decision endpoint takes only the app's tenant token, with a `user_id` naming whose record it becomes. Limits are enforced in code, not by the model | `mcp-servers/approval/` |
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `lark-agent-3lo`, workload `lark-agent-wl` |
 | AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `lark_agent_agent_mem` (STM) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
@@ -119,6 +119,53 @@ this is what the Cognito user pool is for on this variant. Two IAM actions are r
 `InvokeGateway` on the gateway, and `InvokeWebSearch` on `…:aws:tool/web-search.v1`, whose
 account segment is the literal `aws`, not yours. Search is optional: `WEB_SEARCH=false` skips
 the gateway entirely, and the agent simply runs without that tool.
+
+## A third path: approvals, where the user's identity *cannot* be passed through
+
+Everything above rests on one property — the downstream call carries the user's own token, so Lark decides what it may reach. Lark's approval API breaks that property, and the approval demo exists to show what you do when it happens.
+
+`tasks/approve`, `reject`, `transfer` and `rollback` accept **only a tenant (app) token**; there is no user-token variant. `tasks/query` is the same. Only `add_sign` takes a user token — and even that one is out of reach here: Lark offers `approval:approval:readonly` as a user-token scope but no user-token *write* scope for approvals, while add_sign writes. So the user-identity path this whole document is about admits exactly one approval operation, and not one that can actually be performed. So a decision cannot be made *as* the user — it is made by the app, and a `user_id` argument says whose name to record it under:
+
+| | Value | What it decides |
+|---|---|---|
+| `Authorization: Bearer` | the **app's** tenant token | that the app may operate approvals |
+| `user_id` argument | the approver's `open_id` | **whose name the decision is recorded under** |
+
+Lark verifies that `user_id` owns the task. It never asks whether that person agreed — there is nothing in the request that could represent them. So the approval record means "an authorised app claims to have decided for X", not "X decided". **The record itself cannot tell the two apart**, which is why every automated decision carries an `[AI 自动处理]` comment: that marker is the only thing an audit can key on afterwards.
+
+Worse, the `user_id` is free: the app already knows every relevant `open_id` without anyone's consent (a webhook hands over its sender's; `tasks/query` returns each approver's). So Lark's ownership check is not a barrier — the `task_id` and its `user_id` are read together, and filling it in correctly is the only natural thing to do.
+
+### What the guards actually are
+
+Since the protocol offers no enforcement point, the limits live in the approval MCP server, in code rather than in the prompt (`mcp-servers/approval/server.js`, tested in `test_guards.mjs`):
+
+- **An allow-list of approval definitions** (`AGENT_DECIDE_APPROVAL_CODES`) and an **amount ceiling** (`AGENT_DECIDE_MAX_AMOUNT`). Empty allow-list decides nothing — fail closed, so the demo is inert until switched on deliberately. `0` is a kill switch.
+- **The approver's own grant must be on record.** The agent holds a vaulted token for everyone who ever consented, so "a token was passed" and "this approver consented" are different questions: the token is resolved to its owner (`authen/v1/user_info`) and compared with `user_id`. A mismatch refuses; an identity that can't be established refuses too.
+
+Both are **self-imposed**. Lark would permit every decision they block. And they do not survive a leaked `appSecret`, which bypasses this server entirely — the agent itself holds that secret (it needs it to send messages), so the honest description is that these guards raise the bar from "knows a task_id" to "has compromised the app", without changing the trust model. A production design would split messaging and approvals into two Lark apps so the agent only holds the former's secret; this sample does not, to keep one app to configure.
+
+### Event-driven: a turn with nobody present
+
+The demo runs unattended — a `approval_task` event wakes a turn, so nobody has to ask. Delivery is scoped by subscription: Lark sends approval events only for definitions subscribed through `approvals/{code}/subscribe`, which is a **separate step from ticking the event in the console** (`./deploy.sh approvals`).
+
+```
+approval_task (PENDING, carries open_id + task_id + instance_code)
+   ↓  router: three gates, then hand over the address
+   │    status must be PENDING      — a settled status is the agent's own decision echoing back
+   │    claim the task_id           — conditional put; Lark redelivers until acked, and the
+   │                                  ack goes out long before the agent has decided
+   │    approver must be allowlisted — otherwise silence; their approval is their own business
+   ↓  invoke_agent(chat_async, chatId=open_id)   ← returns at once, address only
+agent: reads the instance, applies the guards, decides, and posts its own reply
+   ↓  StreamingCard(open_id) → im/v1/messages
+the approver's DM
+```
+
+Two details that are easy to get wrong. **The router does not deliver the answer** — it only resolves the address; the agent posts the card itself, because the reply streams and a Lambda cannot stay alive for it. The router sends only the consent link and error fallbacks. And **an approval event carries no chat**, so the address is a person, not a room: both senders read an `ou_` prefix as "DM this person".
+
+If the approver has never consented, the turn is guaranteed to wall (the guard above). So it is parked before dispatch and replayed by consent-resume after they authorize — an unattended turn has no user to re-send it.
+
+Two Lark naming inconsistencies cost an afternoon each: the event calls it `approval_code` while `tasks/query` returns `definition_code`, and `tasks/query` is a **GET** (POST answers `404 page not found`, which reads like a permissions problem).
 
 ## Conversation memory
 

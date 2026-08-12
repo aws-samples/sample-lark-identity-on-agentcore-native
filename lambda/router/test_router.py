@@ -432,5 +432,135 @@ def test_resume_ignores_malformed_actor():
     assert inv.call_count == 0
 
 
+
+# --------------------------- event-driven approval ---------------------------
+
+def _approval_event(**over) -> dict:
+    """A Lark `approval_task` event. Legacy 1.0 schema: no `header`, type inside
+    `event`. Fields per the official doc, plus the `open_id` its sample payload shows
+    but its field table omits."""
+    ev = {"app_id": "cli_x", "type": "approval_task", "open_id": "ou_alice",
+          "user_id": "b613t51g", "task_id": "t1", "instance_code": "i1",
+          "approval_code": "AC1", "status": "PENDING", "operate_time": "1700000000000"}
+    ev.update(over)
+    return ev
+
+
+def test_approval_event_dispatches_a_turn_addressed_to_the_approver():
+    """An approval event carries no chat, so the approver's open_id is the delivery
+    address — the senders read an `ou_` prefix as "DM this person"."""
+    import index, identity
+    with mock.patch.object(identity, "claim_approval_task", return_value=True), \
+         mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
+         mock.patch.object(index, "user_token_vaulted", return_value=True), \
+         mock.patch.object(index, "_dispatch_turn") as disp:
+        index.process_approval_event(_approval_event())
+    assert disp.call_count == 1
+    user_id, actor_id, message, chat_id = disp.call_args.args[:4]
+    assert actor_id == "lark:ou_alice"
+    assert chat_id == "ou_alice"
+    # The ids are handed over rather than left to be discovered: an unattended turn has
+    # nobody to ask, and user_id decides whose name the decision is recorded under.
+    for token in ("i1", "t1", "AC1", "ou_alice"):
+        assert token in message
+
+
+def test_approval_event_ignores_a_settled_task():
+    """The loop-breaker: the agent's own approve emits another event, and acting on it
+    would decide the same instance again."""
+    import index, identity
+    for status in ("APPROVED", "REJECTED", "TRANSFERRED", "DONE"):
+        with mock.patch.object(identity, "claim_approval_task", return_value=True), \
+             mock.patch.object(index, "_dispatch_turn") as disp:
+            index.process_approval_event(_approval_event(status=status))
+        assert disp.call_count == 0, status
+
+
+def test_approval_event_without_an_approver_is_skipped():
+    """`approval_instance` events, and auto-approve tasks (documented as having an
+    empty user), name nobody — there is no identity to act as."""
+    import index, identity
+    for missing in ({"open_id": ""}, {"task_id": ""}, {"instance_code": ""}):
+        with mock.patch.object(identity, "claim_approval_task", return_value=True), \
+             mock.patch.object(index, "_dispatch_turn") as disp:
+            index.process_approval_event(_approval_event(**missing))
+        assert disp.call_count == 0, missing
+
+
+def test_approval_event_redelivery_decides_once():
+    """Lark redelivers until acked, and the ack goes out long before the agent has
+    decided. Without the claim the same task gets approved twice."""
+    import index, identity
+    with mock.patch.object(identity, "claim_approval_task", return_value=False), \
+         mock.patch.object(index, "_dispatch_turn") as disp:
+        index.process_approval_event(_approval_event())
+    assert disp.call_count == 0
+
+
+def test_approval_event_for_an_unknown_user_stays_silent():
+    """Someone outside the allowlist: their approval is their own business."""
+    import index, identity
+    with mock.patch.object(identity, "claim_approval_task", return_value=True), \
+         mock.patch.object(identity, "resolve_user", return_value=(None, False)), \
+         mock.patch.object(index, "_dispatch_turn") as disp:
+        index.process_approval_event(_approval_event())
+    assert disp.call_count == 0
+
+
+def test_approval_event_parks_the_turn_when_the_approver_has_not_consented():
+    """The approval server refuses to decide without that person's own grant, so the
+    turn will wall. Parking is what lets consent-resume replay it after they authorize
+    — otherwise an unattended turn is simply lost."""
+    import index, identity
+    with mock.patch.object(identity, "claim_approval_task", return_value=True), \
+         mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
+         mock.patch.object(index, "user_token_vaulted", return_value=False), \
+         mock.patch.object(identity, "park_pending_auth") as park, \
+         mock.patch.object(index, "_dispatch_turn"):
+        index.process_approval_event(_approval_event())
+    assert park.call_count == 1
+    assert park.call_args.args[2] == "ou_alice"      # DM target, not a chat
+
+
+def test_approval_event_does_not_park_for_an_authorized_approver():
+    import index, identity
+    with mock.patch.object(identity, "claim_approval_task", return_value=True), \
+         mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
+         mock.patch.object(index, "user_token_vaulted", return_value=True), \
+         mock.patch.object(identity, "park_pending_auth") as park, \
+         mock.patch.object(index, "_dispatch_turn"):
+        index.process_approval_event(_approval_event())
+    assert park.call_count == 0
+
+
+def test_legacy_schema_event_is_routed_to_the_approval_path():
+    """Message events put the type in `header` (schema 2.0); approval events put it in
+    `event` (1.0). Reading only `header` drops every approval event on the floor."""
+    import index
+    body = json.dumps({"uuid": "u", "type": "event_callback",
+                       "event": _approval_event()})
+    with mock.patch.object(index, "process_approval_event") as appr:
+        index.process_lark_event(body, {})
+    assert appr.call_count == 1
+
+
+def test_message_events_still_take_the_message_path():
+    """The 2.0 header must keep winning — a regression here breaks the whole bot."""
+    import index
+    body = json.dumps({"header": {"event_type": "im.message.receive_v1"},
+                       "event": {"sender": {"sender_type": "bot"}}})
+    with mock.patch.object(index, "process_approval_event") as appr:
+        index.process_lark_event(body, {})
+    assert appr.call_count == 0
+
+
+def test_dm_target_is_inferred_from_the_id_shape(lark_mod):
+    """`ou_` is a person, anything else a chat. This is what lets the same senders
+    serve an event-driven turn, which only ever knows the person."""
+    assert lark_mod._receive_id_type("ou_alice") == "open_id"
+    assert lark_mod._receive_id_type("oc_room") == "chat_id"
+    assert lark_mod._receive_id_type("ou_alice", "chat_id") == "chat_id"   # explicit wins
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

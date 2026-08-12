@@ -3,6 +3,7 @@
 #
 #   ./deploy.sh              everything, in dependency order (the normal case)
 #   ./deploy.sh <step>       one step: base | mcp | 3lo | gateway | runtime | lark
+#                            | approvals (subscribe to Lark approval events)
 #   ./deploy.sh mcp [name...] only those MCP servers (default: all of mcp-servers/)
 #   ./deploy.sh urls         reprint the two URLs you must register in Lark
 #   ./deploy.sh preflight    check tools, credentials and .env without deploying
@@ -40,6 +41,9 @@ run_3lo()     { step "3lo — Identity + OAuth provider";  scripts/setup-3lo.sh;
 run_gateway() { step "gateway — Web Search (optional)";  scripts/provision.sh --gateway; }
 run_runtime() { step "runtime — agent";                  scripts/provision.sh --runtime; }
 run_lark()    { step "lark — credentials + allowlist";   scripts/setup-lark.sh; }
+# No-ops unless AGENT_DECIDE_APPROVAL_CODES is set, so it costs nothing in the common
+# case — and without it Lark silently never delivers the events.
+run_approvals() { step "approvals — event subscription";  scripts/subscribe-approvals.sh; }
 
 # What the user still has to do by hand, gathered from deployed state rather than
 # scraped from the logs above.
@@ -61,7 +65,7 @@ print_urls() {
   echo "permission scopes and the im.message.receive_v1 event subscription."
 }
 
-usage() { sed -n '2,14p' "$0" | cut -c3-; }
+usage() { sed -n '2,15p' "$0" | cut -c3-; }
 
 case "${1:-all}" in
   base)    run_base ;;
@@ -70,13 +74,14 @@ case "${1:-all}" in
   gateway) run_gateway ;;
   runtime) run_runtime ;;
   lark)    run_lark ;;
+  approvals) run_approvals ;;
   urls)    print_urls ;;
   preflight) run_preflight ;;
   all|"")
     run_preflight
     # 3lo and gateway precede runtime: the agent is deployed with the provider,
     # workload and gateway URL baked into its environment.
-    run_base; run_mcp; run_3lo; run_gateway; run_runtime; run_lark
+    run_base; run_mcp; run_3lo; run_gateway; run_runtime; run_lark; run_approvals
     print_urls
     ;;
   -h|--help) usage ;;
