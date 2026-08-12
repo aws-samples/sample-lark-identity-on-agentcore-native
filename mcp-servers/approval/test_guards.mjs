@@ -11,16 +11,16 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-function loadGuards(env = {}) {
+function loadGuards(env = {}, fetchImpl = undefined) {
   const src = readFileSync(new URL('./server.js', import.meta.url), 'utf8');
   // Anchored on declarations, not on comment text — an earlier version keyed off a
   // comment and broke the moment that comment was reworded.
   const start = src.indexOf('const AGENT_DECIDE_MAX_AMOUNT');
   const end = src.indexOf('const TOOLS = [');
   assert.ok(start > 0 && end > start, 'guard block not found — did server.js move?');
-  const fn = new Function('process', `${src.slice(start, end)}
+  const fn = new Function('process', 'fetch', 'API', `${src.slice(start, end)}
     return { checkAutoDecisionAllowed, requireConsentOnRecord, consentNote, AGENT_DECIDE_MAX_AMOUNT, AGENT_DECIDE_APPROVAL_CODES };`);
-  return fn({ env });
+  return fn({ env }, fetchImpl, 'https://open.larksuite.com');
 }
 
 test('fails closed: no configured approval codes means nothing is automated', () => {
@@ -60,16 +60,41 @@ test('a missing or unparseable amount does not bypass the limit check', () => {
                /not in AGENT_DECIDE_APPROVAL_CODES/);
 });
 
-test('refuses to decide for an approver with no consent on record', () => {
+test('refuses to decide when no authorization is on hand', async () => {
   // Lark would allow this — approve/reject take only a tenant token, so the API never
-  // checks whether the approver agreed. Refusing is this server's own rule, and the
-  // one that must not quietly regress: without it the app decides in anyone's name.
+  // checks whether the approver agreed. Refusing is this server's own rule.
   const g = loadGuards({});
-  const refusal = g.requireConsentOnRecord(false);
-  assert.match(refusal, /refused:/);
+  const refusal = await g.requireConsentOnRecord('', 'ou_alice');
   assert.match(refusal, /no on-record authorization/);
-  assert.match(refusal, /the limit is ours/);        // says who is enforcing it
-  assert.equal(g.requireConsentOnRecord(true), null);
+  assert.match(refusal, /the limit is ours/);          // says who is enforcing it
+});
+
+test("refuses when the authorization belongs to someone other than the approver", async () => {
+  // The agent holds a token for every user who ever consented, so "a token exists" and
+  // "this approver consented" are different questions. Deciding in Alice's name using
+  // Bob's grant is the impersonation this closes.
+  const fake = async () => ({ json: async () => ({ data: { open_id: 'ou_bob_1234567890' } }) });
+  const g = loadGuards({}, fake);
+  const refusal = await g.requireConsentOnRecord('bobs-token', 'ou_alice');
+  assert.match(refusal, /belongs to ou_bob/);
+  assert.match(refusal, /that approver's own grant/);
+});
+
+test('allows the decision when the authorization is the approver\'s own', async () => {
+  const fake = async () => ({ json: async () => ({ data: { open_id: 'ou_alice' } }) });
+  const g = loadGuards({}, fake);
+  assert.equal(await g.requireConsentOnRecord('alices-token', 'ou_alice'), null);
+});
+
+test('refuses when the identity behind the token cannot be established', async () => {
+  // Fail closed: an unverifiable token must not pass as "probably the right person".
+  const bad = async () => ({ json: async () => ({ code: 99991663, msg: 'invalid token' }) });
+  const g = loadGuards({}, bad);
+  assert.match(await g.requireConsentOnRecord('junk', 'ou_alice'), /could not establish/);
+
+  const boom = async () => { throw new Error('network down'); };
+  const g2 = loadGuards({}, boom);
+  assert.match(await g2.requireConsentOnRecord('t', 'ou_alice'), /could not verify/);
 });
 
 test('the consent note distinguishes an on-record grant from app authority alone', () => {

@@ -64,11 +64,33 @@ function checkAutoDecisionAllowed(args) {
 // leaked appSecret (that bypasses this code entirely). It is a self-imposed rule, and
 // the reason to impose it is that "the app can decide for anyone, consent or not" is a
 // dangerous default for a sample to demonstrate. Verified 2026-08-12; see adr/0006.
-function requireConsentOnRecord(hasVaultedGrant) {
-  if (hasVaultedGrant) return null;
-  return 'refused: this approver has no on-record authorization for the assistant to '
-       + 'act for them. Ask them to run /auth lark in the bot chat first. (Lark itself '
-       + 'would allow this — the app token suffices — so the limit is ours.)';
+async function requireConsentOnRecord(userToken, userId) {
+  if (!userToken) {
+    return 'refused: this approver has no on-record authorization for the assistant to '
+         + 'act for them. Ask them to run /auth lark in the bot chat first. (Lark itself '
+         + 'would allow this — the app token suffices — so the limit is ours.)';
+  }
+  // Whose token is it? Checking only that *a* token exists would let a decision be
+  // made in A's name using B's grant — the agent holds tokens for every user who has
+  // ever consented, so the two are not the same question. authen/v1/user_info needs
+  // no extra scope (the lark-cli server already reads it for whoami).
+  let who;
+  try {
+    const r = await fetch(`${API}/open-apis/authen/v1/user_info`, {
+      headers: { Authorization: `Bearer ${userToken}` },
+    });
+    const b = await r.json();
+    who = (b.data || {}).open_id;
+    if (!who) return `refused: could not establish whose authorization this is (${b.msg || r.status}).`;
+  } catch (e) {
+    return `refused: could not verify the authorizing identity (${e.message}).`;
+  }
+  if (who !== userId) {
+    return `refused: the authorization on hand belongs to ${who.slice(0, 12)}…, not to the `
+         + `approver this decision would be recorded under. A decision may only be made `
+         + `with that approver's own grant.`;
+  }
+  return null;
 }
 
 
@@ -192,7 +214,15 @@ const TOOLS = [
     // Lambda targets only support IAM outbound auth, and SigV4 leaves the container
     // with no Authorization header at all (measured). A user token can only arrive
     // over OAuth 3LO outbound, which needs an MCP-server target.
-    description: "Add another approver to a task (加签). Requires the USER's own token — Lark rejects this one with an app token, so the caller must have consented via 3LO. This is the tool that proves the user-identity path is real.",
+    // Not reachable as this sample is configured, and saying so in the description is
+    // the point: the contrast is what's instructive. The vaulted user token carries
+    // only the scopes LARK_SCOPES asks for (drive/docx/offline_access), and the only
+    // user-token approval scope Lark offers here is approval:approval:readonly — a read
+    // scope, while add_sign writes. So the user-identity path exists in Lark's API for
+    // exactly one approval operation, and even that one needs a write scope this sample
+    // cannot request. Left in place rather than deleted: it documents where the
+    // user-identity path ends, which is the whole subject of this server.
+    description: "Add another approver to a task (加签). The only approval endpoint that takes the USER's own token rather than the app's. NOT USABLE as this sample is deployed: the vaulted user token has no approval write scope (see README). Calling it will fail on permissions — it is exposed to show where Lark's user-identity path stops.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -300,7 +330,7 @@ const server = http.createServer((req, res) => {
       if (tool.guarded) {
         // Consent first: deciding in someone's name without their grant is the one
         // thing this server will not do, even though Lark would permit it.
-        const noConsent = requireConsentOnRecord(Boolean(userToken));
+        const noConsent = await requireConsentOnRecord(userToken, args.user_id);
         if (noConsent) {
           console.log(`guard refused ${name}: no consent on record`);
           return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: noConsent }], isError: true } });
