@@ -46,6 +46,11 @@ _agentcore = boto3.client("bedrock-agentcore", region_name=_REGION)
 _secrets = boto3.client("secretsmanager", region_name=_REGION)
 # Set to notify the user in chat once consent completes (see _notify_chat).
 _LARK_SECRET_ID = os.environ.get("LARK_SECRET_ID", "")
+# The router function to poke after consent, so it can replay the parked message.
+# Empty → no resume (consent still completes; the user just re-sends). Passed in
+# rather than hardcoded so the name stays owned by the router stack.
+_ROUTER_FUNCTION = os.environ.get("ROUTER_FUNCTION_NAME", "")
+_lambda = boto3.client("lambda", region_name=_REGION)
 
 
 # ------------------------------- helpers ------------------------------------
@@ -209,7 +214,12 @@ def handle_return(qs: dict) -> dict:
     # Tell the user in chat — the browser only sees this static page, and the
     # router can't reliably detect completion by polling (a re-auth keeps the old
     # token until the new one lands). This is the precise signal.
-    _notify_chat(user_id, "✅ 授权成功，现在可以直接提问了。")
+    # Callback-driven resume: tell the router the user has consented, so it can
+    # replay whatever message hit the auth wall. Best-effort and asynchronous — if
+    # it fails or nothing was parked, the user simply sends again. Done before the
+    # notify so a resumed answer, not a "you can ask now", is what they see.
+    _resume_router(user_id)
+    _notify_chat(user_id, "✅ 授权成功，正在继续处理…")
     return {"statusCode": 200, "headers": {"Content-Type": "text/html"},
             "body": "<h3>Authorized</h3><p>You can close this tab and return to the chat.</p>"}
 
@@ -226,6 +236,20 @@ def _post_json(url: str, body: dict, bearer: str = "") -> dict:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         return json.loads(e.read().decode() or "{}")
+
+
+def _resume_router(actor_id: str) -> None:
+    """Fire-and-forget invoke of the router's consent-resume path."""
+    if not _ROUTER_FUNCTION:
+        return
+    try:
+        _lambda.invoke(
+            FunctionName=_ROUTER_FUNCTION,
+            InvocationType="Event",  # async — we don't wait for the replay
+            Payload=json.dumps({"_consent_resumed": True, "actorId": actor_id}).encode(),
+        )
+    except Exception:  # noqa: BLE001 — resume is a nicety; consent already succeeded
+        logger.exception("failed to trigger router resume for %s", actor_id)
 
 
 def _notify_chat(actor_id: str, text: str) -> None:

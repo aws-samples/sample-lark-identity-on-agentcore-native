@@ -38,6 +38,11 @@ class ShimStack(Stack):
             retention=retention_days(log_retention),
             removal_policy=RemovalPolicy.DESTROY,
         )
+        # The router's function name is deterministic ({prefix}-router), so the shim
+        # can address it without a cross-stack reference — which matters because the
+        # shim is created BEFORE the router (the router consumes the shim's return
+        # URL). Referencing the router construct here would be a dependency cycle.
+        router_function = f"{prefix}-router"
         self.shim_fn = _lambda.Function(
             self, "ShimFn",
             function_name=f"{prefix}-oauth-shim",
@@ -48,9 +53,18 @@ class ShimStack(Stack):
             memory_size=256,
             environment={"LARK_API_DOMAIN": lark_api_domain,
                          # Lets /return DM the user once consent completes.
-                         "LARK_SECRET_ID": lark_secret_name},
+                         "LARK_SECRET_ID": lark_secret_name,
+                         # /return pokes this to replay the message that hit the wall.
+                         "ROUTER_FUNCTION_NAME": router_function},
             log_group=log_group,
         )
+        # Invoke the router for consent-resume. Scoped to that one function by ARN
+        # built from the deterministic name — no router-stack reference needed.
+        self.shim_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["lambda:InvokeFunction"],
+            resources=[f"arn:aws:lambda:{Stack.of(self).region}:{Stack.of(self).account}"
+                       f":function:{router_function}"],
+        ))
         # The return-url handler completes the 3LO auth session.
         self.shim_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["bedrock-agentcore:CompleteResourceTokenAuth"],

@@ -188,6 +188,16 @@ _NEEDS_TOKEN_MARKER = "no user token (authorize first)"
 
 
 def _hit_auth_wall(session: dict) -> bool:
+    """True when this turn needs consent — either because the stream was aborted at a
+    Lark tool call (the fast path, before the model can editorialise) or because a
+    tool result carried lark-mcp's refusal (the fallback, e.g. an already-authorized
+    session whose token went stale mid-turn)."""
+    if session.pop("walled_tool", None):
+        return True
+    return _hit_auth_wall_from_tool_results(session)
+
+
+def _hit_auth_wall_from_tool_results(session: dict) -> bool:
     """True if this turn produced a lark-mcp tool result asking the user to
     authorize. Reads the agent's most-recent messages rather than the final reply,
     because the model paraphrases errors — 'no user token is available' would slip
@@ -217,13 +227,27 @@ _IDENTITY_ERROR = (
 )
 
 
-def _get_session(actor_id: str, email: str, mem_sid: str) -> dict:
+def _get_session(actor_id: str, email: str, mem_sid: str, fresh: bool = False) -> dict:
     """Return the cached session for this user, rebuilding it if absent or near
     token expiry. A pending-authorization session (no token yet) is NOT cached —
     so the next turn re-checks the vault and picks up a freshly consented token."""
     cache_key = f"{actor_id}|{mem_sid}"
     with _lock:
         s = _sessions.get(cache_key)
+        # `fresh` is for the consent-resume path: the user has just authorized, so a
+        # cached unauthorized session must not be reused — its MCP clients hold an
+        # empty token and the turn would wall again. Measured: consent completed 31 s
+        # after the prompt, well inside _UNAUTH_TTL, so waiting for expiry is not an
+        # option.
+        if s and fresh:
+            for key in ("mcp", "search_mcp", "approval_mcp"):
+                if s.get(key):
+                    try:
+                        s[key].__exit__(None, None, None)
+                    except Exception:
+                        pass
+            _sessions.pop(cache_key, None)
+            s = None
         if s:
             # An unauthorized session works (tools listed, calls rejected), so it is
             # worth caching — but only briefly, or the user consents and keeps being
@@ -269,7 +293,8 @@ def run_chat(actor_id: str, message: str, email: str = "",
 
 
 def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
-               mem_sid: str = "", message_id: str = "", reaction_id: str = "") -> dict:
+               mem_sid: str = "", message_id: str = "", reaction_id: str = "",
+               fresh_session: bool = False) -> dict:
     """Accept the work and answer later.
 
     A real task can outlast any request/response window (InvokeAgentRuntime caps at
@@ -281,7 +306,8 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     a token, so the turn runs and consent is only raised if the model actually calls
     one. By then the router has returned, so the prompt is pushed to the chat like
     any other answer and the user re-sends after approving."""
-    s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id))
+    s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id),
+                     fresh=fresh_session)
     if s.get("identity_error"):
         return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
                 "needs_auth": False, "identity_error": s["identity_error"]}
@@ -290,7 +316,12 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
         try:
             _stream_to_chat(s, message, chat_id)
             if _hit_auth_wall(s):
-                lark_notify.send_text(chat_id, _AUTH_PROMPT.format(url=s["auth_url"]))
+                # A clickable "点击授权" link, matching the router's synchronous path,
+                # instead of a raw URL. The message was parked before this turn, so
+                # the shim's /return replays it once consent lands — no re-send.
+                lark_notify.send_link(
+                    chat_id, "需要访问你的 Lark 账号，授权后我会自动继续：",
+                    "点击授权", s["auth_url"])
         except Exception as e:  # noqa: BLE001 — the caller is already gone
             log.exception("async turn failed for %s", actor_id)
             lark_notify.send_text(chat_id, f"Sorry, that didn't work out ({type(e).__name__}).")
@@ -315,9 +346,12 @@ _STREAM_MIN_INTERVAL = float(os.environ.get("STREAM_MIN_INTERVAL", "0.4"))
 _STREAM_MIN_CHARS = int(os.environ.get("STREAM_MIN_CHARS", "60"))
 
 
-def _iter_deltas(agent, message: str):
-    """Yield text chunks from Strands' async stream on a private event loop. Kept
-    here (not stream_chat) because chat_async is the only streaming caller now."""
+def _iter_deltas(agent, message: str, on_tool_use=None):
+    """Yield text chunks from Strands' async stream on a private event loop.
+
+    `on_tool_use(tool_name) -> bool` is consulted when the model starts a tool call;
+    returning True abandons the stream. Used to cut a turn short the moment an
+    unauthorized session reaches for a Lark tool."""
     import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -330,6 +364,17 @@ def _iter_deltas(agent, message: str):
                 break
             if isinstance(event, dict) and "data" in event:
                 yield event["data"]
+                continue
+            # Strands emits no tool-*result* event (verified by logging every event
+            # shape), only tool_use_stream with the tool being invoked. That is
+            # enough: in an unauthorized session any Lark tool call is certain to be
+            # refused, so seeing one start means the turn is already lost — stop here
+            # rather than let the model narrate the refusal at length.
+            if on_tool_use is None or not isinstance(event, dict):
+                continue
+            name = (event.get("current_tool_use") or {}).get("name", "")
+            if name and on_tool_use(name):
+                return
     finally:
         loop.close()
 
@@ -343,10 +388,23 @@ def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
     card = lark_notify.StreamingCard(chat_id)
     streaming = card.open()
 
+    # Unauthorized: the first Lark tool the model reaches for is certain to be
+    # refused, and letting the turn run on means it narrates that refusal at length
+    # before the consent card arrives. Stop at the tool call instead — the caller
+    # sees `walled` and posts the card as the only reply.
+    unauthorized = bool(session.get("auth_url"))
+
+    def _abort_on_lark_tool(tool_name: str) -> bool:
+        if not unauthorized or tool_name.startswith("WebSearch"):
+            return False
+        session["walled_tool"] = tool_name
+        log.info("aborting turn: %s needs consent", tool_name)
+        return True
+
     acc = []
     pending = 0
     last_flush = time.monotonic()
-    for delta in _iter_deltas(agent, message):
+    for delta in _iter_deltas(agent, message, on_tool_use=_abort_on_lark_tool):
         acc.append(delta)
         pending += len(delta)
         now = time.monotonic()
@@ -357,6 +415,12 @@ def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
             pending = 0
             last_flush = now
     text = "".join(acc)
+
+    # Aborted for consent: whatever the model had started saying is a half-sentence
+    # about a failure the user is about to be asked to fix, so replace it rather than
+    # leave it on the card.
+    if session.get("walled_tool"):
+        text = "🔐 这一步需要访问你的 Lark 账号"
 
     if streaming:
         if not card.close(text):

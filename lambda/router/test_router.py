@@ -373,5 +373,64 @@ def test_status_shows_both_identities_and_masks_the_app_id():
         assert index._app_identity() == "未配置"
 
 
+# --------------------------- consent resume ---------------------------------
+# When a Lark tool hits an auth wall in the async run, the message is parked; the
+# shim's /return replays it after consent. These pin the parts that must not drift:
+# take is once-only, expiry is honoured, and resume actually re-invokes the agent.
+
+def test_take_pending_auth_is_once_only_and_honours_ttl():
+    import identity, time as _t
+    store = {}
+    def fake_get(Key): return {"Item": store[Key["SK"]]} if Key["SK"] in store else {}
+    def fake_put(Item): store[Item["SK"]] = Item
+    def fake_del(Key): store.pop(Key["SK"], None)
+    with mock.patch.object(identity._table, "get_item", side_effect=fake_get), \
+         mock.patch.object(identity._table, "put_item", side_effect=fake_put), \
+         mock.patch.object(identity._table, "delete_item", side_effect=fake_del):
+        identity.park_pending_auth("u1", "查待审批", "oc_1")
+        first = identity.take_pending_auth("u1")
+        assert first == {"message": "查待审批", "chatId": "oc_1"}
+        # Second take returns nothing — replay must not happen twice.
+        assert identity.take_pending_auth("u1") is None
+
+        # An item past its ttl is treated as absent, even before DynamoDB sweeps it.
+        store["PENDING_AUTH"] = {"message": "old", "chatId": "oc_1",
+                                 "ttl": int(_t.time()) - 1}
+        assert identity.take_pending_auth("u1") is None
+
+
+def test_resume_replays_the_parked_message():
+    import index, identity
+    with mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
+         mock.patch.object(identity, "take_pending_auth",
+                           return_value={"message": "查待审批", "chatId": "oc_1"}), \
+         mock.patch.object(identity, "get_or_create_session", return_value="ses_x"), \
+         mock.patch.object(identity, "get_or_create_memory_session", return_value="mem_x"), \
+         mock.patch.object(index, "invoke_agent") as inv:
+        index.resume_consented_turn("lark:ou_abc")
+    assert inv.call_count == 1
+    kw = inv.call_args.kwargs
+    assert kw["action"] == "chat_async"
+    assert kw["chat_id"] == "oc_1"
+    assert inv.call_args.args[3] == "查待审批"   # message positional
+
+
+def test_resume_is_a_noop_when_nothing_parked():
+    """A user who ran /auth directly has no turn to resume — must not invoke."""
+    import index, identity
+    with mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
+         mock.patch.object(identity, "take_pending_auth", return_value=None), \
+         mock.patch.object(index, "invoke_agent") as inv:
+        index.resume_consented_turn("lark:ou_abc")
+    assert inv.call_count == 0
+
+
+def test_resume_ignores_malformed_actor():
+    import index
+    with mock.patch.object(index, "invoke_agent") as inv:
+        index.resume_consented_turn("not-a-lark-id")
+    assert inv.call_count == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

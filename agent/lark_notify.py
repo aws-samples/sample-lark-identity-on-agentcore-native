@@ -88,6 +88,27 @@ def send_text(chat_id: str, text: str) -> bool:
     return ok
 
 
+def send_link(chat_id: str, text: str, link_text: str, url: str) -> bool:
+    """Post text + a clickable hyperlink, so the user sees "点击授权" rather than a
+    raw consent URL — mirrors the router's send_link_message. Used from the async
+    turn when a tool hits an authorization wall, so the prompt matches what the
+    router shows on the synchronous path."""
+    tok = _tenant_token()
+    if not (tok and chat_id):
+        return False
+    post = {"zh_cn": {"content": [[
+        {"tag": "text", "text": (text + " ") if text else ""},
+        {"tag": "a", "text": link_text, "href": url},
+    ]]}}
+    body = _post(f"{_API_DOMAIN}/open-apis/im/v1/messages?receive_id_type=chat_id",
+                 {"receive_id": chat_id, "msg_type": "post",
+                  "content": json.dumps(post)}, bearer=tok)
+    if body.get("code") not in (0, "0"):
+        log.error("send_link to %s failed: %s", chat_id, body.get("msg", body))
+        return False
+    return True
+
+
 def add_reaction(message_id: str, emoji: str = "OnIt") -> str:
     """React to the user's message so they know it was received. Returns the
     reaction_id needed to remove it, or "" on failure.

@@ -55,7 +55,8 @@ lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
                  action: str = "chat", mem_sid: str = "",
                  budget: float | None = None, chat_id: str = "",
-                 message_id: str = "", reaction_id: str = "") -> dict:
+                 message_id: str = "", reaction_id: str = "",
+                 fresh_session: bool = False) -> dict:
     """Invoke the agent once. Returns the parsed response dict
     {reply, needs_auth, auth_url?} (or {reply:<raw>} on non-JSON).
 
@@ -73,6 +74,8 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
         # the turn ends — only the identity that added one may delete it.
         "messageId": message_id,
         "reactionId": reaction_id,
+        # Consent-resume: force a rebuilt session so the new token is used.
+        "freshSession": fresh_session,
     }).encode()
     client = agentcore
     if budget is not None:
@@ -239,6 +242,38 @@ def wait_for_consent(actor_id: str) -> bool:
             return True
         time.sleep(AUTH_POLL_INTERVAL)
     return False
+
+
+# ----------------------------- consent resume -------------------------------
+
+def resume_consented_turn(actor_id: str) -> None:
+    """Replay the message that hit an auth wall, now that the user has consented.
+    Invoked by the shim's /return after 3LO completes — this is the callback-driven
+    resume that lets the task continue without the user re-sending.
+
+    No-op if nothing was parked (the user may have run /auth directly, with no turn
+    to resume) or it expired."""
+    if not actor_id.startswith("lark:"):
+        logger.info("resume: unexpected actor_id %r", actor_id)
+        return
+    open_id = actor_id.split(":", 1)[1]
+    user_id, _ = identity.resolve_user("lark", open_id)
+    if not user_id:
+        logger.info("resume: no user for %s", actor_id)
+        return
+    parked = identity.take_pending_auth(user_id)
+    if not parked:
+        logger.info("resume: nothing parked for %s", actor_id)
+        return
+    message, chat_id = parked["message"], parked["chatId"]
+    logger.info("resume: replaying for %s: %r", actor_id, message[:80])
+    session_id = identity.get_or_create_session(user_id)
+    mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
+    # A fresh reaction on the resumed turn is not possible (the original message id
+    # isn't parked), so none is passed — the answer arrives without a marker.
+    invoke_agent(session_id, user_id, actor_id, message,
+                 action="chat_async", mem_sid=mem_sid, chat_id=chat_id,
+                 fresh_session=True)
 
 
 # ------------------------------- async processing ---------------------------
@@ -409,6 +444,20 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
         logger.info("status for %s: events=%d", actor_id, events)
         return
 
+    # If the user isn't authorized yet, a Lark tool this turn may hit an auth wall
+    # deep in the async run — past where the router can see it. Park the message now
+    # so the shim's /return can replay it once consent lands. Only for unauthorized
+    # users: an authorized turn won't wall, and parking every message would be waste.
+    # Left to expire by TTL if this turn needs no Lark tool after all.
+    if not user_token_vaulted(actor_id):
+        identity.park_pending_auth(user_id, agent_message, chat_id)
+    _dispatch_turn(user_id, actor_id, agent_message, chat_id, message_id, context)
+
+
+def _dispatch_turn(user_id: str, actor_id: str, agent_message: str, chat_id: str,
+                   message_id: str = "", context=None) -> None:
+    """Invoke the agent for one turn and deliver the reply. Shared by the webhook
+    path and the consent-resume path (shim replays a parked message here)."""
     session_id = identity.get_or_create_session(user_id)
     mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
     logger.info("invoking agent: session=%s mem=%s msg=%r",
@@ -477,6 +526,14 @@ def handler(event, context):
     if event.get("_async_dispatch"):
         logger.info("async dispatch: processing lark event")
         process_lark_event(event["body"], event.get("headers", {}), context)
+        return {"ok": True}
+
+    # Consent-resume path: the shim invokes us here after a user finishes 3LO, so the
+    # message that hit the auth wall can be replayed with the token now in the vault
+    # — the user does not re-send. See .dev/adr and PLAN-consent-resume.
+    if event.get("_consent_resumed"):
+        actor_id = event.get("actorId", "")
+        resume_consented_turn(actor_id)
         return {"ok": True}
 
     path = event.get("rawPath", event.get("requestContext", {}).get("http", {}).get("path", ""))

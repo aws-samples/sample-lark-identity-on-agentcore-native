@@ -96,6 +96,38 @@ def drop_session(user_id: str) -> None:
     _table.delete_item(Key={"PK": f"USER#{user_id}", "SK": "SESSION"})
 
 
+# When a turn hits a Lark authorization wall, the original message is parked here so
+# the shim's /return can replay it once consent completes — the "durable intent"
+# that makes callback-driven resume possible without a live task to wake. TTL-bounded
+# so an abandoned consent doesn't linger.
+_PENDING_AUTH_TTL = int(os.environ.get("PENDING_AUTH_TTL_SECONDS", "600"))  # 10 min
+
+
+def park_pending_auth(user_id: str, message: str, chat_id: str) -> None:
+    """Remember what the user was trying to do, to replay after they authorize.
+    One per user (overwrites) — a second attempt supersedes the first."""
+    _table.put_item(Item={
+        "PK": f"USER#{user_id}", "SK": "PENDING_AUTH",
+        "message": message, "chatId": chat_id,
+        "createdAt": int(time.time()),
+        "ttl": int(time.time()) + _PENDING_AUTH_TTL,
+    })
+
+
+def take_pending_auth(user_id: str) -> dict | None:
+    """Return {message, chatId} and delete it — replay is once-only. None if there is
+    nothing parked (e.g. the user ran /auth directly, with no message to resume), or
+    it expired. A stale item past its ttl is treated as absent even if DynamoDB has
+    not swept it yet."""
+    item = _table.get_item(Key={"PK": f"USER#{user_id}", "SK": "PENDING_AUTH"}).get("Item")
+    if not item:
+        return None
+    _table.delete_item(Key={"PK": f"USER#{user_id}", "SK": "PENDING_AUTH"})
+    if int(item.get("ttl", 0) or 0) < int(time.time()):
+        return None
+    return {"message": item.get("message", ""), "chatId": item.get("chatId", "")}
+
+
 _MEMORY_ID: str | None = None
 
 

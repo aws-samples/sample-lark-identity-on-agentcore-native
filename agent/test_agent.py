@@ -177,11 +177,13 @@ def test_hit_auth_wall_reads_tool_results_not_the_final_reply():
     past a string check on the reply — verified end-to-end before this fix."""
     src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
     ns = {}
-    for name in ('_NEEDS_TOKEN_MARKER = ', 'def _hit_auth_wall('):
+    # The tool-result scan is the fallback path; the fast path (abort mid-stream)
+    # is covered by the streaming tests. Load the scanner directly.
+    for name in ('_NEEDS_TOKEN_MARKER = ', 'def _hit_auth_wall_from_tool_results('):
         start = src.index(name)
         end = src.index("\n\n\n", start)
         exec(src[start:end], ns)
-    hit = ns["_hit_auth_wall"]
+    hit = ns["_hit_auth_wall_from_tool_results"]
 
     class FakeAgent:
         def __init__(self, messages): self.messages = messages
@@ -223,7 +225,17 @@ def test_unauthorized_session_still_connects_and_lists_tools():
 # updates are throttled (not one call per token), and any CardKit failure falls back
 # to send_text so the answer is never lost.
 
-def _load_stream_to_chat(fake_deltas, card, notify_sent):
+def _fake_stream(deltas, tool_calls, on_tool_use):
+    """Yield deltas, then offer each tool call to on_tool_use — stopping if it says
+    to, exactly as the real generator does."""
+    for d in deltas:
+        yield d
+    for name in (tool_calls or []):
+        if on_tool_use and on_tool_use(name):
+            return
+
+
+def _load_stream_to_chat(fake_deltas, card, notify_sent, tool_calls=None):
     """Exec _stream_to_chat in isolation with fakes for its module deps — importing
     agent_core needs strands/mcp (ARM64), unavailable on the test host."""
     import time as _time
@@ -235,7 +247,10 @@ def _load_stream_to_chat(fake_deltas, card, notify_sent):
         "log": mock.Mock(),
         "lark_notify": mock.Mock(StreamingCard=lambda chat_id: card,
                                  send_text=lambda cid, t: notify_sent.append(t) or True),
-        "_iter_deltas": lambda agent, message: iter(fake_deltas),
+        # Mirrors the real signature. `tool_calls` (if given) are offered to
+        # on_tool_use after the deltas run out, so a test can exercise the abort.
+        "_iter_deltas": lambda agent, message, on_tool_use=None: _fake_stream(
+            fake_deltas, tool_calls, on_tool_use),
         "_STREAM_MIN_CHARS": 80,
         "_STREAM_MIN_INTERVAL": 0.6,
     }
@@ -281,6 +296,39 @@ def test_stream_updates_are_throttled_and_cumulative():
     assert card.closed_with == text
 
 
+def test_stream_aborts_when_an_unauthorized_session_reaches_a_lark_tool():
+    """The model must not get to narrate a refusal at length before the consent card.
+    Aborting at the tool call is what keeps the card the only thing the user reads."""
+    card = FakeCard()
+    session = {"agent": object(), "auth_url": "https://consent"}
+    fn = _load_stream_to_chat(["让我查一下…"], card, [], tool_calls=["approval_list_pending"])
+    text = fn(session, "查待审批", "oc_1")
+    assert session.get("walled_tool") == "approval_list_pending"
+    # The half-sentence is replaced, not left on the card.
+    assert "让我查一下" not in text
+    assert "Lark" in text
+
+
+def test_stream_does_not_abort_on_websearch_when_unauthorized():
+    """Search needs no Lark grant, so an unauthorized user must still get results."""
+    card = FakeCard()
+    session = {"agent": object(), "auth_url": "https://consent"}
+    fn = _load_stream_to_chat(["天气是…"], card, [], tool_calls=["WebSearch"])
+    text = fn(session, "今天天气", "oc_1")
+    assert "walled_tool" not in session
+    assert text == "天气是…"
+
+
+def test_stream_does_not_abort_when_authorized():
+    """An authorized session has no auth_url, so tool calls proceed normally."""
+    card = FakeCard()
+    session = {"agent": object()}          # no auth_url
+    fn = _load_stream_to_chat(["结果…"], card, [], tool_calls=["lark_list_my_docs"])
+    text = fn(session, "查文档", "oc_1")
+    assert "walled_tool" not in session
+    assert text == "结果…"
+
+
 def test_stream_falls_back_to_text_when_card_cannot_open():
     """No cardkit:card:write scope → open() fails → the answer still arrives as text."""
     card = FakeCard(open_ok=False)
@@ -301,6 +349,47 @@ def test_stream_falls_back_when_an_update_fails_midway():
     assert text == "x"*100 + "y"*100
     assert sent == [text]                  # fell back after the failed update
     assert card.closed_with is None        # never reached a clean close
+
+
+def test_fresh_session_evicts_a_cached_unauthorized_session():
+    """The consent-resume replay must not reuse the cached unauthorized session: its
+    MCP clients hold an empty token, so the turn would wall again. Measured in the
+    field — consent completed 31 s after the prompt, inside _UNAUTH_TTL, so waiting
+    for expiry is not a fix."""
+    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
+    start = src.index("def _get_session(")
+    end = src.index("\n\ndef chat_result(", start)
+    closed = []
+
+    class FakeMCP:
+        def __exit__(self, *a): closed.append(1)
+
+    sessions = {"lark:u|mem1": {"auth_url": "https://consent", "created": 1e9,
+                                "mcp": FakeMCP(), "agent": object()}}
+    built = []
+
+    def fake_build(actor_id, email, mem_sid):
+        built.append(mem_sid)
+        return {"created": 1e9, "agent": object()}   # authorized: no auth_url
+
+    ns = {"_sessions": sessions, "_lock": __import__("threading").Lock(),
+          "time": __import__("time"), "_UNAUTH_TTL": 60, "_SESSION_TTL": 3000,
+          "_build_session": fake_build, "log": mock.Mock()}
+    exec(src[start:end], ns)
+    get = ns["_get_session"]
+
+    # Without fresh, the cached unauthorized session is returned (still inside TTL).
+    with mock.patch.object(ns["time"], "time", return_value=1e9 + 10):
+        s = get("lark:u", "", "mem1")
+        assert s.get("auth_url") == "https://consent"
+        assert built == []
+
+    # With fresh, it is evicted, its clients closed, and a new one built.
+    with mock.patch.object(ns["time"], "time", return_value=1e9 + 10):
+        s = get("lark:u", "", "mem1", fresh=True)
+    assert closed, "the stale MCP client must be closed, not leaked"
+    assert built == ["mem1"]
+    assert "auth_url" not in s
 
 
 if __name__ == "__main__":

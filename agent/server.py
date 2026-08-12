@@ -132,6 +132,9 @@ async def handle_invocations(request: web.Request) -> web.Response:
         # The router's in-progress reaction, for us to clear when the turn ends.
         msg_id = payload.get("messageId", "")
         reaction_id = payload.get("reactionId", "")
+        # Set on the consent-resume replay: rebuild the session so the just-vaulted
+        # token is picked up instead of the cached unauthorized one.
+        fresh_session = bool(payload.get("freshSession"))
         if not (message and chat_id):
             return web.json_response({"error": "message and chatId required"}, status=400)
         try:
@@ -139,7 +142,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
             # chat later. Consent still comes back inline (see chat_async).
             result = await asyncio.get_event_loop().run_in_executor(
                 None, agent_core.chat_async, actor_id, message, chat_id, email,
-                mem_sid, msg_id, reaction_id,
+                mem_sid, msg_id, reaction_id, fresh_session,
             )
             return web.json_response(result)
         except Exception as e:
