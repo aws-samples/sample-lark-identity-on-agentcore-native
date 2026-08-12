@@ -43,7 +43,7 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 | `agent/` | Strands agent container: HTTP contract + AgentCore Memory + agent-side 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers back into a card (`lark_notify`) |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
-| `mcp-server/` | Lark MCP server (AgentCore Runtime, lark-cli engine) — calls Lark as the user |
+| `mcp-servers/` | The MCP servers, one Runtime each: `lark-cli/` acts as the user against Lark; `approval/` runs approval decisions on the app identity (see its guards) |
 | `deploy.sh` | the deploy entry point — orders the steps in `scripts/` |
 | `scripts/` | step implementations: deploy (base/runtime/gateway) / build-mcp / setup-3lo / setup-lark / manage-allowlist / destroy |
 | `tests/` | `run.sh` (all unit suites) + e2e smoke tests that need a deployed stack |

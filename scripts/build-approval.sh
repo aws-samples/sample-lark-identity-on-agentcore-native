@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Build the Lark MCP server image natively on ARM64 via CodeBuild, then push to ECR.
+# Build the Lark Approval MCP server image natively on ARM64 via CodeBuild, push to
+# ECR, then create/update its Runtime. Separate from the lark-cli server on purpose:
+# approve/reject accept only a tenant token, and the decision guards have to be bound
+# to specific tools rather than a generic passthrough. See .dev/adr/0006.
 # Prints the image URI, then creates/updates the MCP Runtime (./deploy.sh mcp).
 #
 # Local QEMU cross-builds aren't reliable for ARM64 native artifacts, so use CodeBuild's aarch64 image to build natively.
@@ -21,16 +24,17 @@ export AWS_REGION="$REGION"
 [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-REPO="$PREFIX-mcp-lark-cli"
+REPO="$PREFIX-mcp-approval"
 ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$REPO"
 LARK_CLI_VERSION="${LARK_CLI_VERSION:-1.0.68}"   # engine = official lark-cli (not lark-mcp)
 TAG="cli-$LARK_CLI_VERSION"
 PROJECT="$PREFIX-mcp-builder"
 SRC_BUCKET="bedrock-agentcore-codebuild-sources-$ACCOUNT-$REGION"
 CB_ROLE_NAME="$PREFIX-mcp-builder-role"
-RUNTIME_NAME="${PREFIX//-/_}_mcp"        # AgentCore runtime names use underscores
+RUNTIME_NAME="${PREFIX//-/_}_approval"   # AgentCore runtime names use underscores
 LARK_API_DOMAIN="${LARK_API_DOMAIN:-https://open.larksuite.com}"   # CN: open.feishu.cn
 : "${LARK_APP_ID:?set LARK_APP_ID in .env}"
+: "${LARK_APP_SECRET:?set LARK_APP_SECRET in .env}"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 
@@ -59,9 +63,9 @@ log "Upload build source to S3"
 aws s3api head-bucket --bucket "$SRC_BUCKET" >/dev/null 2>&1 || \
   aws s3api create-bucket --bucket "$SRC_BUCKET" \
     --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null
-SRC_KEY="$PREFIX-mcp/source.zip"
+SRC_KEY="$PREFIX-approval/source.zip"
 TMPZIP="$(mktemp -u).zip"   # -u: name only, let zip create it (zip rejects a pre-existing empty file)
-( cd mcp-servers/lark-cli && zip -qr "$TMPZIP" . -x '*.pyc' '__pycache__/*' )  # Dockerfile + proxy.py + any other source
+( cd mcp-servers/approval && zip -qr "$TMPZIP" . -x '*.pyc' '__pycache__/*' )  # Dockerfile + proxy.py + any other source
 aws s3 cp "$TMPZIP" "s3://$SRC_BUCKET/$SRC_KEY" >/dev/null
 rm -f "$TMPZIP"  # safe-rm-ok
 echo "  s3://$SRC_BUCKET/$SRC_KEY"
@@ -131,7 +135,39 @@ ROLE_ARN="$(aws cloudformation describe-stacks --stack-name "$PREFIX-agentcore" 
 
 ARTIFACT="{\"containerConfiguration\":{\"containerUri\":\"$ECR:$TAG\"}}"
 HEADERS='{"requestHeaderAllowlist":["X-Amzn-Bedrock-AgentCore-Runtime-Custom-Lark-Token"]}'
-ENVVARS="APP_ID=$LARK_APP_ID,LARK_DOMAIN=$LARK_API_DOMAIN"
+# This runtime needs a real appSecret, unlike the lark-cli server — approve/reject
+# mint a tenant token, and the container has no AWS SDK to fetch it from Secrets
+# Manager (adding one to reach a single value costs more than it returns). So the
+# secret is injected as an environment variable, which widens where it lives: an
+# operator who can read this Runtime's config can read it. Worth knowing given what
+# the tenant token can do here — complete any approval in the tenant (.dev/adr/0006).
+# AGENT_DECIDE_* are the code-enforced limits on what the agent may decide; an empty
+# allow-list decides nothing (fail closed) until set deliberately in .env.
+# Built as JSON, not the shorthand key=value,key=value form: an allow-list holds
+# several approval codes separated by commas, and the shorthand parser would split on
+# those and silently mangle the whole map. Failure mode was an empty allow-list, i.e.
+# the guards refusing everything with no error anywhere.
+ENVVARS="$(LARK_APP_ID="$LARK_APP_ID" LARK_APP_SECRET="$LARK_APP_SECRET" \
+  LARK_API_DOMAIN="$LARK_API_DOMAIN" \
+  AGENT_DECIDE_APPROVAL_CODES="${AGENT_DECIDE_APPROVAL_CODES:-}" \
+  AGENT_DECIDE_MAX_AMOUNT="${AGENT_DECIDE_MAX_AMOUNT:-1000}" \
+  uv run python -c '
+import json, os
+print(json.dumps({
+    "APP_ID": os.environ["LARK_APP_ID"],
+    "APP_SECRET": os.environ["LARK_APP_SECRET"],
+    "LARK_DOMAIN": os.environ.get("LARK_API_DOMAIN", ""),
+    "AGENT_DECIDE_APPROVAL_CODES": os.environ.get("AGENT_DECIDE_APPROVAL_CODES", ""),
+    "AGENT_DECIDE_MAX_AMOUNT": os.environ.get("AGENT_DECIDE_MAX_AMOUNT", "1000"),
+}))')"
+
+# Surface what the guards will actually allow — an empty allow-list is a silent
+# "decide nothing", which is safe but confusing if it was not intended.
+if [ -z "${AGENT_DECIDE_APPROVAL_CODES:-}" ]; then
+  printf '\033[1;33m%s\033[0m\n' "  AGENT_DECIDE_APPROVAL_CODES is empty — the agent will decline every decision"
+else
+  echo "  agent may decide on: $AGENT_DECIDE_APPROVAL_CODES (max amount ${AGENT_DECIDE_MAX_AMOUNT:-1000})"
+fi
 
 RID="$(aws bedrock-agentcore-control list-agent-runtimes \
   --query "agentRuntimes[?agentRuntimeName=='$RUNTIME_NAME'].agentRuntimeId" \

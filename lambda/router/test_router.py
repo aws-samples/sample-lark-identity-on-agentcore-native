@@ -357,5 +357,21 @@ def test_add_reaction_returns_id_and_never_raises():
         assert lark.add_reaction("") == ""
 
 
+def test_status_shows_both_identities_and_masks_the_app_id():
+    """/status must name both identities — the whole point of this sample is that
+    tools act as the *user* while replies go out as the *app*. The appId is not a
+    secret but is masked anyway: no reason to paste a full identifier into a chat."""
+    import index
+    with mock.patch.object(index.lark, "get_credentials",
+                           return_value=("cli_a1b2c3d4e5f6g7h8", "s", "v", "k")):
+        line = index._app_identity()
+    assert line == "cli_a1b2…g7h8"
+    assert "c3d4e5f6" not in line          # middle is not exposed
+
+    # Unconfigured must not blow up or print an empty parenthesis.
+    with mock.patch.object(index.lark, "get_credentials", return_value=("", "", "", "")):
+        assert index._app_identity() == "未配置"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

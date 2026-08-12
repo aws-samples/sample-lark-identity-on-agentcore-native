@@ -71,7 +71,7 @@ phase2_runtime() {
   command -v agentcore >/dev/null || { echo "agentcore CLI not found: npm i -g @aws/agentcore"; exit 1; }
   export AGENTCORE_SUPPRESS_RECOMMENDATION=1
 
-  local role model memory shim mcp_arn mcp_url pool client pwsecret ws_url
+  local role model memory shim mcp_arn mcp_url pool client pwsecret ws_url approval_url approval_arn
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
   # Cognito lets the agent mint the access token the search Gateway authorises with.
   pool="$(cfn_out "$PREFIX-security" UserPoolId)"
@@ -86,6 +86,18 @@ phase2_runtime() {
   mcp_arn="$(aws bedrock-agentcore-control list-agent-runtimes \
     --query "agentRuntimes[?agentRuntimeName=='lark_agent_mcp'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
   mcp_url="https://bedrock-agentcore.$REGION.amazonaws.com/runtimes/$(uv run python -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$mcp_arn")/invocations?qualifier=DEFAULT"
+  # Approval MCP server, if ./deploy.sh approval ran. Optional by design: left empty
+  # the agent simply has no approval tools, same as web search.
+  approval_arn="$(aws bedrock-agentcore-control list-agent-runtimes \
+    --query "agentRuntimes[?agentRuntimeName=='${PREFIX//-/_}_approval'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
+  if [ -n "$approval_arn" ] && [ "$approval_arn" != "None" ]; then
+    approval_url="https://bedrock-agentcore.$REGION.amazonaws.com/runtimes/$(uv run python -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$approval_arn")/invocations?qualifier=DEFAULT"
+    echo "  approval tools: enabled"
+  else
+    approval_url=""
+    echo "  approval tools: not deployed (./deploy.sh approval to add them)"
+  fi
+
   [ -n "$role" ] || { echo "missing execution role output — run --base first"; exit 1; }
   [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || { echo "lark_agent_mcp runtime not found — deploy the MCP server first (scripts/build-mcp.sh + create runtime)"; exit 1; }
 
@@ -110,7 +122,8 @@ phase2_runtime() {
     --env "COGNITO_USER_POOL_ID=$pool" \
     --env "COGNITO_CLIENT_ID=$client" \
     --env "COGNITO_PASSWORD_SECRET_ID=$pwsecret" \
-    --env "WEBSEARCH_GATEWAY_URL=$ws_url"
+    --env "WEBSEARCH_GATEWAY_URL=$ws_url" \
+    --env "APPROVAL_MCP_URL=$approval_url"
 
   # Persist the runtime id into .cdk-state.json for the dependent stacks.
   local rid

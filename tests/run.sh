@@ -18,4 +18,9 @@ uv run --with cryptography --with boto3 --with pytest python -m pytest lambda/ro
 echo "== shim =="
 uv run --with boto3 --with pytest python -m pytest lambda/shim/test_shim.py -q
 
+echo "== approval guards (node) =="
+# Node's own runner — the guards are dependency-free by design, so no new toolchain.
+# Pointed at the file, not the directory: server.js starts listening on load.
+node --test mcp-servers/approval/test_guards.mjs
+
 echo "== all green =="

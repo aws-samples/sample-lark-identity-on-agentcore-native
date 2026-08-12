@@ -44,6 +44,8 @@ log = logging.getLogger("agent.core")
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
 _MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
 _MEMORY_ID = os.environ.get("BEDROCK_AGENTCORE_MEMORY_ID", "")
+# Empty unless ./deploy.sh approval ran — the approval tools are opt-in.
+_APPROVAL_MCP_URL = os.environ.get("APPROVAL_MCP_URL", "")
 _SYSTEM = os.environ.get(
     "AGENT_SYSTEM_PROMPT",
     "You are a helpful assistant embedded in Lark. Be concise. "
@@ -137,6 +139,21 @@ def _build_session(actor_id: str, email: str, mem_sid: str) -> dict:
             log.exception("lark-mcp unavailable for %s", actor_id)
             mcp = None
 
+    # Approval tools, when that Runtime is deployed. Separate server because its
+    # write operations run on the app's tenant token (Lark accepts no user token
+    # there) and its decision limits have to be bound to specific tools — see
+    # .dev/adr/0006. The user token is still passed: add_sign needs it.
+    approval_mcp = None
+    if _APPROVAL_MCP_URL:
+        try:
+            approval_mcp = lark_3lo.mcp_client_for(
+                value if kind == "token" else "", url=_APPROVAL_MCP_URL)
+            approval_mcp.__enter__()
+            tools = tools + approval_mcp.list_tools_sync()
+        except Exception:  # noqa: BLE001 — optional, like search
+            log.exception("approval tools unavailable for %s", actor_id)
+            approval_mcp = None
+
     # Search doesn't depend on the user's Lark grant, so add it even when the
     # Lark tools are unavailable — an unauthorised user can still ask questions.
     search_mcp = None
@@ -154,6 +171,7 @@ def _build_session(actor_id: str, email: str, mem_sid: str) -> dict:
         session_manager=_make_session_manager(actor_id, mem_sid),
     )
     return {"agent": agent, "mcp": mcp, "search_mcp": search_mcp,
+            "approval_mcp": approval_mcp,
             "created": time.time(),
             "auth_url": auth_url, "identity_error": identity_error}
 
@@ -213,7 +231,7 @@ def _get_session(actor_id: str, email: str, mem_sid: str) -> dict:
             ttl = _UNAUTH_TTL if s.get("auth_url") else _SESSION_TTL
             if (time.time() - s["created"]) < ttl:
                 return s
-            for key in ("mcp", "search_mcp"):
+            for key in ("mcp", "search_mcp", "approval_mcp"):
                 if s.get(key):
                     try:
                         s[key].__exit__(None, None, None)  # close the stale connection

@@ -164,10 +164,10 @@ def test_auth_marker_matches_the_mcp_server():
     not, the user silently stops being offered a consent link."""
     here = os.path.dirname(__file__)
     core = open(os.path.join(here, "agent_core.py"), encoding="utf-8").read()
-    server = open(os.path.join(here, "..", "mcp-server", "server.js"), encoding="utf-8").read()
+    server = open(os.path.join(here, "..", "mcp-servers", "lark-cli", "server.js"), encoding="utf-8").read()
     marker = re.search(r'_NEEDS_TOKEN_MARKER = "([^"]+)"', core).group(1)
     assert marker in server, (
-        f"agent_core expects {marker!r} but mcp-server/server.js no longer says it"
+        f"agent_core expects {marker!r} but mcp-servers/lark-cli/server.js no longer says it"
     )
 
 

@@ -96,6 +96,18 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
     return data
 
 
+def _app_identity() -> str:
+    """The Lark app the bot speaks as. Shown next to the user identity because this
+    sample's whole point is that the two are different: tools reach Lark as the
+    *user* (their vaulted token), while replies, reactions and cards go out as the
+    *app* (its tenant token). Masked — an appId is not a secret, but there is no
+    reason to paste a full identifier into a chat."""
+    app_id = lark.get_credentials()[0]
+    if not app_id:
+        return "未配置"
+    return f"{app_id[:8]}…{app_id[-4:]}" if len(app_id) > 14 else app_id
+
+
 # ------------------------- execution environment probe -----------------------
 
 # Measured: probing a session id with no live microVM provisions one (a fresh id
@@ -384,7 +396,8 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
         last_str = (datetime.datetime.fromtimestamp(last, datetime.timezone.utc)
                     .strftime("%Y-%m-%d %H:%M UTC") if last else "—")
         lines = [
-            f"身份：{actor_id}",
+            f"应用身份：{_app_identity()}",
+            f"用户身份：{actor_id}",
             f"会话路由键：{rt_sid or '尚未建立（发一条普通消息后创建）'}",
             f"当前 microVM：{_microvm_line(rt_sid, user_id, actor_id)}",
             f"记忆线程：{mem_sid}",

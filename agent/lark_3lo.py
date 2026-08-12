@@ -90,12 +90,14 @@ class _SigV4HTTPXAuth(httpx.Auth):
         yield request
 
 
-def mcp_client_for(lark_token: str) -> MCPClient:
-    """MCP client to the lark-mcp Runtime: SigV4 transport + Lark token in the
-    custom header (the sidecar copies it to Authorization for official lark-mcp)."""
+def mcp_client_for(lark_token: str, url: str = "") -> MCPClient:
+    """MCP client to an MCP-server Runtime: SigV4 transport + the Lark token in the
+    custom passthrough header. Defaults to the lark-cli server; pass `url` for
+    another one (the approval server, say). Same transport either way — what differs
+    is which tools the server exposes and which identity each of them uses."""
     creds = boto3.Session(region_name=_REGION).get_credentials()
     auth = _SigV4HTTPXAuth(creds, "bedrock-agentcore", _REGION)
     headers = {_CUSTOM_HEADER: lark_token}
     return MCPClient(lambda: streamablehttp_client(
-        _LARK_MCP_URL, headers=headers, auth=auth, timeout=timedelta(seconds=60),
+        url or _LARK_MCP_URL, headers=headers, auth=auth, timeout=timedelta(seconds=60),
     ))
