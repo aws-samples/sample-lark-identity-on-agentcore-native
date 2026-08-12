@@ -19,7 +19,7 @@ function loadGuards(env = {}) {
   const end = src.indexOf('const TOOLS = [');
   assert.ok(start > 0 && end > start, 'guard block not found — did server.js move?');
   const fn = new Function('process', `${src.slice(start, end)}
-    return { checkAutoDecisionAllowed, consentNote, AGENT_DECIDE_MAX_AMOUNT, AGENT_DECIDE_APPROVAL_CODES };`);
+    return { checkAutoDecisionAllowed, requireConsentOnRecord, consentNote, AGENT_DECIDE_MAX_AMOUNT, AGENT_DECIDE_APPROVAL_CODES };`);
   return fn({ env });
 }
 
@@ -58,6 +58,18 @@ test('a missing or unparseable amount does not bypass the limit check', () => {
   assert.equal(g.checkAutoDecisionAllowed({ approval_code: 'LEAVE_V1', amount: 'lots' }), null);
   assert.match(g.checkAutoDecisionAllowed({ approval_code: 'OTHER_V1', amount: 'lots' }),
                /not in AGENT_DECIDE_APPROVAL_CODES/);
+});
+
+test('refuses to decide for an approver with no consent on record', () => {
+  // Lark would allow this — approve/reject take only a tenant token, so the API never
+  // checks whether the approver agreed. Refusing is this server's own rule, and the
+  // one that must not quietly regress: without it the app decides in anyone's name.
+  const g = loadGuards({});
+  const refusal = g.requireConsentOnRecord(false);
+  assert.match(refusal, /refused:/);
+  assert.match(refusal, /no on-record authorization/);
+  assert.match(refusal, /the limit is ours/);        // says who is enforcing it
+  assert.equal(g.requireConsentOnRecord(true), null);
 });
 
 test('the consent note distinguishes an on-record grant from app authority alone', () => {

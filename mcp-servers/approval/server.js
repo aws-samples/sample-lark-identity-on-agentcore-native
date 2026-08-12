@@ -16,7 +16,6 @@
 'use strict';
 
 const http = require('http');
-const { execFile } = require('child_process');
 
 const PORT = parseInt(process.env.PORT || '8000', 10);
 const APP_ID = process.env.APP_ID || '';
@@ -25,7 +24,7 @@ const APP_ID = process.env.APP_ID || '';
 // which never actually needs it — a tenant token can complete any approval in the
 // tenant, so anyone who can read this Runtime's config gains that. See .dev/adr/0006.
 const APP_SECRET = process.env.APP_SECRET || '';
-const BRAND = process.env.LARK_BRAND || 'lark';
+const API = (process.env.LARK_DOMAIN || 'https://open.larksuite.com').replace(/\/$/, '');
 const TOKEN_HEADER = 'x-amzn-bedrock-agentcore-runtime-custom-lark-token';
 
 
@@ -59,15 +58,24 @@ function checkAutoDecisionAllowed(args) {
   return null;   // allowed
 }
 
-// Governance trail, NOT a security control — say so plainly. Requiring that the
-// approver once consented via 3LO leaves a record that they agreed to be acted
-// for. It does nothing against a leaked appSecret: the tenant token alone can
-// complete any approval, which is Lark's design (approve/reject accept no user
-// token at all). Verified 2026-08-12; see .dev/adr/0006.
+// Requiring an on-record 3LO grant before deciding for someone. Two things this is
+// NOT: it is not Lark enforcing anything (approve/reject take only a tenant token, so
+// the API never asks whether the approver agreed), and it is not protection against a
+// leaked appSecret (that bypasses this code entirely). It is a self-imposed rule, and
+// the reason to impose it is that "the app can decide for anyone, consent or not" is a
+// dangerous default for a sample to demonstrate. Verified 2026-08-12; see adr/0006.
+function requireConsentOnRecord(hasVaultedGrant) {
+  if (hasVaultedGrant) return null;
+  return 'refused: this approver has no on-record authorization for the assistant to '
+       + 'act for them. Ask them to run /auth lark in the bot chat first. (Lark itself '
+       + 'would allow this — the app token suffices — so the limit is ours.)';
+}
+
+
 function consentNote(hasVaultedGrant) {
   return hasVaultedGrant
     ? 'approver has an on-record 3LO grant'
-    : 'approver has NO on-record grant — proceeding on app authority alone';
+    : 'approver has NO on-record grant';
 }
 
 // `as` is the whole point of this server: 'tenant' → the app acts; 'user' → the
@@ -75,10 +83,26 @@ function consentNote(hasVaultedGrant) {
 const TOOLS = [
   {
     name: 'approval_list_pending',
-    as: 'user',
-    description: "List the calling user's own pending approval tasks. Returns task_id and instance_code, which the other tools need. Acts as the user, so it only ever shows their own queue.",
-    inputSchema: { type: 'object', properties: {} },
-    cli: () => ['api', 'GET', '/open-apis/approval/v4/tasks/query'],
+    // Tenant, not user: Lark's error for this endpoint names the required scopes and
+    // ends the help URL with token_type=tenant. So the app reads the queue and
+    // `user_id` names whose queue — the same shape as approve/reject, and the same
+    // consequence: the app can read any user's queue, not just the caller's.
+    as: 'tenant',
+    description: "List a user's approval tasks. topic: 1=pending (default), 2=done, 3=initiated. Runs on the APP identity — Lark offers no user-token variant — so user_id decides whose queue is read. Requires approval:approval:readonly or approval:task:list_by_user (tenant scopes).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_id: { type: 'string', description: "the approver's open_id (ou_...)" },
+        topic: { type: 'integer', description: '1=pending (default), 2=done, 3=initiated' },
+      },
+      required: ['user_id'],
+    },
+    // Both user_id and topic are mandatory server-side — omitting them returns
+    // 99992402 field validation failed, which reads like a permission problem and
+    // sent an earlier version of this looking for a scope that does not exist.
+    req: (a) => ({ method: 'GET', path: '/open-apis/approval/v4/tasks/query'
+      + `?user_id=${encodeURIComponent(a.user_id)}&user_id_type=open_id`
+      + `&topic=${a.topic || 1}` }),
   },
   {
     name: 'approval_get_instance',
@@ -89,7 +113,8 @@ const TOOLS = [
       properties: { instance_code: { type: 'string', description: 'the approval instance code' } },
       required: ['instance_code'],
     },
-    cli: (a) => ['api', 'GET', `/open-apis/approval/v4/instances/${encodeURIComponent(a.instance_code)}`],
+    req: (a) => ({ method: 'GET',
+      path: `/open-apis/approval/v4/instances/${encodeURIComponent(a.instance_code)}` }),
   },
   {
     name: 'approval_approve',
@@ -108,10 +133,11 @@ const TOOLS = [
       required: ['approval_code', 'instance_code', 'task_id', 'user_id'],
     },
     guarded: true,
-    cli: (a) => ['api', 'POST', '/open-apis/approval/v4/tasks/approve', '--data', JSON.stringify({
+    req: (a) => ({ method: 'POST', path: '/open-apis/approval/v4/tasks/approve',
+      body: {
       approval_code: a.approval_code, instance_code: a.instance_code,
       task_id: a.task_id, user_id: a.user_id, comment: a.comment || '',
-    })],
+    } }),
   },
   {
     name: 'approval_reject',
@@ -130,10 +156,11 @@ const TOOLS = [
       required: ['approval_code', 'instance_code', 'task_id', 'user_id'],
     },
     guarded: true,
-    cli: (a) => ['api', 'POST', '/open-apis/approval/v4/tasks/reject', '--data', JSON.stringify({
+    req: (a) => ({ method: 'POST', path: '/open-apis/approval/v4/tasks/reject',
+      body: {
       approval_code: a.approval_code, instance_code: a.instance_code,
       task_id: a.task_id, user_id: a.user_id, comment: a.comment || '',
-    })],
+    } }),
   },
   {
     name: 'approval_transfer',
@@ -151,11 +178,12 @@ const TOOLS = [
       },
       required: ['approval_code', 'instance_code', 'task_id', 'user_id', 'transfer_user_id'],
     },
-    cli: (a) => ['api', 'POST', '/open-apis/approval/v4/tasks/transfer', '--data', JSON.stringify({
+    req: (a) => ({ method: 'POST', path: '/open-apis/approval/v4/tasks/transfer',
+      body: {
       approval_code: a.approval_code, instance_code: a.instance_code,
       task_id: a.task_id, user_id: a.user_id,
       transfer_user_id: a.transfer_user_id, comment: a.comment || '',
-    })],
+    } }),
   },
   {
     name: 'approval_add_sign',
@@ -178,34 +206,54 @@ const TOOLS = [
       },
       required: ['approval_code', 'instance_code', 'task_id', 'user_id', 'add_sign_user_ids'],
     },
-    cli: (a) => ['api', 'POST', '/open-apis/approval/v4/tasks/add_sign', '--data', JSON.stringify({
+    req: (a) => ({ method: 'POST', path: '/open-apis/approval/v4/tasks/add_sign',
+      body: {
       approval_code: a.approval_code, instance_code: a.instance_code,
       task_id: a.task_id, user_id: a.user_id,
       add_sign_user_ids: a.add_sign_user_ids,
       add_sign_type: a.add_sign_type || 2, comment: a.comment || '',
-    })],
+    } }),
   },
 ];
 
-function runLarkCli(cliArgs, as, userToken) {
-  return new Promise((resolve) => {
-    const env = {
-      PATH: process.env.PATH,
-      HOME: process.env.HOME || '/tmp',
-      LARKSUITE_CLI_APP_ID: APP_ID,
-      LARKSUITE_CLI_APP_SECRET: APP_SECRET,
-      LARKSUITE_CLI_BRAND: BRAND,
-      LARKSUITE_CLI_DEFAULT_AS: as,
-    };
-    // Only hand over the user's token on the tools that act as the user — a tenant
-    // tool must not be able to reach it.
-    if (as === 'user') env.LARKSUITE_CLI_USER_ACCESS_TOKEN = userToken;
-    execFile('lark-cli', cliArgs, { timeout: 30000, maxBuffer: 10 * 1024 * 1024, env },
-      (err, stdout, stderr) => {
-        if (err && !stdout) resolve({ isError: true, text: `lark-cli error: ${stderr || err.message}` });
-        else resolve({ isError: false, text: stdout.trim() || stderr.trim() });
-      });
+let _tenant = null;   // { token, expiresAt }
+
+async function tenantToken() {
+  if (_tenant && _tenant.expiresAt > Date.now()) return _tenant.token;
+  const r = await fetch(`${API}/open-apis/auth/v3/tenant_access_token/internal`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET }),
   });
+  const b = await r.json();
+  if (!b.tenant_access_token) throw new Error(`tenant token failed: ${b.msg || r.status}`);
+  _tenant = { token: b.tenant_access_token,
+              expiresAt: Date.now() + ((b.expire || 7200) - 300) * 1000 };
+  return _tenant.token;
+}
+
+// The approval endpoints are plain REST, and the tools above already say which token
+// each one needs — so this calls Lark directly. An earlier version shelled out to
+// lark-cli, copied from the sibling MCP server, which bought nothing here (no
+// lark-cli feature was used, every tool was a passthrough) and cost a process spawn
+// per call plus a vocabulary mismatch: Lark's docs say "tenant token", lark-cli
+// spells the same thing 'bot' and rejects 'tenant'.
+async function callLark(req, as, userToken) {
+  const bearer = as === 'user' ? userToken : await tenantToken();
+  const r = await fetch(API + req.path, {
+    method: req.method,
+    headers: { 'Content-Type': 'application/json; charset=utf-8',
+               Authorization: `Bearer ${bearer}` },
+    body: req.body ? JSON.stringify(req.body) : undefined,
+  });
+  const text = await r.text();
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { parsed = null; }
+  // Lark answers HTTP 200 with a non-zero `code` on failure, so status alone is not
+  // the signal. Surface the whole body either way — field_violations is where the
+  // real reason lives (a missing required param reads as 99992402, which looks like
+  // a permission problem until you read that array).
+  const failed = !parsed || (parsed.code !== undefined && parsed.code !== 0);
+  return { isError: failed, text: text.slice(0, 8000) };
 }
 
 function sse(res, obj) {
@@ -250,6 +298,13 @@ const server = http.createServer((req, res) => {
       // as a tool error so the model sees the refusal and can explain it, rather
       // than being able to talk its way past it.
       if (tool.guarded) {
+        // Consent first: deciding in someone's name without their grant is the one
+        // thing this server will not do, even though Lark would permit it.
+        const noConsent = requireConsentOnRecord(Boolean(userToken));
+        if (noConsent) {
+          console.log(`guard refused ${name}: no consent on record`);
+          return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: noConsent }], isError: true } });
+        }
         const refusal = checkAutoDecisionAllowed(args);
         if (refusal) {
           console.log(`guard refused ${name}: ${refusal}`);
@@ -261,7 +316,7 @@ const server = http.createServer((req, res) => {
         args.comment = [args.comment, `[AI 自动处理] ${consentNote(Boolean(userToken))}`]
           .filter(Boolean).join(' ');
       }
-      const out = await runLarkCli(tool.cli(args), tool.as, userToken);
+      const out = await callLark(tool.req(args), tool.as, userToken);
       return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { content: [{ type: 'text', text: out.text }], isError: out.isError } });
     }
     return sse(res, { jsonrpc: '2.0', id: mcp.id || null, error: { code: -32601, message: `method not found: ${mcp.method}` } });
