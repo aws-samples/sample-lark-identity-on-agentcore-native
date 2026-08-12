@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# Build the Lark MCP server image natively on ARM64 via CodeBuild, then push to ECR.
-# Prints the image URI, then creates/updates the MCP Runtime (./deploy.sh mcp).
+# Build the MCP servers under mcp-servers/ natively on ARM64 via CodeBuild, push to
+# ECR, and create/update a Runtime for each.
+#
+# Usage: [PROFILE=p REGION=r] scripts/build-mcp.sh [name...]
+#   no args   every directory under mcp-servers/ (subject to its DEPLOY_IF)
+#   name...   only those, by directory name — DEPLOY_IF is ignored, since naming a
+#             server is an explicit request and should not be second-guessed
+#
+# Each server describes itself in mcp-servers/<name>/runtime.env (runtime suffix,
+# required vars, container env, optional DEPLOY_IF gate), so adding a server means
+# adding a directory — not editing this script.
 #
 # Local QEMU cross-builds aren't reliable for ARM64 native artifacts, so use CodeBuild's aarch64 image to build natively.
 # Provisions its own CodeBuild role; reuses the source bucket the agentcore CLI created in this account.
-#
-# Usage: [PROFILE=p REGION=r] scripts/build-mcp.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
@@ -21,19 +28,36 @@ export AWS_REGION="$REGION"
 [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-REPO="$PREFIX-mcp-lark-cli"
-ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$REPO"
 LARK_CLI_VERSION="${LARK_CLI_VERSION:-1.0.68}"   # engine = official lark-cli (not lark-mcp)
 TAG="cli-$LARK_CLI_VERSION"
+# One CodeBuild project and role for every server — only the source zip differs.
 PROJECT="$PREFIX-mcp-builder"
 SRC_BUCKET="bedrock-agentcore-codebuild-sources-$ACCOUNT-$REGION"
 CB_ROLE_NAME="$PREFIX-mcp-builder-role"
-RUNTIME_NAME="${PREFIX//-/_}_mcp"        # AgentCore runtime names use underscores
 LARK_API_DOMAIN="${LARK_API_DOMAIN:-https://open.larksuite.com}"   # CN: open.feishu.cn
 : "${LARK_APP_ID:?set LARK_APP_ID in .env}"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
+warn() { printf '\033[1;33m%s\033[0m\n' "$*"; }
 
+# Which servers to handle. Explicit names skip the DEPLOY_IF gate.
+EXPLICIT=0
+if [ $# -gt 0 ]; then
+  EXPLICIT=1
+  SERVERS=("$@")
+  for n in "${SERVERS[@]}"; do
+    [ -f "mcp-servers/$n/runtime.env" ] || { echo "unknown MCP server: $n (expected mcp-servers/$n/runtime.env)"; exit 1; }
+  done
+else
+  SERVERS=()
+  for d in mcp-servers/*/; do
+    [ -f "$d/runtime.env" ] && SERVERS+=("$(basename "$d")")
+  done
+fi
+[ ${#SERVERS[@]} -gt 0 ] || { echo "no MCP servers found under mcp-servers/"; exit 1; }
+
+# One role for every server, so ECR push is granted by prefix rather than to a
+# single repository — the loop below builds one repo per server.
 log "CodeBuild service role"
 if ! aws iam get-role --role-name "$CB_ROLE_NAME" >/dev/null 2>&1; then
   aws iam create-role --role-name "$CB_ROLE_NAME" \
@@ -44,9 +68,34 @@ aws iam put-role-policy --role-name "$CB_ROLE_NAME" --policy-name build \
     {\"Effect\":\"Allow\",\"Action\":[\"logs:CreateLogGroup\",\"logs:CreateLogStream\",\"logs:PutLogEvents\"],\"Resource\":\"arn:aws:logs:$REGION:$ACCOUNT:log-group:/aws/codebuild/$PROJECT*\"},
     {\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:GetObjectVersion\"],\"Resource\":\"arn:aws:s3:::$SRC_BUCKET/*\"},
     {\"Effect\":\"Allow\",\"Action\":\"ecr:GetAuthorizationToken\",\"Resource\":\"*\"},
-    {\"Effect\":\"Allow\",\"Action\":[\"ecr:BatchCheckLayerAvailability\",\"ecr:PutImage\",\"ecr:InitiateLayerUpload\",\"ecr:UploadLayerPart\",\"ecr:CompleteLayerUpload\",\"ecr:BatchGetImage\",\"ecr:GetDownloadUrlForLayer\"],\"Resource\":\"arn:aws:ecr:$REGION:$ACCOUNT:repository/$REPO\"}]}" >/dev/null
+    {\"Effect\":\"Allow\",\"Action\":[\"ecr:BatchCheckLayerAvailability\",\"ecr:PutImage\",\"ecr:InitiateLayerUpload\",\"ecr:UploadLayerPart\",\"ecr:CompleteLayerUpload\",\"ecr:BatchGetImage\",\"ecr:GetDownloadUrlForLayer\"],\"Resource\":\"arn:aws:ecr:$REGION:$ACCOUNT:repository/$PREFIX-mcp-*\"}]}" >/dev/null
 CB_ROLE_ARN="$(aws iam get-role --role-name "$CB_ROLE_NAME" --query 'Role.Arn' --output text)"
 sleep 8  # let the new role/policy propagate before CodeBuild validates it
+
+# ---- per server ----------------------------------------------------------
+for SERVER in "${SERVERS[@]}"; do
+DIR="mcp-servers/$SERVER"
+# Reset per-iteration so one server's config cannot leak into the next.
+RUNTIME_SUFFIX=""; DEPLOY_IF=""; REQUIRE_VARS=""; RUNTIME_ENV_MAP=""
+. "$DIR/runtime.env"
+: "${RUNTIME_SUFFIX:?$DIR/runtime.env must set RUNTIME_SUFFIX}"
+
+# A server can declare a variable that gates it. Skipped only for a build-everything
+# run — an explicitly named server is built regardless.
+if [ "$EXPLICIT" = "0" ] && [ -n "$DEPLOY_IF" ] && [ -z "${!DEPLOY_IF:-}" ]; then
+  warn "skipping $SERVER — $DEPLOY_IF is unset (name it explicitly to build anyway)"
+  continue
+fi
+for v in $REQUIRE_VARS; do
+  [ -n "${!v:-}" ] || { echo "$SERVER needs $v — set it in .env"; exit 1; }
+done
+
+REPO="$PREFIX-mcp-$SERVER"
+ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$REPO"
+RUNTIME_NAME="${PREFIX//-/_}_$RUNTIME_SUFFIX"   # AgentCore runtime names use underscores
+SRC_KEY="$PREFIX-mcp-$SERVER/source.zip"
+
+printf '\n\033[1;36m### MCP server: %s → %s\033[0m\n' "$SERVER" "$RUNTIME_NAME"
 
 log "ECR repo"
 aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 || \
@@ -59,9 +108,8 @@ log "Upload build source to S3"
 aws s3api head-bucket --bucket "$SRC_BUCKET" >/dev/null 2>&1 || \
   aws s3api create-bucket --bucket "$SRC_BUCKET" \
     --create-bucket-configuration "LocationConstraint=$REGION" >/dev/null
-SRC_KEY="$PREFIX-mcp/source.zip"
 TMPZIP="$(mktemp -u).zip"   # -u: name only, let zip create it (zip rejects a pre-existing empty file)
-( cd mcp-servers/lark-cli && zip -qr "$TMPZIP" . -x '*.pyc' '__pycache__/*' )  # Dockerfile + proxy.py + any other source
+( cd "$DIR" && zip -qr "$TMPZIP" . -x '*.pyc' '__pycache__/*' -x 'test_*' )  # Dockerfile + server.js; tests stay out of the image
 aws s3 cp "$TMPZIP" "s3://$SRC_BUCKET/$SRC_KEY" >/dev/null
 rm -f "$TMPZIP"  # safe-rm-ok
 echo "  s3://$SRC_BUCKET/$SRC_KEY"
@@ -131,7 +179,16 @@ ROLE_ARN="$(aws cloudformation describe-stacks --stack-name "$PREFIX-agentcore" 
 
 ARTIFACT="{\"containerConfiguration\":{\"containerUri\":\"$ECR:$TAG\"}}"
 HEADERS='{"requestHeaderAllowlist":["X-Amzn-Bedrock-AgentCore-Runtime-Custom-Lark-Token"]}'
-ENVVARS="APP_ID=$LARK_APP_ID,LARK_DOMAIN=$LARK_API_DOMAIN"
+# Container env from the server's RUNTIME_ENV_MAP ("CONTAINER_KEY=SOURCE_VAR" pairs).
+# Emitted as JSON because a value may contain commas (the approval allow-list does),
+# and the CLI's key=value shorthand splits on those and mangles the whole map.
+ENVVARS="$(MAP="$RUNTIME_ENV_MAP" uv run python -c '
+import json, os
+out = {}
+for pair in os.environ["MAP"].split():
+    key, _, src = pair.partition("=")
+    out[key] = os.environ.get(src or key, "")
+print(json.dumps(out))')"
 
 RID="$(aws bedrock-agentcore-control list-agent-runtimes \
   --query "agentRuntimes[?agentRuntimeName=='$RUNTIME_NAME'].agentRuntimeId" \
@@ -157,4 +214,7 @@ fi
 
 log "Done"
 echo "IMAGE_URI=$ECR:$TAG"
-echo "RUNTIME=$RUNTIME_NAME ($RID) — next: ./deploy.sh 3lo"
+echo "  runtime: $RUNTIME_NAME ($RID)"
+
+done
+

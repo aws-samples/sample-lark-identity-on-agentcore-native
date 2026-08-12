@@ -2,7 +2,8 @@
 # Deploy this sample end to end.
 #
 #   ./deploy.sh              everything, in dependency order (the normal case)
-#   ./deploy.sh <step>       one step: base | mcp | approval | 3lo | gateway | runtime | lark
+#   ./deploy.sh <step>       one step: base | mcp | 3lo | gateway | runtime | lark
+#   ./deploy.sh mcp [name...] only those MCP servers (default: all of mcp-servers/)
 #   ./deploy.sh urls         reprint the two URLs you must register in Lark
 #   ./deploy.sh preflight    check tools, credentials and .env without deploying
 #
@@ -34,8 +35,7 @@ note() { printf '\033[1;33m%s\033[0m\n' "$*"; }
 
 run_preflight() { step "preflight";                       scripts/preflight.sh; }
 run_base()    { step "base — CDK stacks";                scripts/provision.sh --base; }
-run_mcp()     { step "mcp — Lark MCP server";            scripts/build-mcp.sh; }
-run_approval(){ step "approval — Approval MCP server";   scripts/build-approval.sh; }
+run_mcp()     { step "mcp — MCP servers";                 scripts/build-mcp.sh "$@"; }
 run_3lo()     { step "3lo — Identity + OAuth provider";  scripts/setup-3lo.sh; }
 run_gateway() { step "gateway — Web Search (optional)";  scripts/provision.sh --gateway; }
 run_runtime() { step "runtime — agent";                  scripts/provision.sh --runtime; }
@@ -65,8 +65,7 @@ usage() { sed -n '2,14p' "$0" | cut -c3-; }
 
 case "${1:-all}" in
   base)    run_base ;;
-  mcp)     run_mcp ;;
-  approval) run_approval ;;
+  mcp)     shift; run_mcp "$@" ;;
   3lo)     run_3lo ;;
   gateway) run_gateway ;;
   runtime) run_runtime ;;
@@ -78,9 +77,6 @@ case "${1:-all}" in
     # 3lo and gateway precede runtime: the agent is deployed with the provider,
     # workload and gateway URL baked into its environment.
     run_base; run_mcp; run_3lo; run_gateway; run_runtime; run_lark
-    # approval is opt-in: it provisions another Runtime (its own cold start and
-    # memory-time) and does nothing until AGENT_DECIDE_APPROVAL_CODES names an approval
-    # definition. Run `./deploy.sh approval` when demoing that scenario.
     print_urls
     ;;
   -h|--help) usage ;;
