@@ -29,7 +29,6 @@ export AWS_REGION="$REGION"
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 LARK_CLI_VERSION="${LARK_CLI_VERSION:-1.0.68}"   # engine = official lark-cli (not lark-mcp)
-TAG="cli-$LARK_CLI_VERSION"
 # One CodeBuild project and role for every server — only the source zip differs.
 PROJECT="$PREFIX-mcp-builder"
 SRC_BUCKET="bedrock-agentcore-codebuild-sources-$ACCOUNT-$REGION"
@@ -76,9 +75,16 @@ sleep 8  # let the new role/policy propagate before CodeBuild validates it
 for SERVER in "${SERVERS[@]}"; do
 DIR="mcp-servers/$SERVER"
 # Reset per-iteration so one server's config cannot leak into the next.
-RUNTIME_SUFFIX=""; DEPLOY_IF=""; REQUIRE_VARS=""; RUNTIME_ENV_MAP=""
+RUNTIME_SUFFIX=""; DEPLOY_IF=""; REQUIRE_VARS=""; RUNTIME_ENV_MAP=""; IMAGE_TAG=""
 . "$DIR/runtime.env"
 : "${RUNTIME_SUFFIX:?$DIR/runtime.env must set RUNTIME_SUFFIX}"
+
+# The tag comes from the server itself (IMAGE_TAG in its runtime.env), so a server
+# that doesn't wrap lark-cli isn't labelled with a CLI version it never installs.
+# SRC_SHA lets such a server tag by content, which also makes "did this deploy
+# actually change anything?" visible at a glance in ECR.
+SRC_SHA="$(find "$DIR" -type f -exec sha256sum {} + | sort | sha256sum | cut -c1-12)"
+TAG="$(eval echo "${IMAGE_TAG:-cli-\$LARK_CLI_VERSION}")"
 
 # A server can declare a variable that gates it. Skipped only for a build-everything
 # run — an explicitly named server is built regardless.
