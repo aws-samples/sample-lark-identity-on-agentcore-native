@@ -186,10 +186,50 @@ class StreamingCard:
         self.card_id = ""
         self._seq = 0
         self.ok = False
+        # Sending happens on its own thread. Measured, one CardKit write takes ~470 ms
+        # (361–606 ms), so writing from the token loop stalled it for longer than the
+        # flush interval it was tuned against — the loop spent over half its time
+        # waiting on HTTP instead of reading the model, and the text arrived in visible
+        # jerks. Now the loop only ever hands over the latest accumulated text.
+        self._lock = threading.Lock()      # guards _pending
+        self._send_lock = threading.Lock()  # one write in flight, so _seq stays ordered
+        self._pending: str | None = None
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._worker: threading.Thread | None = None
 
     def _next_seq(self) -> int:
         self._seq += 1
         return self._seq
+
+    def _pump(self) -> None:
+        """Write the newest text, repeatedly. Superseded states are dropped rather than
+        queued: CardKit takes the full accumulated text on every write, so the newest
+        one subsumes every earlier one — queueing them would only add latency."""
+        while not self._stop.is_set():
+            self._wake.wait(timeout=0.5)
+            self._wake.clear()
+            with self._lock:
+                text, self._pending = self._pending, None
+            if text is not None:
+                self._write(text)
+
+    def _write(self, full_text: str) -> bool:
+        """The blocking CardKit write. Serialized, so `sequence` stays ordered."""
+        with self._send_lock:
+            tok = _tenant_token()
+            if not tok:
+                return False
+            body = _call("PUT",
+                         f"{_API_DOMAIN}/open-apis/cardkit/v1/cards/{self.card_id}"
+                         f"/elements/{_ELEMENT_ID}/content",
+                         {"content": full_text or _STREAM_PLACEHOLDER,
+                          "sequence": self._next_seq()}, bearer=tok)
+            if body.get("code") not in (0, "0"):
+                log.warning("card update failed: %s", body.get("msg", body))
+                self.ok = False
+                return False
+            return True
 
     def open(self) -> bool:
         """Create the card entity and post it. False if CardKit is unavailable
@@ -218,25 +258,25 @@ class StreamingCard:
                         sent.get("msg", sent))
             return False
         self.ok = True
+        self._worker = threading.Thread(target=self._pump, daemon=True,
+                                        name="cardkit-stream")
+        self._worker.start()
         return True
 
     def update(self, full_text: str) -> bool:
-        """Write the accumulated text. CardKit renders only the appended tail with a
-        typewriter effect, so this must be the full text so far, not a delta."""
+        """Hand over the accumulated text and return at once — the write happens on the
+        worker. Must be the full text so far, not a delta: CardKit renders the appended
+        tail with a typewriter effect.
+
+        The bool reports whether the card is still usable, which is now known one call
+        late — a write that fails is discovered by the worker, so this returns False from
+        the *next* call onwards. That is what the caller needs it for (stop streaming,
+        fall back to text), and close() re-checks before finishing."""
         if not self.ok:
             return False
-        tok = _tenant_token()
-        if not tok:
-            return False
-        body = _call("PUT",
-                     f"{_API_DOMAIN}/open-apis/cardkit/v1/cards/{self.card_id}"
-                     f"/elements/{_ELEMENT_ID}/content",
-                     {"content": full_text or _STREAM_PLACEHOLDER,
-                      "sequence": self._next_seq()}, bearer=tok)
-        if body.get("code") not in (0, "0"):
-            log.warning("card update failed: %s", body.get("msg", body))
-            self.ok = False
-            return False
+        with self._lock:
+            self._pending = full_text
+        self._wake.set()
         return True
 
     def close(self, final_text: str) -> bool:
@@ -244,7 +284,15 @@ class StreamingCard:
         typewriter indicator and becomes static."""
         if not self.ok:
             return False
-        self.update(final_text)
+        # Stop the worker first, then write the final text synchronously: the worker
+        # drops superseded states, and the last one must not be dropped.
+        self._stop.set()
+        self._wake.set()
+        if self._worker is not None:
+            self._worker.join(timeout=10)
+        self._write(final_text)
+        if not self.ok:
+            return False
         tok = _tenant_token()
         body = _call("PATCH",
                      f"{_API_DOMAIN}/open-apis/cardkit/v1/cards/{self.card_id}/settings",

@@ -337,13 +337,11 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     return {"accepted": True, "needs_auth": False}
 
 
-# Throttle card updates: whichever threshold trips first flushes the accumulated
-# text. Not a rate-limit concern — CardKit updates don't count against QPS while
-# streaming, which is why it beats editing a message. The real cost is the round
-# trip: each flush is an HTTPS call that blocks this loop, so an interval below it
-# just adds calls without making the typing look smoother.
-_STREAM_MIN_INTERVAL = float(os.environ.get("STREAM_MIN_INTERVAL", "0.4"))
-_STREAM_MIN_CHARS = int(os.environ.get("STREAM_MIN_CHARS", "60"))
+# No throttle here on purpose. The card write is queued, not performed — the card's
+# own worker coalesces to the newest text and is paced by Lark's round trip (~470 ms
+# measured), so handing over every delta costs a lock and sets no rate. The earlier
+# throttle guarded a blocking write from this loop, and at 0.4 s it was tuned below the
+# write's real cost: the loop lost over half its time to HTTP and the text jerked.
 
 
 def _iter_deltas(agent, message: str, on_tool_use=None):
@@ -402,18 +400,10 @@ def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
         return True
 
     acc = []
-    pending = 0
-    last_flush = time.monotonic()
     for delta in _iter_deltas(agent, message, on_tool_use=_abort_on_lark_tool):
         acc.append(delta)
-        pending += len(delta)
-        now = time.monotonic()
-        if streaming and (pending >= _STREAM_MIN_CHARS
-                          or (now - last_flush) >= _STREAM_MIN_INTERVAL):
-            if not card.update("".join(acc)):
-                streaming = False  # a failed update drops us to the fallback below
-            pending = 0
-            last_flush = now
+        if streaming and not card.update("".join(acc)):
+            streaming = False  # a failed write drops us to the fallback below
     text = "".join(acc)
 
     # Aborted for consent: whatever the model had started saying is a half-sentence

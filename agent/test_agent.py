@@ -281,16 +281,98 @@ class FakeCard:
         return self._close_ok
 
 
-def test_stream_updates_are_throttled_and_cumulative():
-    """Many small deltas must not become many calls, and each update carries the full
-    text so far (CardKit renders the appended tail; a non-prefix would flash)."""
+# ------------------------ CardKit worker (coalescing) ------------------------
+
+def _load_card(monkeypatch_calls):
+    """Import StreamingCard with its HTTP layer replaced. lark_notify imports boto3
+    only, so unlike agent_core it loads on the test host."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    import importlib
+    import lark_notify
+    importlib.reload(lark_notify)
+    lark_notify._tenant_token = lambda: "tok"
+
+    def fake_call(method, url, body, bearer=""):
+        monkeypatch_calls.append((method, body.get("content"), body.get("sequence")))
+        return {"code": 0}
+    lark_notify._call = fake_call
+    return lark_notify
+
+
+def test_card_worker_writes_the_newest_text_and_never_loses_the_last():
+    """Superseded states may be dropped — CardKit takes the full text every time, so
+    the newest write subsumes the earlier ones. The FINAL text must not be dropped,
+    which is why close() stops the worker and writes synchronously."""
+    calls = []
+    ln = _load_card(calls)
+    card = ln.StreamingCard("oc_1")
+    card.card_id = "c1"
+    card.ok = True
+    import threading
+    card._worker = threading.Thread(target=card._pump, daemon=True)
+    card._worker.start()
+
+    for t in ("a", "ab", "abc", "abcd"):
+        assert card.update(t) is True
+    card.close("abcd-final")
+
+    contents = [c for _, c, _ in calls if c]
+    assert "abcd-final" in contents, "the final text must always be written"
+    assert contents[-2:][0] == "abcd-final" or contents[-1] == "abcd-final"
+    # Every write is one of the accumulated states, never a stale fragment reordered.
+    assert all(c in ("a", "ab", "abc", "abcd", "abcd-final") for c in contents)
+
+
+def test_card_sequence_never_repeats_or_goes_backwards():
+    """CardKit rejects an out-of-order sequence, and the worker plus close() both
+    write — so the counter has to be shared and monotonic across them."""
+    calls = []
+    ln = _load_card(calls)
+    card = ln.StreamingCard("oc_1")
+    card.card_id = "c1"
+    card.ok = True
+    import threading
+    card._worker = threading.Thread(target=card._pump, daemon=True)
+    card._worker.start()
+    for i in range(6):
+        card.update("x" * (i + 1))
+    card.close("done")
+    seqs = [s for _, _, s in calls if s is not None]
+    assert seqs == sorted(set(seqs)), f"sequence not strictly increasing: {seqs}"
+
+
+def test_card_update_reports_failure_on_the_next_call():
+    """A write now fails on the worker, so the caller learns one call late. That is
+    enough to stop streaming and fall back — the answer is never lost."""
+    calls = []
+    ln = _load_card(calls)
+    ln._call = lambda *a, **k: {"code": 99991400, "msg": "nope"}
+    card = ln.StreamingCard("oc_1")
+    card.card_id = "c1"
+    card.ok = True
+    import threading, time as _t
+    card._worker = threading.Thread(target=card._pump, daemon=True)
+    card._worker.start()
+    assert card.update("a") is True        # queued before any failure is known
+    for _ in range(50):                   # let the worker discover it
+        if not card.ok:
+            break
+        _t.sleep(0.02)
+    assert card.ok is False
+    assert card.update("ab") is False      # now the caller is told
+
+
+def test_stream_hands_over_every_delta_cumulatively():
+    """The loop no longer throttles: handing over text is a lock, not a round trip, so
+    every delta goes over and the card's worker decides what to actually write. Each
+    hand-over carries the full text so far — CardKit renders the appended tail, so a
+    non-prefix would flash the wrong content."""
     card = FakeCard()
-    deltas = ["a" * 30, "b" * 30, "c" * 30, "d" * 30]   # 120 chars in 30-char steps
+    deltas = ["a" * 30, "b" * 30, "c" * 30, "d" * 30]
     fn = _load_stream_to_chat(deltas, card, [])
     text = fn({"agent": object()}, "msg", "oc_1")
     assert text == "a"*30 + "b"*30 + "c"*30 + "d"*30
-    # Flushes only when the 80-char threshold is crossed, not once per delta.
-    assert len(card.updates) < len(deltas)
+    assert len(card.updates) == len(deltas)
     for u in card.updates:
         assert text.startswith(u)          # cumulative, always a prefix of the whole
     assert card.closed_with == text
