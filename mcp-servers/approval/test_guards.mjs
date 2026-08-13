@@ -19,7 +19,7 @@ function loadGuards(env = {}, fetchImpl = undefined) {
   const end = src.indexOf('const TOOLS = [');
   assert.ok(start > 0 && end > start, 'guard block not found — did server.js move?');
   const fn = new Function('process', 'fetch', 'API', `${src.slice(start, end)}
-    return { checkAutoDecisionAllowed, requireConsentOnRecord, consentNote, AGENT_DECIDE_MAX_AMOUNT, AGENT_DECIDE_APPROVAL_CODES };`);
+    return { checkAutoDecisionAllowed, requireConsentOnRecord, consentNote, policyNote, AGENT_DECIDE_MAX_AMOUNT, AGENT_DECIDE_APPROVAL_CODES };`);
   return fn({ env }, fetchImpl, 'https://open.larksuite.com');
 }
 
@@ -95,6 +95,26 @@ test('refuses when the identity behind the token cannot be established', async (
   const boom = async () => { throw new Error('network down'); };
   const g2 = loadGuards({}, boom);
   assert.match(await g2.requireConsentOnRecord('t', 'ou_alice'), /could not verify/);
+});
+
+test('the advertised policy states the real limits, so the model need not guess', () => {
+  // A model asked whether a case is "in scope", without being told the scope, falls back
+  // on its context: one refused a ¥375 reimbursement the allow-list permitted, citing an
+  // authorization boundary that did not exist. The limits still bind in code — this only
+  // stops the model inventing a stricter, invisible one.
+  const g = loadGuards({ AGENT_DECIDE_APPROVAL_CODES: 'AC1, AC2', AGENT_DECIDE_MAX_AMOUNT: '500' });
+  const note = g.policyNote();
+  assert.match(note, /AC1, AC2/);
+  assert.match(note, /500/);
+  assert.match(note, /Do not refuse on your own judgement of scope/);
+  assert.match(note, /enforced in this server, not by you/);
+});
+
+test('the advertised policy does not claim permission when nothing is allowed', () => {
+  const off = loadGuards({});
+  assert.match(off.policyNote(), /none — every automatic decision is refused/);
+  const killed = loadGuards({ AGENT_DECIDE_APPROVAL_CODES: 'AC1', AGENT_DECIDE_MAX_AMOUNT: '0' });
+  assert.match(killed.policyNote(), /disabled outright/);
 });
 
 test('the consent note distinguishes an on-record grant from app authority alone', () => {

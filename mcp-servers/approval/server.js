@@ -44,6 +44,28 @@ const AGENT_DECIDE_MAX_AMOUNT = parseFloat(process.env.AGENT_DECIDE_MAX_AMOUNT |
 // Approval definitions this app may act on at all. Empty = none (fail closed).
 const AGENT_DECIDE_APPROVAL_CODES = (process.env.AGENT_DECIDE_APPROVAL_CODES || '').split(',').map((s) => s.trim()).filter(Boolean);
 
+// What the guards below will actually permit, in words, for the tool descriptions.
+// Stating "attempt it and let this server answer" is deliberate: the code is the
+// authority, so a model that pre-refuses is not being careful, it is guessing.
+function policyNote() {
+  const codes = AGENT_DECIDE_APPROVAL_CODES.length
+    ? AGENT_DECIDE_APPROVAL_CODES.join(', ')
+    : '(none — every automatic decision is refused)';
+  const ceiling = AGENT_DECIDE_MAX_AMOUNT > 0
+    ? `amounts up to ${AGENT_DECIDE_MAX_AMOUNT} (forms without an amount are limited by the list alone)`
+    : 'automatic decisions are disabled outright';
+  return [
+    'CURRENTLY PERMITTED (enforced in this server, not by you):',
+    `  approval_code in: ${codes}`,
+    `  ${ceiling}`,
+    '  the approver must have their own 3LO grant on record',
+    'Do not refuse on your own judgement of scope — attempt the decision and this server',
+    'will refuse with a reason if it is not allowed. Judge the case on its merits',
+    '(is the request coherent, does it match its stated purpose), not on whether you',
+    'think you are authorised.',
+  ].join('\n');
+}
+
 function checkAutoDecisionAllowed(args) {
   if (!AGENT_DECIDE_APPROVAL_CODES.includes(args.approval_code)) {
     return `refused: approval_code ${args.approval_code} is not in AGENT_DECIDE_APPROVAL_CODES — a human must handle this`;
@@ -311,7 +333,17 @@ const server = http.createServer((req, res) => {
     // Listed without a token, deliberately: the model should know what it could do
     // once the user consents, and consent is asked for at call time.
     if (mcp.method === 'tools/list') {
-      const tools = TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
+      // Guarded tools advertise the actual configured limits. Not a courtesy: asked to
+      // judge whether a case is "in scope" without being told the scope, a model falls
+      // back on whatever is in its context — one refused a ¥375 reimbursement that the
+      // allow-list permitted, reasoning from an earlier turn and asserting an
+      // authorization boundary that did not exist. The limits still bind in code below;
+      // publishing them only stops the model from inventing a stricter, invisible one.
+      const tools = TOOLS.map((t) => ({
+        name: t.name,
+        description: t.guarded ? `${t.description}\n\n${policyNote()}` : t.description,
+        inputSchema: t.inputSchema,
+      }));
       return sse(res, { jsonrpc: '2.0', id: mcp.id, result: { tools } });
     }
     if (mcp.method === 'tools/call') {
@@ -328,6 +360,10 @@ const server = http.createServer((req, res) => {
       // as a tool error so the model sees the refusal and can explain it, rather
       // than being able to talk its way past it.
       if (tool.guarded) {
+        // Logged before the guards run, so an attempt is visible even when it passes.
+        // Previously only refusals logged, which meant "the model never tried" and "the
+        // model tried and succeeded" looked identical here.
+        console.log(`guarded call ${name}: code=${args.approval_code} amount=${args.amount ?? '-'}`);
         // Consent first: deciding in someone's name without their grant is the one
         // thing this server will not do, even though Lark would permit it.
         const noConsent = await requireConsentOnRecord(userToken, args.user_id);
