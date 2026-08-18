@@ -18,11 +18,11 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `lark-agent-3lo`, workload `lark-agent-wl` |
 | AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `lark_agent_agent_mem` (STM) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
-| AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region). Not used for the Lark tools — a Gateway hop to an AgentCore Runtime delivers no per-user token to the container | `stacks/gateway_stack.py`, `deploy.sh gateway` |
+| AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region). Not used for the Lark tools — it hands out no per-user token for a `CustomOauth2` provider | `stacks/gateway_stack.py`, `deploy.sh gateway` |
 
 ## One entrypoint, one identity
 
-> **Status (2026-07): this variant is chat-only and drives 3LO agent-side.** There is no web UI, and the Lark tools don't go through the Gateway — a Gateway hop to a Runtime-hosted MCP server arrives with no user token in any header (verified @2026-08-18; see [Two tool paths](#two-tool-paths-and-why)), so the agent fetches each user's token from the Token Vault itself and calls the lark-cli MCP server directly. The Gateway *is* used for web search, where there's no user identity to forward (see [Two tool paths](#two-tool-paths-and-why)). Sections marked *(legacy)* describe the interceptor/web-UI baseline of the sibling variant and are kept for contrast.
+> **Status (2026-07): this variant is chat-only and drives 3LO agent-side.** There is no web UI, and the Lark tools don't go through the Gateway — the Gateway hands out no per-user token for a `CustomOauth2` provider (verified @2026-08-18; see [Two tool paths](#two-tool-paths-and-why)), so the agent fetches each user's token from the Token Vault itself and calls the lark-cli MCP server directly. The Gateway *is* used for web search, where there's no user identity to forward (see [Two tool paths](#two-tool-paths-and-why)). Sections marked *(legacy)* describe the interceptor/web-UI baseline of the sibling variant and are kept for contrast.
 
 ```
                     ┌──────────────────────────────┐        ┌──────────────────────────┐
@@ -152,27 +152,27 @@ Authorization is scoped per downstream system, not per bot: each one gets its ow
 | How the agent reaches it | direct to the lark-cli Runtime (SigV4 + the user's token in a custom header) | through an AgentCore Gateway (MCP) |
 | Outbound credential | the user's vaulted Lark token | `GATEWAY_IAM_ROLE` |
 
-The split isn't stylistic, and the reason is narrower than it first looks. The Gateway is the
-natural home for tools, and per-user 3LO on it **does** work — including for a `CustomOauth2`
-provider like Lark: consent completes, the token vaults, the target reaches `READY`
-(verified @2026-08-18). What fails is the last hop. With an **AgentCore Runtime** as the target, the
-request reaches the container carrying no `authorization` header and no token header of any
-kind, so a per-request bearer has nowhere to ride — the AWS transport owns that header on a
-Runtime hop, the same reason `GATEWAY_IAM_ROLE` delivers none either. Hence the Lark tools
-bypass the Gateway and the agent drives 3LO itself and passes the token in a custom header.
+The split isn't stylistic. The Gateway is the natural home for tools, but verified
+@2026-08-18 it will not hand a **per-user** token to any target for a `CustomOauth2` provider
+like Lark: a `tools/call` returns `An internal error occurred. Please retry later.` with no
+consent prompt, identically across three configurations (`mcpServer` with dynamic discovery,
+`mcpServer` with `mcpToolSchema`, and OpenAPI), for callers who had never consented and for
+callers whose token was already vaulted. Hence the Lark tools bypass the Gateway: the agent
+drives 3LO itself and passes the token to the MCP server in a custom header.
 
-This is a **target-type** limit rather than a vendor limit, and switching target type does not
-escape it. Verified @2026-08-18 with an OpenAPI target on the same provider: it needs no
-target-level pre-auth (straight to `READY`, no `authorizationData`), but a `tools/call` returns
-`An internal error occurred. Please retry later.` with no consent prompt — both for a caller who
-had never consented and for one whose token was already vaulted. The two target types supply
-opposite halves: per-user consent can only be *initiated* through elicitation, which is
-documented as supported only for **MCP server** targets, while an MCP server on a Runtime cannot
-*receive* the token. An earlier version of this document attributed the limit to the
-`CustomOauth2` vendor and cited agentcore-samples#1424; running it showed that opaque
-`Authorization error` is what a gateway role missing `bedrock-agentcore:InvokeAgentRuntime`
-produces. See `docs/agentcore-behavior.md` for all six experiments. Web search has no such problem: with no user identity to forward,
-`GATEWAY_IAM_ROLE` is all it needs, so it uses the Gateway as intended.
+What the Gateway *does* complete for such a provider is a **target-level** federation — one
+operator consent at target creation, whose `userId` is `{gatewayId}_{targetId}_{random}`,
+documented as "defined by AgentCore Gateway". Every later call would share that single token, so
+reading it as per-user would silently collapse to app-level access. It exists only so the
+Gateway can list the target's tools at creation time, when no user is present; declaring
+`mcpToolSchema` removes the need and the pre-auth disappears.
+
+Two things worth knowing before debugging this yourself: the opaque
+`Authorization error when sending message` is what a gateway role missing
+`bedrock-agentcore:InvokeAgentRuntime` produces, not a 3LO gap; and a Runtime hop delivers no
+`authorization` header to the container at all, under either outbound credential type. See
+`docs/agentcore-behavior.md` for the experiments. Web search has no such problem: with no user
+identity to forward, `GATEWAY_IAM_ROLE` is all it needs, so it uses the Gateway as intended.
 
 The Web Search connector is only offered in **us-east-1**, so its gateway lives there even
 when the rest of the stack doesn't, and the agent calls it cross-region. Inbound auth is a
@@ -276,7 +276,7 @@ sequenceDiagram
     end
 
     rect rgb(255, 244, 229)
-    Note over A,S: FIRST-USE CONSENT — driven by the agent: a Gateway hop to a Runtime target delivers no token to the container
+    Note over A,S: FIRST-USE CONSENT — driven by the agent: the Gateway hands out no per-user token for a CustomOauth2 provider
     A->>V: ForUserId(actorId) → GetResourceOauth2Token(USER_FEDERATION, customState=b64(actorId))
     V-->>A: no token vaulted → authorizationUrl + sessionUri
     A-->>R: needs_auth + auth_url

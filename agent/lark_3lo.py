@@ -1,9 +1,12 @@
 """Agent-side per-user 3LO for Lark + direct connection to the lark-mcp Runtime.
 
-Why this exists: the Gateway does not do per-user 3LO token injection for a
-CustomOauth2 provider (AWS gap, agentcore-samples#1424). So the agent drives 3LO
-itself against AgentCore Identity and delivers the user's vaulted Lark token to
-the lark-mcp Runtime directly, in a custom passthrough header.
+Why this exists: the Gateway hands out no per-user token for a CustomOauth2
+provider — verified @2026-08-18, a tools/call returns "An internal error occurred"
+with no consent prompt across every target configuration (see
+docs/agentcore-behavior.md). What it will complete is a target-level federation
+under an identity it invents, shared by all callers, which is not what per-user
+means. So the agent drives 3LO itself against AgentCore Identity and delivers the
+user's vaulted Lark token to the lark-mcp Runtime in a custom passthrough header.
 
 Flow per user (actor_id = "lark:{open_id}"):
   1. get_user_lark_token(actor_id):

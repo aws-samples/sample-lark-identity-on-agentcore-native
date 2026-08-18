@@ -18,8 +18,8 @@ in a custom header (the lark-mcp sidecar copies it to Authorization). The token
 gates tool *calls*, not the connection — lark-mcp lists its tools without one — so
 an unauthorized user gets a working session and is only asked to consent if the
 model actually reaches for a Lark tool. We drive 3LO from the agent because the
-Gateway does not do per-user 3LO injection for a CustomOauth2 provider (AWS gap,
-agentcore-samples#1424).
+Gateway hands out no per-user token for a CustomOauth2 provider (verified
+@2026-08-18; see docs/agentcore-behavior.md).
 
 `chat_result` returns the final text; `chat_async` streams it into a Lark card.
 """
