@@ -86,9 +86,22 @@ const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', async () => {
-    let mcp;
-    try { mcp = JSON.parse(body); } catch { res.writeHead(400); res.end('bad json'); return; }
     const userToken = req.headers[TOKEN_HEADER] || '';
+    // One line per inbound request: the MCP method and whether a user token rode along —
+    // names and presence only, never a token value. A bare http server keeps no access log,
+    // so without this "did the caller even reach us, and with what" is unanswerable; it has
+    // been the first question in every routing/auth incident here. Logged before parsing so
+    // an unparseable body is visible too — that is the case worth seeing, not the one to
+    // drop silently.
+    let mcp;
+    try {
+      mcp = JSON.parse(body);
+    } catch {
+      console.log(`inbound ${req.method} ${req.url} unparseable body (${body.length}B) `
+        + `content-type=${req.headers['content-type'] || '(none)'} token=${userToken ? 'yes' : 'no'}`);
+      res.writeHead(400); res.end('bad json'); return;
+    }
+    console.log(`inbound ${req.method} ${req.url} mcp=${mcp.method || '(none)'} token=${userToken ? 'yes' : 'no'}`);
 
     if (mcp.method === 'initialize') {
       return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
