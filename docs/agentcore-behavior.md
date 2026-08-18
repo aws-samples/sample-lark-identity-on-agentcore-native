@@ -59,14 +59,58 @@ Both are configurable 60–28800 s via `lifecycleConfiguration` and left at defa
 - Send `MCP-Protocol-Version: <version>` on **every** request after `initialize` (the gateway is otherwise stateless about it and falls back to an older version, 400 `-32042`).
 - Tool names are target-prefixed: `<targetName>___<toolName>`.
 
+## How the workload access token is obtained — and why inbound auth decides the trust model
+
+Every per-user token fetch starts with a workload access token (WAT). There are **two ways to get one, and they have completely different security properties**. Which one applies is decided by the Runtime's *inbound* auth, not by anything in the agent.
+
+**Manual path — `GetWorkloadAccessTokenForUserId(workloadName, userId)`** (what this sample uses, because it is invoked with SigV4 and the identity arrives as a payload string):
+
+- **It does not check whether the caller "owns" the `userId`** (measured: our agent passes whatever `actorId` the router put in the payload, for arbitrary users, and it succeeds). So the calling code's choice of `userId` *is* the identity it acts as. Any user who has consented once is reachable, with nobody present.
+- Consequence: with SigV4 inbound, per-user safety rests on the agent only ever passing the `actorId` it was given — **code discipline, not a cryptographic constraint**. That matters because the agent is the component processing untrusted input.
+
+**Automatic path — Runtime does it for you when inbound auth is `CUSTOM_JWT`** (from the [devguide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/get-workload-access-token.html); **documented, not measured by us**):
+
+> "Runtime automatically delivers workload access tokens to agent execution instances as payload headers, eliminating the need for manual token management in most scenarios."
+
+The documented sequence: Runtime validates the inbound OAuth token (issuer, signature) → extracts `iss`/`sub` → fetches the agent's workload identity → calls `GetWorkloadAccessTokenForJWT` → passes the WAT to agent code as a payload header. The same page adds the property that makes this the stronger model:
+
+> "Runtime-managed agent identities cannot retrieve workload access tokens directly, preventing token extraction and misuse."
+
+Three practical notes:
+
+- **`CUSTOM_JWT` and SigV4 invocation are mutually exclusive.** Turning it on means the caller stops using the `InvokeAgentRuntime` SDK call and sends `Authorization: Bearer` to the Runtime endpoint instead — a breaking cutover, not an additive hardening. This is why this sample still uses SigV4.
+- **Removing the manual call from agent code is not enforcement.** `GetWorkloadAccessTokenForUserId` remains callable by anything holding the execution role, so closing the impersonation surface requires **denying that action in IAM**, not just not calling it.
+- `authorizerConfiguration` on a Runtime has exactly one shape, `customJWTAuthorizer` (`discoveryUrl` + `allowedAudience`/`allowedClients`/`allowedScopes`, plus optional custom claim matching) — verified from the `create-agent-runtime` API model. `UpdateAgentRuntime` accepts `authorizerConfiguration`, so switching does not require rebuilding the runtime.
+
 ## 3LO (per-user authorization) with a custom OAuth2 provider — the important one
 
-**Rule of thumb (the single most reusable finding): whether you can use the Gateway for per-user 3LO depends on the IdP's credential-provider vendor, NOT on which downstream MCP server you use.** If the IdP is an AgentCore built-in vendor (Google/Salesforce/Microsoft/Slack/Github/…), the Gateway's per-user token injection works. If the IdP is non-standard and can only be registered as `CustomOauth2` (Lark/Feishu, most in-house IdPs), the Gateway's per-user injection is broken (#1424) — and no choice of downstream MCP server (lark-mcp, a lark-cli wrapper, a home-grown server, anything) changes that, because the failure is in the Gateway's auth-stage token dispatch, which runs *before* it forwards to any target. For a `CustomOauth2` IdP you must drive 3LO from the agent and inject the token yourself; the Gateway adds no value for that leg (it can still be used later for a built-in-vendor downstream).
+**Rule of thumb, verified @2026-08-18: what blocks per-user tokens is the TARGET TYPE, not the IdP vendor.** Neither target type does the whole job:
 
-Registering a non-standard IdP (e.g. behind an RFC-6749 shim) yields a `CustomOauth2` credential provider. Two facts govern what works:
+| Target | Consent | Token delivery |
+|---|---|---|
+| `mcpServer` on a Runtime | ✅ completes, target `READY` | ❌ container sees no `authorization`, no token header |
+| OpenAPI (external HTTPS) | ❌ `tools/call` → `An internal error occurred`, no prompt | — |
 
-- **The Gateway does NOT do per-user 3LO for `CustomOauth2` providers — verified against the AWS issue.** On a `tools/call`, whether or not a token is already vaulted, the Gateway returns `{isError:true,"An internal error occurred. Please retry later."}` and — per the CloudTrail/X-Ray evidence in the issue — **never calls `GetResourceOauth2Token` against Identity at all** (zero provider spans). No `-32042` elicitation is emitted either. This per-user `USER_FEDERATION` dispatch appears wired only for built-in vendors (GithubOauth2/LinkedinOauth2 confirmed emitting `-32042`); `CLIENT_CREDENTIALS`/M2M on the *same* custom provider *does* reach Identity, so it's specifically the per-user path that's missing. A shim makes the IdP *standard*, not a *built-in vendor*, so it cannot dodge this.
-  - Reference to verify: **awslabs/agentcore-samples issue #1424** — <https://github.com/awslabs/agentcore-samples/issues/1424> (opened 2026-04-30, closed `not_planned` 2026-05-14 by the reporter; no AWS response, no fix PR). Related: issue #809 (older `tools/call` internal-error, still open). The reporter's CloudTrail note is the primary evidence that Gateway skips `GetResourceOauth2Token` for custom providers.
+So drive 3LO from the agent and pass the token yourself, whatever the vendor is.
+
+> An earlier version blamed the `CustomOauth2` vendor, on second-hand evidence we never reproduced. Left described rather than deleted, so the change is traceable.
+
+Registering a non-standard IdP (e.g. behind an RFC-6749 shim) yields a `CustomOauth2` credential provider. What the experiments established:
+
+- **3LO completes on a `CustomOauth2` Gateway target.** `mcpServer` target on our lark-cli Runtime, `grantType: AUTHORIZATION_CODE`: real `authorizationUrl` → a real user consented via the shim → `CompleteResourceTokenAuth` succeeded → target **`READY`**, `statusReasons: null` (so the Gateway then connected and listed tools). The per-user 3LO leg is not broken for a custom vendor.
+  - **`Authorization error when sending message` means a missing IAM permission, not a 3LO gap.** One variable at a time: OAuth outbound + no `InvokeAgentRuntime` → that error; SigV4 + no permission → *same* error; SigV4 + permission → `READY`; OAuth + permission → `READY`. The Web Search gateway role carries only `InvokeGateway` + `InvokeWebSearch`, which is how we walked into it. **Check the role before suspecting 3LO.**
+  - **#1424** (<https://github.com/awslabs/agentcore-samples/issues/1424>, closed `not_planned` by the reporter, no AWS response) — its CloudTrail note is second-hand; we could not reproduce the conclusion drawn from it.
+  - **`-32042` is not in AWS docs**, though these notes long treated it as *the* signal. Documented codes: `-32600`, `-32601`, `-32021`; the OAuth path raises `URLElicitationRequiredError` carrying a URL — [gateway-mcp-elicitation](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-mcp-elicitation.html). Elicitation works **only for MCP server targets**, and the client must declare the capability.
+  - **No vendor restriction is documented.** The API model defines `AUTHORIZATION_CODE` as "Authorization with a token that is specific to an individual end user", and the outbound-auth guide's own authorization-code example uses `CustomOAuth2`.
+- **But no token reaches the Runtime container.** With that `READY` target, a `tools/call` arrived carrying only `x-amzn-requestid, accept, baggage, content-length, content-type, mcp-method, mcp-protocol-version, x-amzn-bedrock-agentcore-runtime-session-id, x-amzn-trace-id, host` — and `authorization=(none)`. Our server answered its own "no user token". Same wall as `GATEWAY_IAM_ROLE` (below): the AWS transport owns `Authorization` on a Runtime hop, so a per-request bearer has nowhere to ride.
+- **An OpenAPI target fails earlier, and differently.** Same provider and grant, target replaced by `mcp.openApiSchema.inlinePayload` (one endpoint, `authen/v1/user_info` — its answer names the token's owner):
+  - Straight to `READY`, **no `authorizationData`, no `authorizationUrl`** — no operator pre-auth, so credentials are fetched at call time.
+  - But `tools/call` → `An internal error occurred. Please retry later.` (#1424's exact string), with **no consent prompt**, both for a caller who never consented and for one whose token *was* already vaulted. CloudTrail showed no `AccessDenied` and no `GetResourceOauth2Token` — data-plane calls may not be logged, so that proves little.
+  - **Two causes, not separated:** (a) key mismatch — the agent flow vaults under `lark:{open_id}` while the Gateway keys on the inbound JWT's `iss`/`sub`, and our Cognito `sub` is a UUID; (b) per-user dispatch really is unwired for `CustomOauth2`. To separate: make the JWT's `sub` (or a custom claim) equal `lark:{open_id}`, or re-consent under the Cognito `sub`.
+  - **The pincer:** consent can only be *initiated* via elicitation, which works only for MCP server targets — and an MCP server on a Runtime cannot *receive* the token.
+- **3LO outbound requires `CUSTOM_JWT` inbound.** On an `AWS_IAM` gateway it is refused outright: `ValidationException: 3LO Auth is not supported when gateway authorizer type is AWS_IAM`. Per-user outbound needs an inbound user identity to key on, and SigV4 carries none — so inbound and outbound are **not** freely combinable, contrary to what these notes implied.
+- **Two credential provider types we had missed:** `CredentialProviderType` is `['GATEWAY_IAM_ROLE','OAUTH','API_KEY','CALLER_IAM_CREDENTIALS','JWT_PASSTHROUGH']`; the last two need no config struct. `JWT_PASSTHROUGH` (forward the caller's own JWT downstream) is worth evaluating where the downstream validates end-user JWTs directly — untested.
+- **Operational trap:** a target stuck in `CREATE_PENDING_AUTH` (nobody completed the consent before the `request_uri` expired) **cannot be deleted** — `DeleteGatewayTarget can't be performed on target when it is in Create_Pending_Auth state`. The way out is `UpdateGatewayTarget`, which issues a fresh `authorizationUrl` (and a fresh synthetic `userId`).
 - **The agent-side SDK path DOES work end-to-end for `CustomOauth2`** — you drive 3LO yourself instead of relying on the Gateway:
   1. `GetWorkloadAccessTokenForUserId(workloadName, userId)` → workload access token.
   2. `GetResourceOauth2Token(workloadIdentityToken, resourceCredentialProviderName, scopes, oauth2Flow=USER_FEDERATION, resourceOauth2ReturnUrl=..., customState=base64url(userId))` → `{authorizationUrl, sessionUri}` when no token is vaulted.
@@ -77,14 +121,23 @@ Registering a non-standard IdP (e.g. behind an RFC-6749 shim) yields a `CustomOa
 
 **Bottom line:** Lark, as a `CustomOauth2` provider behind an RFC-6749 shim, **does** complete native per-user 3LO and vault the token. Verified: a real user consented once through the shim → Lark → AgentCore, the return page showed "Authorized", and `GetResourceOauth2Token` then returned a real Lark `user_access_token` (a ~1529-char JWT) from the managed Token Vault. So the "fully native managed Token Vault for the user token" thesis holds for Lark too — **no self-managed store needed after all.**
 
-**Correction of an earlier wrong conclusion:** a prior version of this finding said CustomOauth2 3LO completion was "defective" (CompleteResourceTokenAuth → "Invalid or expired session"). That was a **misdiagnosis** caused by our own operational noise, not an AWS defect. Three self-inflicted issues, each independently confirmed and fixed, produced that error:
+**Revised @2026-07 after re-running it:** a prior version of this finding said CustomOauth2 3LO completion was "defective" (CompleteResourceTokenAuth → "Invalid or expired session"). That was a **misdiagnosis** caused by our own operational noise, not an AWS defect. Three self-inflicted issues, each independently confirmed and fixed, produced that error:
 1. **Server-side "generate-and-verify" curl consumed the single-use `request_uri`** before the user's browser could — after which the browser hit an already-spent session (surfacing as "Invalid request" / "Invalid or expired session"). Fix: never touch the authorizationUrl server-side; hand it straight to the user.
 2. **A `:` in `customState`** (raw `lark:userAAA`) made AgentCore reject the authorize request with a misleading "requestUri regex" error. Fix: base64url-encode the userId into state; decode at the return endpoint.
 3. **URL mangling in transit** (double-encoded `%3A`→`%253A` / stray whitespace from copy-paste). Fix: hand the URL as one unbroken line.
 
 With all three avoided (base64url state, no server-side curl, clean URL) the identical flow succeeds — first proven with `GoogleOauth2` (built-in), then reproduced with `lark-agent-3lo` (CustomOauth2). So the agent-driven path (`GetWorkloadAccessTokenForUserId` → `GetResourceOauth2Token USER_FEDERATION` → surface URL → `CompleteResourceTokenAuth`) works for **both** built-in and custom providers.
 
-**The one real, remaining AWS gap:** the **Gateway-mediated** per-user elicitation at `tools/call` still returns `{isError:true,"An internal error occurred"}` instead of `-32042` for `CustomOauth2` (awslabs/agentcore-samples #1424, "not planned"). That only means you cannot rely on the *Gateway auto-prompting* the user for a custom provider — you drive the 3LO from the agent instead (which we do). Vaulting itself is fine.
+**Superseded (2026-08-18):** this section used to end by naming the Gateway-mediated per-user elicitation as "the one real remaining AWS gap" for `CustomOauth2`. Running it showed otherwise — the Gateway completes 3LO for a custom provider and the target reaches `READY`; what it will not do is deliver the token to an **AgentCore Runtime** target's container. The reason to drive 3LO from the agent is that delivery gap, not a vendor gap. See the findings above, verified @2026-08-18.
+
+### Refinement (2026-08, measured directly): the Gateway *can* be configured for `AUTHORIZATION_CODE` — but what you get is target-level, not per-user
+
+The account above rests on the second-hand CloudTrail evidence in #1424. Configuring it ourselves gave a more precise, and more dangerous, picture — the failure is not that it refuses, it is that **it appears to work**:
+
+- An `mcpServer` target with `oauthCredentialProvider` + `grantType: AUTHORIZATION_CODE` on a `CustomOauth2` provider **creates successfully**, reaches status `CREATE_PENDING_AUTH`, and returns a real `authorizationUrl` that 302s to our shim with proper PKCE parameters. Nothing about it looks broken.
+- But the accompanying `userId` is of the form `{gatewayId}_{targetId}_{random}`, and the API documentation defines that field as "The user identifier associated with the OAuth2 authorization session that is **defined by AgentCore Gateway**". So it is a **synthetic, target-level, one-time federation**: an operator consents once, and every subsequent call shares that single token.
+- **Mistaking this for per-user injection is worse than not using it at all** — per-user identity is silently lost (the effect degrades to 2LO) while everything continues to appear correct. The direction of the original conclusion stands; the wording needed fixing: not "you cannot configure it", but "what you configure is not per-user".
+- One self-inflicted trap found along the way: **`grantType` is a top-level field of `oauthCredentialProvider`**, not something inside `customParameters`. Putting it in `customParameters` silently falls back to `CLIENT_CREDENTIALS`, which then fails against a shim that implements no 2LO — and the resulting error reads like "3LO is unsupported". We lost a round to this.
 
 **What works (measured):**
 - Shim translating Lark's non-standard OAuth (JSON body / `code:"0"` envelope / HTTP-200-on-error / PKCE `code_verifier`) into RFC-6749.
@@ -105,7 +158,7 @@ Two things vary across them, and they are independent:
 
 **Integration depth (from the config schema):** only seven have a dedicated config sub-key with endpoints baked in — Google, Github, Slack, Salesforce, Microsoft, Atlassian, Linkedin (you supply just client id/secret). The rest of the built-ins (Okta, PingOne, Auth0, Zoom, Notion, …) use `includedOauth2ProviderConfig`, where you still supply the `authorizationEndpoint`/`tokenEndpoint`/`issuer` yourself. `CustomOauth2` is fully self-described (via `authorizationServerMetadata` or a discovery URL).
 
-**Whether Gateway per-user `-32042` elicitation works (the thing that matters for end-user 3LO):**
+**Whether Gateway-mediated per-user consent works (note: `-32042` below is a code we carried from community reports; official docs list `-32600`/`-32601`/`-32021` plus `URLElicitationRequiredError`):**
 - **Publicly confirmed working:** `GithubOauth2`, `LinkedinOauth2` (AWS samples/workshops).
 - **Confirmed NOT working:** `CustomOauth2` (issue #1424).
 - **Listed but unverified in public material:** the other 22 built-ins — very likely fine (the gap is `CustomOauth2`-specific), but not proven; verify per-vendor before relying on it.

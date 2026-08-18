@@ -18,11 +18,11 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `lark-agent-3lo`, workload `lark-agent-wl` |
 | AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `lark_agent_agent_mem` (STM) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
-| AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region). Not used for the Lark tools — it can't do per-user 3LO for a CustomOauth2 provider | `stacks/gateway_stack.py`, `deploy.sh gateway` |
+| AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region). Not used for the Lark tools — a Gateway hop to an AgentCore Runtime delivers no per-user token to the container | `stacks/gateway_stack.py`, `deploy.sh gateway` |
 
 ## One entrypoint, one identity
 
-> **Status (2026-07): this variant is chat-only and drives 3LO agent-side.** There is no web UI, and the Lark tools don't go through the Gateway — it can't do per-user 3LO for a CustomOauth2 provider (AWS gap, agentcore-samples#1424), so the agent fetches each user's token from the Token Vault itself and calls a lark-cli MCP server directly. The Gateway *is* used for web search, where there's no user identity to forward (see [Two tool paths](#two-tool-paths-and-why)). Sections marked *(legacy)* describe the interceptor/web-UI baseline of the sibling variant and are kept for contrast.
+> **Status (2026-07): this variant is chat-only and drives 3LO agent-side.** There is no web UI, and the Lark tools don't go through the Gateway — a Gateway hop to a Runtime-hosted MCP server arrives with no user token in any header (verified @2026-08-18; see [Two tool paths](#two-tool-paths-and-why)), so the agent fetches each user's token from the Token Vault itself and calls the lark-cli MCP server directly. The Gateway *is* used for web search, where there's no user identity to forward (see [Two tool paths](#two-tool-paths-and-why)). Sections marked *(legacy)* describe the interceptor/web-UI baseline of the sibling variant and are kept for contrast.
 
 ```
                     ┌──────────────────────────────┐        ┌──────────────────────────┐
@@ -33,11 +33,13 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
                     └──────────────┬───────────────┘        └──────────────────────────┘
                      InvokeAgentRuntime (SigV4) — returns "accepted" at once;
                      carries runtimeSessionId + memorySessionId + actorId + chatId
+                          ⚠ actorId is an unsigned string the Runtime cannot verify
+                            → see "The inbound hop is the weak link" below
                                    ▼
         ┌────────────────────────────────────────────────────────┐
         │  Agent container (ARM64, AgentCore Runtime)            │     AgentCore Identity
         │   Strands agent, history in AgentCore Memory           │     Token Vault (3LO)
-        │   lark_3lo: GetResourceOauth2Token(USER_FEDERATION)    │◀───▶ stores / refreshes
+        │   lark_3lo: ForUserId(actorId) → GetResourceOauth2Token │◀───▶ stores / refreshes
         │   the turn runs in the background; /ping = HealthyBusy │     THIS user's token
         └───┬───────────────────────────────────────────┬────────┘            ▲
             │ MCP over SigV4, user's Lark token         │ answer, when ready  │ RFC-6749
@@ -57,7 +59,7 @@ Identity is `lark:{open_id}` for every message, and the vaulted Lark token is ke
 
 First use (consent-wait): no vaulted token → the router posts a clickable 点击授权 link, holds while polling the vault, and re-invokes once consent lands, so the user gets their answer without re-sending. The shim also DMs them when consent completes, which matters for `/auth`-triggered re-consent — there the old token is still present, so polling cannot tell the difference.
 
-Answers come back asynchronously. A turn that researches something and writes it into a document outlasts any request/response window — `InvokeAgentRuntime` and the router's Lambda both cap out — and being cut off mid-way is the worst case, since the work often finished while the user was told it failed. So `chat_async` accepts the turn, returns at once, and runs it on a background thread. The reply is streamed rather than posted in one go: a CardKit card with `streaming_mode` goes out immediately as a placeholder, then each flush writes the accumulated text (throttled to ~0.4 s / 60 chars) so it types out. Measured, the first token takes ~7.5 s — session assembly, MCP handshake, model latency — which is exactly the window the placeholder covers. All of this uses the app's tenant token: it is the bot speaking. A CardKit failure (missing `cardkit:card:write`, an update rejected mid-stream) degrades to a single plain-text post. `/ping` reports `HealthyBusy` for the duration, which is what stops AgentCore from reclaiming the container mid-turn; that defers idle reclamation (the session-inactivity timer `idleRuntimeSessionTimeout`) but not `maxLifetime` — the microVM's wall-clock age cap (default 8 h, configurable 60–28800 s) which never resets on activity, so it is the hard ceiling on one background turn. The router's async self-invocation also disables Lambda's default retries — a timeout counts as a function error there, so retries would replay the whole turn and duplicate both the work and the reply.
+Answers come back asynchronously. A turn that researches something and writes it into a document outlasts any request/response window — `InvokeAgentRuntime` and the router's Lambda both cap out — and being cut off mid-way is the worst case, since the work often finished while the user was told it failed. So `chat_async` accepts the turn, returns at once, and runs it on a background thread. The reply is streamed rather than posted in one go: a CardKit card with `streaming_mode` goes out immediately as a placeholder, then the accumulated text is written into it so it types out. The write happens on the card's own thread and coalesces to the newest text — a CardKit write costs ~470 ms (measured, 361–606 ms), so doing it inline stalled the loop for longer than the interval it was throttled to, and the text arrived in jerks. Now the token loop is paced by the model (~40 chars/s measured for Sonnet 4.6) and the visible cadence by Lark's round trip, instead of the two throttling each other. What the placeholder actually covers is session assembly, not model latency: raw Bedrock returns a first token in 1.0–1.5 s, while a first turn spends ~7 s before that — ~4 s of MCP handshakes across two servers and ~2 s loading Memory history. Subsequent turns in the same session skip the handshake (the agent and its MCP clients are cached). All of this uses the app's tenant token: it is the bot speaking. A CardKit failure (missing `cardkit:card:write`, an update rejected mid-stream) degrades to a single plain-text post. `/ping` reports `HealthyBusy` for the duration, which is what stops AgentCore from reclaiming the container mid-turn; that defers idle reclamation (the session-inactivity timer `idleRuntimeSessionTimeout`) but not `maxLifetime` — the microVM's wall-clock age cap (default 8 h, configurable 60–28800 s) which never resets on activity, so it is the hard ceiling on one background turn. The router's async self-invocation also disables Lambda's default retries — a timeout counts as a function error there, so retries would replay the whole turn and duplicate both the work and the reply.
 
 ## Why Lark is wrapped in Cognito *(the web-UI exchange is legacy; the pool itself is still used)*
 
@@ -76,21 +78,64 @@ agent  ──MCP──▶  AgentCore Gateway  ──invoke (IAM)──▶  Tool 
 
 Lark is a plain REST API at the bottom, not an MCP server. The Lambda target exists because "look up this user's token, refresh it if expired, then call Lark" is per-user logic that needs somewhere to run — an OpenAPI target pointed straight at Lark couldn't manage per-user tokens.
 
-## Auth at every hop *(legacy — the Gateway/Cognito/WSS hops don't exist on this variant)*
+## Auth at every hop, grouped by direction
 
-On this variant the hops are: Lark webhook → Router (signature+AES); Router → Runtime (IAM SigV4); Agent → lark-cli MCP Runtime (IAM SigV4 + user's Lark token in a custom passthrough header); lark-cli → Lark REST (Bearer = user_access_token, scoped by Lark to that user). The legacy table below describes the interceptor baseline.
+Inbound and outbound are **independent axes** — each can be configured without regard to the other, and conflating them is where most of the confusion about AgentCore auth comes from. So the hops are listed by direction rather than in call order.
 
-| Hop | Credential | Who verifies |
+**Inbound — who is allowed to invoke us, and how the identity arrives:**
+
+| Hop | Credential | Who verifies | Identity carried how |
+|---|---|---|---|
+| Lark → Router (webhook) | `X-Lark-Signature` + AES (encryptKey) | Router, fail-closed | `open_id` inside the decrypted event |
+| Router → agent Runtime | IAM SigV4 (`InvokeAgentRuntime`) | AgentCore (caller is an AWS principal) | **`actorId`, an unsigned payload string** ⚠ |
+| Agent → lark-cli / approval Runtime | IAM SigV4 | AgentCore | n/a — the user's token rides a header (outbound concern) |
+
+The ⚠ is the one to notice: SigV4 authenticates *the router as an AWS principal*, not *the user*. Nothing verifies the `actorId` string — see [the inbound hop is the weak link](#the-inbound-hop-is-the-weak-link-and-what-production-should-do-instead) for what production should do instead.
+
+**Outbound — what credential leaves us, and who adjudicates access:**
+
+| Hop | Credential | Who adjudicates |
 |---|---|---|
-| Lark webhook → Router | X-Lark-Signature + AES (encryptKey) | Router Lambda (fail-closed) |
-| Browser → web_api `/api/session` | Cognito JWT | API Gateway JWT authorizer |
-| Router / web_api → AgentCore Runtime | IAM SigV4 (`InvokeAgentRuntime`) | AgentCore |
-| Browser → Runtime WSS | SigV4 **presigned URL** (signed by web_api) | AgentCore |
-| Agent → Gateway (MCP) | user's Cognito **access** token (Bearer) | Gateway `customJWTAuthorizer` (validates `client_id` via `allowedClients`) |
-| Gateway → Tool Lambda | Gateway IAM role | Lambda resource policy (principal `bedrock-agentcore`) |
-| Tool Lambda → Lark REST | user's Lark **user_access_token** (Bearer) | Lark (scopes it to that user's own permissions) |
+| Agent → AgentCore Identity | workload access token (from `ForUserId`) | AgentCore Identity |
+| Agent → lark-cli Runtime | the user's Lark token in `X-Amzn-…-Custom-Lark-Token` | passed through; lark-cli uses it verbatim |
+| lark-cli → Lark REST | the user's **`user_access_token`** (Bearer) | **Lark** — returns only what that user can see |
+| approval server → Lark REST | the **app's** tenant token + a `user_id` argument | Lark checks task ownership, never consent (see [approvals](#a-third-path-approvals-where-the-users-identity-cannot-be-passed-through)) |
+| Agent → Web Search Gateway | the user's Cognito **access** token (Bearer) | Gateway `customJWTAuthorizer` (`allowedClients` checks the `client_id` claim, which ID tokens lack — an ID token 403s with `insufficient_scope`) |
+| Gateway → Web Search connector | `GATEWAY_IAM_ROLE` | IAM |
+| Agent / Router → Lark chat | the app's tenant token | Lark — it is the bot speaking, not the user |
 
-Note the deliberate split: the Runtime uses SigV4 inbound (so the webhook + web Lambdas can call it), while the *outbound* MCP path to the Gateway uses the per-user JWT. The Gateway needs the **access** token (it carries the `client_id` claim `allowedClients` checks); an ID token 403s with `insufficient_scope`.
+The last row is the pair worth holding onto: **replies go out as the app, tool calls go out as the user.** Both directions exist in the same turn, on purpose.
+
+*(Legacy, for contrast with the sibling interceptor variant: Browser → `web_api /api/session` used a Cognito JWT on an API Gateway authorizer; Browser → Runtime used a SigV4 **presigned** WSS URL; Gateway → Tool Lambda used the Gateway IAM role with a Lambda resource policy. None of those hops exist here.)*
+
+## The inbound hop is the weak link, and what production should do instead
+
+Everything above is about the *outbound* hop — the user's own token reaching Lark, so Lark adjudicates. The inbound hop, router → Runtime, is where this sample is deliberately simpler than production should be, and it is worth stating plainly rather than leaving to be discovered.
+
+**The limitation.** The router calls `InvokeAgentRuntime` with SigV4 and passes the user identity as `actorId`, a plain string in the payload. The Runtime cannot verify it. The agent then hands that string to `GetWorkloadAccessTokenForUserId`, which does not check whether the caller "owns" that user either — so whatever `actorId` the agent supplies is the identity it acts as. Any user who has consented once is reachable, with nobody present. Against a prompt-injected agent the only thing standing there is that the code doesn't do it: **discipline, not a cryptographic constraint**.
+
+Two narrower holes in the same area were real bugs and are fixed (see `fix(security)` in the history): a vaulted token is now confirmed to belong to the actor before use, because consent completion binds a token to the `userId` in the return-url `state` rather than to the account that actually signed in — so forwarding a consent link vaulted someone else's token under your name. Those were defects. What is described above is not; it is the shape of the design.
+
+**What production should do: move inbound auth to `CUSTOM_JWT`.** This closes the impersonation surface without switching to OBO, because the platform takes over the identity step. Per the [devguide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/get-workload-access-token.html): "Runtime automatically delivers workload access tokens to agent execution instances as payload headers." Configured that way, Runtime validates the inbound JWT's signature, reads `iss`/`sub`, calls `GetWorkloadAccessTokenForJWT` itself, and passes the resulting workload token to the agent — and, on the same page, "Runtime-managed agent identities cannot retrieve workload access tokens directly, preventing token extraction and misuse."
+
+```
+  this sample                                production
+  ───────────                                ──────────
+  router ──SigV4──▶ Runtime                  router ──signs a user JWT──▶ Runtime
+     payload: actorId="lark:ou_A"               Authorization: Bearer <sub=lark:ou_A>
+                  │                                          │
+                  ▼                                          ▼
+  agent: ForUserId("lark:ou_A")              Runtime verifies → ForJWT → workload
+     ↑ a string; substitute ou_B and            token arrives in the payload header
+       you hold B's Lark token                agent: uses what it was given, cannot
+                                                choose someone else
+```
+
+The pieces are mostly present already: the Cognito pool mints per-user JWTs under `lark:{open_id}` (`agent/identity.py`) and publishes a discovery document, and `scripts/provision.sh` already configures a `customJWTAuthorizer` in exactly this shape — for the Gateway. Four things would change: sign the JWT in the router; set `authorizerConfiguration.customJWTAuthorizer` on the agent Runtime (`UpdateAgentRuntime` accepts it, no rebuild); read the workload token from the payload header instead of calling `ForUserId`; and **deny `GetWorkloadAccessTokenForUserId` on the execution role** — code that no longer calls it is not a constraint, IAM is. Consent completion should likewise pass `userIdentifier.userToken` (a verified JWT) rather than `userId` (a string the caller asserts).
+
+**Why this sample doesn't do it.** `CUSTOM_JWT` and SigV4 invocation are mutually exclusive: turning it on means the router must switch to a bearer-token call in the same change, so it is a breaking cutover rather than a hardening you can add alongside. For a reference implementation whose subject is the *outbound* per-user path, the simpler inbound hop keeps the demonstration legible.
+
+**And it relocates trust rather than removing it.** In the event-driven approval flow nobody is present, so the router would sign a JWT for an absent person — "the app asserts it represents X" all over again, with the router as the trusted party instead of the agent. That is still a real improvement, since the router is small, runs no model and never sees untrusted input. But only OBO (`TOKEN_EXCHANGE`) makes impersonation cryptographically impossible: without the user's own token there is nothing to exchange.
 
 ## Identity pass-through vs permission inheritance
 
@@ -107,10 +152,27 @@ Authorization is scoped per downstream system, not per bot: each one gets its ow
 | How the agent reaches it | direct to the lark-cli Runtime (SigV4 + the user's token in a custom header) | through an AgentCore Gateway (MCP) |
 | Outbound credential | the user's vaulted Lark token | `GATEWAY_IAM_ROLE` |
 
-The split isn't stylistic. The Gateway is the natural home for tools, but it cannot inject a
-per-user token for a `CustomOauth2` provider (agentcore-samples#1424), which is why the Lark
-tools bypass it and the agent drives 3LO itself. Web search has no such problem: with no user
-identity to forward, `GATEWAY_IAM_ROLE` is all it needs, so it uses the Gateway as intended.
+The split isn't stylistic, and the reason is narrower than it first looks. The Gateway is the
+natural home for tools, and per-user 3LO on it **does** work — including for a `CustomOauth2`
+provider like Lark: consent completes, the token vaults, the target reaches `READY`
+(verified @2026-08-18). What fails is the last hop. With an **AgentCore Runtime** as the target, the
+request reaches the container carrying no `authorization` header and no token header of any
+kind, so a per-request bearer has nowhere to ride — the AWS transport owns that header on a
+Runtime hop, the same reason `GATEWAY_IAM_ROLE` delivers none either. Hence the Lark tools
+bypass the Gateway and the agent drives 3LO itself and passes the token in a custom header.
+
+This is a **target-type** limit rather than a vendor limit, and switching target type does not
+escape it. Verified @2026-08-18 with an OpenAPI target on the same provider: it needs no
+target-level pre-auth (straight to `READY`, no `authorizationData`), but a `tools/call` returns
+`An internal error occurred. Please retry later.` with no consent prompt — both for a caller who
+had never consented and for one whose token was already vaulted. The two target types supply
+opposite halves: per-user consent can only be *initiated* through elicitation, which is
+documented as supported only for **MCP server** targets, while an MCP server on a Runtime cannot
+*receive* the token. An earlier version of this document attributed the limit to the
+`CustomOauth2` vendor and cited agentcore-samples#1424; running it showed that opaque
+`Authorization error` is what a gateway role missing `bedrock-agentcore:InvokeAgentRuntime`
+produces. See `docs/agentcore-behavior.md` for all six experiments. Web search has no such problem: with no user identity to forward,
+`GATEWAY_IAM_ROLE` is all it needs, so it uses the Gateway as intended.
 
 The Web Search connector is only offered in **us-east-1**, so its gateway lives there even
 when the rest of the stack doesn't, and the agent calls it cross-region. Inbound auth is a
@@ -189,7 +251,70 @@ Earlier the agent derived the memory id from `actor_id` itself and ignored what 
 
 Authorization is a third, orthogonal dimension: the vaulted Lark token is keyed to `lark:{open_id}`, not to either session, so rotating sessions never forces a re-consent.
 
-## Sequence: a web-UI turn that reads the user's docs *(legacy — no web UI; see the consent-wait flow above)*
+## Sequence: first use — consent, then the user's own documents
+
+The whole chain for a user who has never authorized, which is the case that exercises every hop. Inbound and outbound are boxed separately, because which credential applies depends on the direction and nothing else.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User (Lark client / browser)
+    participant L as Lark platform (IdP + REST)
+    participant R as Router λ
+    participant A as Agent (AgentCore Runtime)
+    participant V as AgentCore Identity (OAuth + Token Vault)
+    participant S as Shim λ
+    participant M as lark-cli MCP Runtime
+
+    rect rgb(232, 240, 254)
+    Note over L,A: INBOUND — who may invoke, and how the identity arrives
+    L->>R: webhook event (AES-encrypted)
+    R->>R: verify signature (fail-closed, 300 s replay window) → decrypt → actorId=lark:{open_id} → allowlist
+    R->>R: park the turn (so consent can replay it) + react OnIt
+    R->>A: InvokeAgentRuntime (SigV4) — actorId in the payload, no user token
+    Note over R,A: SigV4 proves the ROUTER is an AWS principal — nothing verifies actorId itself
+    end
+
+    rect rgb(255, 244, 229)
+    Note over A,S: FIRST-USE CONSENT — driven by the agent: a Gateway hop to a Runtime target delivers no token to the container
+    A->>V: ForUserId(actorId) → GetResourceOauth2Token(USER_FEDERATION, customState=b64(actorId))
+    V-->>A: no token vaulted → authorizationUrl + sessionUri
+    A-->>R: needs_auth + auth_url
+    R->>U: post 点击授权 link (app tenant token), then poll the vault ≤45 s
+    U->>V: GET AgentCore /authorize (binds a cookie to the session, then 302)
+    V->>S: 302 → shim /authorize (AgentCore appends client_id / redirect_uri / scope / state / PKCE)
+    S-->>U: 302 → Lark accounts authorize page
+    U->>L: sign in and consent
+    L-->>V: 302 with code → AgentCore callback
+    V->>S: POST shim /token
+    S->>L: POST authen/v2/oauth/token (RFC form → Lark JSON)
+    L-->>S: code:0 envelope + access_token
+    S-->>V: unwrapped, standard OAuth response
+    V-->>U: 302 → shim /return (session_id + state)
+    U->>S: GET shim /return
+    S->>V: CompleteResourceTokenAuth(sessionUri, userId=b64decode(state)) → token vaulted
+    S->>R: poke _consent_resumed
+    R->>R: claim the parked turn (atomic — the poll loop races this)
+    R->>A: replay the message (fresh_session, so the unauthorized session is rebuilt)
+    end
+
+    rect rgb(232, 245, 233)
+    Note over A,L: OUTBOUND — the user's own credential, adjudicated by Lark
+    A->>V: GetResourceOauth2Token → the vaulted Lark token
+    A->>L: authen/v1/user_info — confirm the token belongs to actorId
+    Note over A,L: refuses a token vaulted under this actor but owned by someone else
+    A->>M: MCP tools/call (SigV4 + user's token in X-Amzn-…-Custom-Lark-Token)
+    M->>L: GET /open-apis/drive/… (Bearer = user_access_token)
+    L-->>M: only what THIS user can see — Lark adjudicates, not our code
+    M-->>A: tool result
+    A->>U: stream the answer into a CardKit card (app tenant token — the bot is speaking)
+    end
+```
+
+Two things the boxes are meant to make obvious. The **user's credential never appears inbound** — it is fetched, per user, on the outbound side; the inbound hop carries only a name. And the **last arrow flips identity**: the answer goes out as the app, while everything that touched the user's data went out as the user.
+
+## Sequence: a web-UI turn that reads the user's docs 
+> *(legacy — no web UI; see the consent-wait flow above)*
 
 ```mermaid
 sequenceDiagram
