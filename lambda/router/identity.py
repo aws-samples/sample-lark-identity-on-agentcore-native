@@ -116,14 +116,24 @@ def park_pending_auth(user_id: str, message: str, chat_id: str) -> None:
 
 
 def take_pending_auth(user_id: str) -> dict | None:
-    """Return {message, chatId} and delete it — replay is once-only. None if there is
-    nothing parked (e.g. the user ran /auth directly, with no message to resume), or
-    it expired. A stale item past its ttl is treated as absent even if DynamoDB has
-    not swept it yet."""
-    item = _table.get_item(Key={"PK": f"USER#{user_id}", "SK": "PENDING_AUTH"}).get("Item")
+    """Claim the parked turn: return {message, chatId} and remove it, atomically.
+
+    Two paths race for this — the router polling the vault and the shim's callback
+    after consent completes — and both replay whatever they claim. A get-then-delete
+    lets both read the same item inside the same window and run the turn twice, with
+    duplicated side effects. Deleting with ALL_OLD makes the delete itself the claim:
+    DynamoDB returns the item to exactly one caller.
+
+    None if nothing was parked (the user ran /auth directly, with no turn to resume),
+    someone else already claimed it, or it expired — a stale item past its ttl counts
+    as absent even if DynamoDB has not swept it yet."""
+    resp = _table.delete_item(
+        Key={"PK": f"USER#{user_id}", "SK": "PENDING_AUTH"},
+        ReturnValues="ALL_OLD",
+    )
+    item = resp.get("Attributes")
     if not item:
         return None
-    _table.delete_item(Key={"PK": f"USER#{user_id}", "SK": "PENDING_AUTH"})
     if int(item.get("ttl", 0) or 0) < int(time.time()):
         return None
     return {"message": item.get("message", ""), "chatId": item.get("chatId", "")}

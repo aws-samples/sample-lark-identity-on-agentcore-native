@@ -22,6 +22,8 @@ token vaulted and proceeds.
 from __future__ import annotations
 
 import base64
+import hashlib
+import logging
 import os
 from datetime import timedelta
 
@@ -40,6 +42,9 @@ _SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # bare, allowlisted on
 _LARK_MCP_URL = os.environ.get("LARK_MCP_URL", "")        # SigV4 Runtime MCP invocations URL
 _SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
 _CUSTOM_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Lark-Token"
+_API_DOMAIN = os.environ.get("LARK_API_DOMAIN", "https://open.larksuite.com").rstrip("/")
+
+log = logging.getLogger("agent.lark_3lo")
 
 _agentcore = boto3.client("bedrock-agentcore", region_name=_REGION)
 
@@ -48,12 +53,58 @@ def _b64url(s: str) -> str:
     return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
 
 
+# Which tokens have been confirmed to belong to the actor they are vaulted under.
+# Keyed by a digest, never the token itself, and bounded — this is a cache, and a
+# token that is already known good does not need re-checking every turn.
+_VERIFIED: dict[str, str] = {}
+_VERIFIED_MAX = 256
+
+
+def _token_owner(token: str) -> str:
+    """The open_id this Lark token actually belongs to, or "" if it can't be read.
+    Needs no extra scope — the lark-cli server reads the same endpoint for whoami."""
+    try:
+        r = httpx.get(f"{_API_DOMAIN}/open-apis/authen/v1/user_info",
+                      headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        return ((r.json().get("data") or {}).get("open_id") or "")
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not read the token's owner: %s", e)
+        return ""
+
+
+def _belongs_to(token: str, actor_id: str) -> bool:
+    """Whether this token is really the actor's own.
+
+    Consent completion binds the vaulted token to whatever userId the return-url was
+    told (`state`), NOT to the Lark account that actually signed in. So forwarding a
+    consent link is enough to get someone else's token vaulted under your name, and
+    every later turn would act as them. Checking at the point of use closes that
+    regardless of how the token got there. Fails closed: an owner we cannot establish
+    is not accepted."""
+    digest = hashlib.sha256(token.encode()).hexdigest()[:32]
+    if _VERIFIED.get(digest) == actor_id:
+        return True
+    owner = _token_owner(token)
+    expected = actor_id.split(":", 1)[1] if ":" in actor_id else actor_id
+    if not owner or owner != expected:
+        log.error("vaulted token does not belong to %s (owner=%s) — refusing it",
+                  actor_id, owner[:12] + "…" if owner else "unknown")
+        return False
+    if len(_VERIFIED) >= _VERIFIED_MAX:
+        _VERIFIED.pop(next(iter(_VERIFIED)))
+    _VERIFIED[digest] = actor_id
+    return True
+
+
 def get_user_lark_token(actor_id: str, force: bool = False) -> tuple[str, str]:
     """Return ("token", <lark token>) if vaulted, else ("auth_url", <url>).
 
     actor_id is "lark:{open_id}" — the same id the token was (or will be) vaulted
     under, carried through as customState so the shim /return can complete it.
     force=True always starts a fresh 3LO flow, ignoring any vaulted token.
+
+    A vaulted token is used only after it is confirmed to be this actor's own; one
+    that isn't gets discarded in favour of a fresh consent flow (see _belongs_to).
     """
     wat = _agentcore.get_workload_access_token_for_user_id(
         workloadName=_WORKLOAD, userId=actor_id
@@ -69,8 +120,16 @@ def get_user_lark_token(actor_id: str, force: bool = False) -> tuple[str, str]:
     if _SHIM_RETURN_URL:
         kwargs["resourceOauth2ReturnUrl"] = _SHIM_RETURN_URL
     resp = _agentcore.get_resource_oauth2_token(**kwargs)
-    if resp.get("accessToken"):
-        return "token", resp["accessToken"]
+    token = resp.get("accessToken")
+    if token and _belongs_to(token, actor_id):
+        return "token", token
+    if token:
+        # Someone else's grant is sitting under this actor. Re-consent is the only way
+        # out: the wrong token stays in the vault, so without forcing a fresh flow the
+        # next call would fetch it right back. Guarded against recursion by `force`.
+        if not force:
+            return get_user_lark_token(actor_id, force=True)
+        log.error("fresh authorization still produced a token for another account")
     return "auth_url", resp["authorizationUrl"]
 
 

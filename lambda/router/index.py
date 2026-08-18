@@ -574,6 +574,15 @@ def _dispatch_turn(user_id: str, actor_id: str, agent_message: str, chat_id: str
                 lark.send_message(chat_id, result.get("reply", ""))
             logger.info("awaiting consent for %s (<= %ds)", actor_id, AUTH_WAIT_SECONDS)
             if wait_for_consent(actor_id):
+                # Claim the parked turn before replaying it. The shim's callback races
+                # us the moment consent lands — it claims and replays too — so whoever
+                # polls the token first would otherwise run the turn a second time, in
+                # a different session, with the side effects duplicated. Whoever wins
+                # the claim runs it; the loser stops here.
+                if identity.take_pending_auth(user_id) is None:
+                    logger.info("consent complete for %s; already claimed elsewhere",
+                                actor_id)
+                    return
                 logger.info("consent complete for %s; re-invoking", actor_id)
                 # Waiting for consent already spent part of the budget.
                 left = (context.get_remaining_time_in_millis() / 1000 - 10
@@ -581,7 +590,8 @@ def _dispatch_turn(user_id: str, actor_id: str, agent_message: str, chat_id: str
                 result = invoke_agent(session_id, user_id, actor_id, agent_message,
                                       action="chat_async", mem_sid=mem_sid,
                                       budget=left, chat_id=chat_id,
-                                      message_id=message_id, reaction_id=reaction_id)
+                                      message_id=message_id, reaction_id=reaction_id,
+                                      fresh_session=True)
             else:
                 logger.info("consent wait timed out for %s", actor_id)
                 return  # link already sent; user finishes later and re-sends

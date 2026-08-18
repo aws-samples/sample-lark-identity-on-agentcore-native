@@ -281,6 +281,56 @@ class FakeCard:
         return self._close_ok
 
 
+
+# ------------------- vaulted token ownership (consent hijack) ------------------
+
+def _load_3lo_guard(owner_lookup):
+    """Exec the ownership check in isolation — lark_3lo imports strands/mcp (ARM64)."""
+    src = open(os.path.join(os.path.dirname(__file__), "lark_3lo.py"), encoding="utf-8").read()
+    start = src.index("_VERIFIED: dict[str, str] = {}")
+    end = src.index("def get_user_lark_token(")
+    ns = {"hashlib": hashlib, "log": mock.Mock(), "httpx": mock.Mock()}
+    exec(src[start:end], ns)
+    ns["_token_owner"] = owner_lookup          # replace the HTTP call
+    return ns
+
+
+def test_vaulted_token_must_belong_to_the_actor():
+    """Consent completion binds the token to whatever userId the return-url was told
+    (`state`), not to the account that actually signed in — so forwarding a consent
+    link vaults someone else's token under your name. Checked at the point of use."""
+    ns = _load_3lo_guard(lambda t: "ou_alice")
+    assert ns["_belongs_to"]("tok", "lark:ou_alice") is True
+    assert ns["_belongs_to"]("tok2", "lark:ou_bob") is False     # Bob's grant, Alice's slot
+
+
+def test_unverifiable_token_owner_fails_closed():
+    """An owner we cannot establish is not "probably fine"."""
+    ns = _load_3lo_guard(lambda t: "")
+    assert ns["_belongs_to"]("tok", "lark:ou_alice") is False
+
+
+def test_verified_token_is_not_rechecked_every_turn():
+    """One whoami per token, not per turn — the check is on the hot path."""
+    calls = []
+    def owner(t):
+        calls.append(t)
+        return "ou_alice"
+    ns = _load_3lo_guard(owner)
+    for _ in range(4):
+        assert ns["_belongs_to"]("tok", "lark:ou_alice") is True
+    assert len(calls) == 1
+
+
+def test_the_ownership_cache_is_bounded():
+    """A long-lived container sees many users; the cache must not grow without limit."""
+    ns = _load_3lo_guard(lambda t: t.replace("tok-", "ou_"))
+    for i in range(ns["_VERIFIED_MAX"] + 20):
+        ns["_belongs_to"](f"tok-{i}", f"lark:ou_{i}")
+    assert len(ns["_VERIFIED"]) <= ns["_VERIFIED_MAX"]
+
+
+
 # ------------------------ CardKit worker (coalescing) ------------------------
 
 def _load_card(monkeypatch_calls):

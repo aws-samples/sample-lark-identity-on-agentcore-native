@@ -378,25 +378,79 @@ def test_status_shows_both_identities_and_masks_the_app_id():
 # shim's /return replays it after consent. These pin the parts that must not drift:
 # take is once-only, expiry is honoured, and resume actually re-invokes the agent.
 
-def test_take_pending_auth_is_once_only_and_honours_ttl():
+def test_take_pending_auth_claims_atomically_and_honours_ttl():
+    """The claim IS the delete. Two paths race to replay a parked turn — the router
+    polling the vault and the shim's post-consent callback — so a get-then-delete lets
+    both read the same item and run the turn twice, with duplicated side effects."""
     import identity, time as _t
     store = {}
-    def fake_get(Key): return {"Item": store[Key["SK"]]} if Key["SK"] in store else {}
     def fake_put(Item): store[Item["SK"]] = Item
-    def fake_del(Key): store.pop(Key["SK"], None)
-    with mock.patch.object(identity._table, "get_item", side_effect=fake_get), \
-         mock.patch.object(identity._table, "put_item", side_effect=fake_put), \
+    def fake_del(Key, ReturnValues=None):
+        old = store.pop(Key["SK"], None)
+        return {"Attributes": old} if (old and ReturnValues == "ALL_OLD") else {}
+    with mock.patch.object(identity._table, "put_item", side_effect=fake_put), \
          mock.patch.object(identity._table, "delete_item", side_effect=fake_del):
         identity.park_pending_auth("u1", "查待审批", "oc_1")
-        first = identity.take_pending_auth("u1")
-        assert first == {"message": "查待审批", "chatId": "oc_1"}
-        # Second take returns nothing — replay must not happen twice.
+        assert identity.take_pending_auth("u1") == {"message": "查待审批", "chatId": "oc_1"}
+        # The loser of the race gets nothing — replay must not happen twice.
         assert identity.take_pending_auth("u1") is None
 
         # An item past its ttl is treated as absent, even before DynamoDB sweeps it.
         store["PENDING_AUTH"] = {"message": "old", "chatId": "oc_1",
                                  "ttl": int(_t.time()) - 1}
         assert identity.take_pending_auth("u1") is None
+
+
+def test_take_pending_auth_reads_the_item_from_the_delete_itself():
+    """Guards the mechanism, not just the outcome: without ReturnValues=ALL_OLD the
+    claim degrades to a blind delete and nothing is ever replayed."""
+    import identity
+    with mock.patch.object(identity._table, "delete_item",
+                           return_value={"Attributes": {"message": "m", "chatId": "c",
+                                                        "ttl": 9999999999}}) as dele:
+        assert identity.take_pending_auth("u1") == {"message": "m", "chatId": "c"}
+    assert dele.call_args.kwargs.get("ReturnValues") == "ALL_OLD"
+
+
+def test_fast_path_claims_before_replaying():
+    """When the user consents inside the polling window, the router and the shim both
+    want to replay. The claim decides which one does."""
+    import index, identity
+    with mock.patch.object(identity, "get_or_create_session", return_value="ses_x"), \
+         mock.patch.object(identity, "get_or_create_memory_session", return_value="mem_x"), \
+         mock.patch.object(index.lark, "add_reaction", return_value=""), \
+         mock.patch.object(index.lark, "send_link_message", return_value=True), \
+         mock.patch.object(index.lark, "send_message", return_value=True), \
+         mock.patch.object(index, "wait_for_consent", return_value=True), \
+         mock.patch.object(identity, "take_pending_auth",
+                           return_value={"message": "m", "chatId": "oc_1"}) as claim, \
+         mock.patch.object(index, "invoke_agent",
+                           side_effect=[{"needs_auth": True, "auth_url": "https://x"},
+                                        {"accepted": True}]) as inv:
+        index._dispatch_turn("u1", "lark:ou_a", "查文档", "oc_1")
+    assert claim.call_count == 1
+    assert inv.call_count == 2                      # the walled turn, then the replay
+    # The replay must rebuild the session: the cached one is still marked unauthorized
+    # (consent lands well inside UNAUTH_SESSION_TTL), so reusing it walls again.
+    assert inv.call_args.kwargs.get("fresh_session") is True
+
+
+def test_fast_path_does_not_replay_when_the_claim_is_lost():
+    """The shim got there first and is already replaying — a second run would duplicate
+    every side effect, in a different session, with no dedup on the agent side."""
+    import index, identity
+    with mock.patch.object(identity, "get_or_create_session", return_value="ses_x"), \
+         mock.patch.object(identity, "get_or_create_memory_session", return_value="mem_x"), \
+         mock.patch.object(index.lark, "add_reaction", return_value=""), \
+         mock.patch.object(index.lark, "send_link_message", return_value=True), \
+         mock.patch.object(index.lark, "send_message", return_value=True) as send, \
+         mock.patch.object(index, "wait_for_consent", return_value=True), \
+         mock.patch.object(identity, "take_pending_auth", return_value=None), \
+         mock.patch.object(index, "invoke_agent",
+                           return_value={"needs_auth": True, "auth_url": "https://x"}) as inv:
+        index._dispatch_turn("u1", "lark:ou_a", "查文档", "oc_1")
+    assert inv.call_count == 1                      # only the original walled turn
+    assert send.call_count == 0                     # and no stray reply
 
 
 def test_resume_replays_the_parked_message():
