@@ -2,9 +2,8 @@
 
 Unlike the Lark tools, search needs no end-user identity: it asks Amazon's web
 index, not the user's account. So it goes through the Gateway with
-GATEWAY_IAM_ROLE outbound auth, sidestepping the missing per-user token dispatch
-that forced the Lark tools onto a direct Runtime connection (see
-docs/agentcore-behavior.md).
+GATEWAY_IAM_ROLE outbound auth and needs none of the per-user 3LO machinery the
+Lark tools carry (see docs/agentcore-behavior.md).
 
 The connector is only offered in us-east-1, so this gateway typically lives in a
 different region from everything else and is called cross-region.

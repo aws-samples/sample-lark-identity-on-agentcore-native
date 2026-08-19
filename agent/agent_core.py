@@ -17,9 +17,9 @@ USER_FEDERATION) and connects directly to the lark-mcp Runtime, passing the toke
 in a custom header (the lark-mcp sidecar copies it to Authorization). The token
 gates tool *calls*, not the connection — lark-mcp lists its tools without one — so
 an unauthorized user gets a working session and is only asked to consent if the
-model actually reaches for a Lark tool. We drive 3LO from the agent because the
-Gateway hands out no per-user token for a CustomOauth2 provider (verified
-@2026-08-18; see docs/agentcore-behavior.md).
+model actually reaches for a Lark tool. We drive 3LO from the agent by choice — the Gateway can also do it for a
+CustomOauth2 provider once its role has the Identity permissions (verified
+@2026-08-19; see docs/agentcore-behavior.md).
 
 `chat_result` returns the final text; `chat_async` streams it into a Lark card.
 """
