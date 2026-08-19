@@ -500,7 +500,7 @@ def test_fresh_session_evicts_a_cached_unauthorized_session():
                                 "mcp": FakeMCP(), "agent": object()}}
     built = []
 
-    def fake_build(actor_id, email, mem_sid):
+    def fake_build(actor_id, email, mem_sid, workload_token=""):
         built.append(mem_sid)
         return {"created": 1e9, "agent": object()}   # authorized: no auth_url
 

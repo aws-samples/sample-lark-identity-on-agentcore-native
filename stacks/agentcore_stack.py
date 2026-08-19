@@ -169,8 +169,6 @@ class AgentCoreStack(Stack):
             iam.PolicyStatement(
                 actions=[
                     "bedrock-agentcore:GetWorkloadAccessToken",
-                    "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
-                    "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
                     "bedrock-agentcore:GetResourceOauth2Token",
                     "bedrock-agentcore:InvokeAgentRuntime",
                     "bedrock-agentcore:InvokeAgentRuntimeForUser",
@@ -178,6 +176,27 @@ class AgentCoreStack(Stack):
                     # the only region offering the connector), so the caller needs
                     # this on top of the Gateway role's own permissions.
                     "bedrock-agentcore:InvokeGateway",
+                ],
+                resources=["*"],
+            )
+        )
+
+        # The impersonation surface, closed. With CUSTOM_JWT inbound the Runtime hands
+        # the agent a workload token derived from the caller's verified JWT, so the agent
+        # has no reason to mint one for a user it names itself. Not calling those APIs is
+        # not enough — anything holding this role could still call them, and the actions
+        # take no resource scope, so a Deny is the only way to make "act as an arbitrary
+        # consented user" impossible rather than merely unwritten.
+        #
+        # ForJWT is denied too: possessing any user's JWT is sufficient to exchange it
+        # for their vaulted token, so leaving it would keep the surface open to whatever
+        # token reaches the agent — verified callable from outside AgentCore entirely.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.DENY,
+                actions=[
+                    "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+                    "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
                 ],
                 resources=["*"],
             )

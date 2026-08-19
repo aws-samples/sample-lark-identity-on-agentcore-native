@@ -132,6 +132,42 @@ phase2_runtime() {
     --output text 2>/dev/null | head -1)"
   [ -n "$rid" ] && [ "$rid" != "None" ] && ctx_set runtime_id "$rid"
 
+  # Inbound auth: CUSTOM_JWT, so the platform verifies who the caller is and hands the
+  # agent a workload token derived from that identity. The AgentCore CLI has no flag for
+  # this, hence a follow-up update.
+  #
+  # UpdateAgentRuntime REPLACES the runtime rather than patching it: anything omitted is
+  # cleared, and it silently dropped every environment variable the first time round
+  # (SHIM_RETURN_URL going missing surfaced as a ValidationException from
+  # GetResourceOauth2Token). So read the current config back and resend all of it.
+  #
+  # This is also what makes SigV4 invocation stop working ("Authorization method
+  # mismatch"), so the router deploy above and this step belong to the same cutover.
+  if [ -n "$rid" ] && [ "$rid" != "None" ]; then
+    log "Runtime — inbound auth: CUSTOM_JWT (Cognito)"
+    local issuer client cur art net envvars
+    issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
+    client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
+    cur="$(aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$rid" --output json)"
+    _rt_get() { printf '%s' "$cur" | uv run python -c "import json,sys;print(json.dumps(json.load(sys.stdin).get('$1') or {}))"; }
+    art="$(_rt_get agentRuntimeArtifact)"
+    net="$(_rt_get networkConfiguration)"
+    envvars="$(_rt_get environmentVariables)"
+    # Fail loudly rather than deploy a runtime stripped of its configuration.
+    [ "$envvars" = "{}" ] && { echo "  aborting: runtime reports no environment variables to preserve"; exit 1; }
+    aws bedrock-agentcore-control update-agent-runtime --agent-runtime-id "$rid" \
+      --agent-runtime-artifact "$art" --role-arn "$role" --network-configuration "$net" \
+      --environment-variables "$envvars" \
+      --authorizer-configuration "{\"customJWTAuthorizer\":{\"discoveryUrl\":\"$issuer/.well-known/openid-configuration\",\"allowedClients\":[\"$client\"]}}" \
+      --query 'status' --output text
+    for _ in $(seq 1 40); do
+      [ "$(aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$rid" \
+           --query status --output text 2>/dev/null)" = "READY" ] && break
+      sleep 5
+    done
+    echo "  inbound: CUSTOM_JWT ($client); env vars preserved: $(printf '%s' "$envvars" | uv run python -c 'import json,sys;print(len(json.load(sys.stdin)))')"
+  fi
+
   # The router's AGENTCORE_RUNTIME_ARN was synthesised before the runtime existed
   # (a PLACEHOLDER), so re-deploy it now that the real id is known — otherwise the
   # webhook invokes a non-existent runtime.

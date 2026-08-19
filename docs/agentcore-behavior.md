@@ -63,12 +63,12 @@ Both are configurable 60–28800 s via `lifecycleConfiguration` and left at defa
 
 Every per-user token fetch starts with a workload access token (WAT). There are **two ways to get one, and they have completely different security properties**. Which one applies is decided by the Runtime's *inbound* auth, not by anything in the agent.
 
-**Manual path — `GetWorkloadAccessTokenForUserId(workloadName, userId)`** (what this sample uses, because it is invoked with SigV4 and the identity arrives as a payload string):
+**Manual path — `GetWorkloadAccessTokenForUserId(workloadName, userId)`** (what this sample used until the `CUSTOM_JWT` cutover, and what any SigV4-invoked deployment is left with, since the identity arrives as a payload string):
 
 - **It does not check whether the caller "owns" the `userId`** (measured: our agent passes whatever `actorId` the router put in the payload, for arbitrary users, and it succeeds). So the calling code's choice of `userId` *is* the identity it acts as. Any user who has consented once is reachable, with nobody present.
-- Consequence: with SigV4 inbound, per-user safety rests on the agent only ever passing the `actorId` it was given — **code discipline, not a cryptographic constraint**. That matters because the agent is the component processing untrusted input.
+- Consequence: with SigV4 inbound, per-user safety rests on the agent only ever passing the `actorId` it was given — **code discipline, not a cryptographic constraint**. That matters because the agent is the component processing untrusted input. This sample no longer relies on it: inbound is `CUSTOM_JWT` and both by-name APIs are IAM-denied on the execution role.
 
-**Automatic path — Runtime does it for you when inbound auth is `CUSTOM_JWT`** (from the [devguide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/get-workload-access-token.html); **documented, not measured by us**):
+**Automatic path — Runtime does it for you when inbound auth is `CUSTOM_JWT`** (documented in the [devguide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/get-workload-access-token.html), and **measured @2026-08-19** — this is now what this sample runs):
 
 > "Runtime automatically delivers workload access tokens to agent execution instances as payload headers, eliminating the need for manual token management in most scenarios."
 
@@ -76,10 +76,15 @@ The documented sequence: Runtime validates the inbound OAuth token (issuer, sign
 
 > "Runtime-managed agent identities cannot retrieve workload access tokens directly, preventing token extraction and misuse."
 
-Three practical notes:
+Measured details, beyond what the devguide states:
 
-- **`CUSTOM_JWT` and SigV4 invocation are mutually exclusive.** Turning it on means the caller stops using the `InvokeAgentRuntime` SDK call and sends `Authorization: Bearer` to the Runtime endpoint instead — a breaking cutover, not an additive hardening. This is why this sample still uses SigV4.
-- **Removing the manual call from agent code is not enforcement.** `GetWorkloadAccessTokenForUserId` remains callable by anything holding the execution role, so closing the impersonation surface requires **denying that action in IAM**, not just not calling it.
+- **The WAT arrives in three header aliases, same value** (2911 bytes in our case): `x-amzn-bedrock-agentcore-runtime-workload-accesstoken`, `x-amz-bedrock-agentcore-identity-wat`, `workloadaccesstoken`. Read whichever is present; do not assume one name.
+- **`Authorization` reaches the container too**, but only if the Runtime's `requestHeaderConfiguration.requestHeaderAllowlist` includes it. The WAT headers arrive regardless.
+- **`CUSTOM_JWT` and SigV4 invocation are mutually exclusive, and the error says so plainly**: `AccessDeniedException: Authorization method mismatch. The agent is configured for a different authorization method than what was used`. So the caller's switch to `Authorization: Bearer` and the authorizer change are one cutover, not an additive hardening.
+- **Removing the manual call from agent code is not enforcement.** `GetWorkloadAccessTokenForUserId` remains callable by anything holding the execution role, so closing the impersonation surface requires **denying that action in IAM**, not just not calling it. Deny `GetWorkloadAccessTokenForJWT` as well: possessing any user's JWT is itself enough to exchange for their vaulted token.
+- **The vault namespace follows the token's `sub`, and consent completion must match it.** Cognito's `sub` is a UUID while the username is `lark:{open_id}`, which is why the JWT-derived namespace is disjoint from `ForUserId`. A consent started from a JWT-derived WAT can only be completed with `userIdentifier={"userToken": <JWT>}`; passing `{"userId": <string>}` fails with `AccessDeniedException: Invalid or expired session` — a misleading message for what is an identity mismatch, not expiry.
+- **Migrating an existing deployment costs one re-consent per user.** Measured on a real user with a live grant: `ForUserId` returned the vaulted token, the platform-delivered WAT for the same person returned none plus an `authorizationUrl`. Nothing errors, so the only symptom is users being asked to authorise again.
+- **`UpdateAgentRuntime` replaces rather than patches.** Setting the authorizer without resending `environmentVariables` silently cleared all of them; the symptom was a `ValidationException` from `GetResourceOauth2Token` about a missing `ResourceOauth2ReturnUrl`. Read the current config back and resend artifact, role, network and env together.
 - `authorizerConfiguration` on a Runtime has exactly one shape, `customJWTAuthorizer` (`discoveryUrl` + `allowedAudience`/`allowedClients`/`allowedScopes`, plus optional custom claim matching) — verified from the `create-agent-runtime` API model. `UpdateAgentRuntime` accepts `authorizerConfiguration`, so switching does not require rebuilding the runtime.
 
 ## 3LO (per-user authorization) with a custom OAuth2 provider — the important one
@@ -149,7 +154,9 @@ Also note the OAuth Runtime target's error *changed* from `-32042` to the author
 
 **Consequence for this repo: the agent-side 3LO path stays.** A Runtime-hosted MCP server can only be reached over SigV4, so the per-user Lark token has to arrive some other way — here, the custom passthrough header. The managed Gateway path becomes available only by moving the MCP server off Runtime onto an addressable HTTPS endpoint (ALB / API Gateway / Fargate), which trades Runtime's session and scaling model for it.
 
-**Incidental finding: consent is per target, not per provider.** The two OAuth targets shared provider, scopes, grant and return URL, yet completing consent on one still left the other emitting `-32042` until separately authorised. Budget one consent per target per user, not one per provider.
+**Incidental finding, scoped narrowly: on the Gateway path, one consent did not cover a second target.** The two OAuth targets shared provider, scopes, grant and return URL, yet completing consent on one still left the other emitting `-32042` until separately authorised. Observed once, on Gateway targets only, and not narrowed further — treat it as a thing to check when planning a Gateway rollout, not an established rule.
+
+**This does not apply to the agent-driven path, where one vaulted token serves every downstream server.** There are no targets there: the agent fetches a single token per (workload, provider, scopes) and passes it to each MCP server in a header. Verified in real use @2026-08-19 — one consent, and the same turn used both the lark-cli and the approval MCP server, with later turns needing no re-consent.
 
 ## FINDING: AgentCore native 3LO WORKS end-to-end for a non-standard IdP (Lark) via the agent-driven path — measured
 

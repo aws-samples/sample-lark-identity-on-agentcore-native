@@ -87,6 +87,16 @@ async def handle_invocations(request: web.Request) -> web.Response:
     # AgentCore passes the runtime session id on every request (verified), which is
     # what lets this process report per-session age rather than only its own.
     sid = request.headers.get("x-amzn-bedrock-agentcore-runtime-session-id", "")
+    # Under CUSTOM_JWT inbound the Runtime validates the caller's JWT and hands us a
+    # workload access token derived from it. Three header aliases carry the same value
+    # (measured); read them in order and pass it down — using it instead of naming a
+    # user is what makes this turn's identity unforgeable. Empty under SigV4 inbound.
+    workload_token = next(
+        (request.headers[h] for h in (
+            "x-amzn-bedrock-agentcore-runtime-workload-accesstoken",
+            "x-amz-bedrock-agentcore-identity-wat",
+            "workloadaccesstoken",
+        ) if request.headers.get(h)), "")
     now = time.monotonic()
     if sid:
         if sid not in _session_first_seen and len(_session_first_seen) >= _SESSIONS_TRACKED:
@@ -116,7 +126,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
         idp = payload.get("message", "") or "lark"   # router sends the idp key here
         try:
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.reauth, actor_id, idp
+                None, agent_core.reauth, actor_id, idp, workload_token
             )
             return web.json_response(result)
         except Exception as e:
@@ -142,7 +152,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
             # chat later. Consent still comes back inline (see chat_async).
             result = await asyncio.get_event_loop().run_in_executor(
                 None, agent_core.chat_async, actor_id, message, chat_id, email,
-                mem_sid, msg_id, reaction_id, fresh_session,
+                mem_sid, msg_id, reaction_id, fresh_session, workload_token,
             )
             return web.json_response(result)
         except Exception as e:
@@ -160,7 +170,8 @@ async def handle_invocations(request: web.Request) -> web.Response:
             return web.json_response({"error": "message required"}, status=400)
         try:
             result = await asyncio.get_event_loop().run_in_executor(
-                None, agent_core.chat_result, actor_id, message, email, mem_sid
+                None, agent_core.chat_result, actor_id, message, email, mem_sid,
+                workload_token,
             )
             # {reply, needs_auth, auth_url?} — router drives the consent wait.
             return web.json_response(result)

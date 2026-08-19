@@ -18,11 +18,11 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `lark-agent-3lo`, workload `lark-agent-wl` |
 | AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `lark_agent_agent_mem` (STM) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
-| AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region). Not on the Lark tool path here — a choice, not a limitation: verified @2026-08-19 the Gateway does per-user 3LO for a `CustomOauth2` provider once its role has the Identity permissions | `stacks/gateway_stack.py`, `deploy.sh gateway` |
+| AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region). Not on the Lark tool path here, because it cannot be: verified @2026-08-19 the Gateway does per-user 3LO for a `CustomOauth2` provider, but only into an addressable HTTPS downstream — never into a Runtime-hosted MCP server | `stacks/gateway_stack.py`, `deploy.sh gateway` |
 
 ## One entrypoint, one identity
 
-> **Status (2026-07): this variant is chat-only and drives 3LO agent-side.** There is no web UI, and the Lark tools don't go through the Gateway — the agent fetches each user's token from the Token Vault itself and calls the lark-cli MCP server directly. **That is now a choice rather than a workaround:** verified @2026-08-19, the Gateway *does* perform per-user 3LO for a `CustomOauth2` provider once its execution role carries the Identity permissions (see [Two tool paths](#two-tool-paths-and-why)). The Gateway *is* used for web search, where there's no user identity to forward (see [Two tool paths](#two-tool-paths-and-why)). Sections marked *(legacy)* describe the interceptor/web-UI baseline of the sibling variant and are kept for contrast.
+> **Status (2026-08): chat-only, 3LO driven agent-side, inbound auth is `CUSTOM_JWT`.** There is no web UI, and the Lark tools don't go through the Gateway — the agent fetches each user's token from the Token Vault itself and calls the lark-cli MCP server directly. **That is required by the topology, not a preference:** verified @2026-08-19 the Gateway *does* perform per-user 3LO for a `CustomOauth2` provider, but it cannot deliver that token to an MCP server hosted on AgentCore Runtime (see [Two tool paths](#two-tool-paths-and-why)). The Gateway *is* used for web search, where there's no user identity to forward. The inbound hop router → Runtime carries a **signed per-user JWT**; see [Inbound identity](#inbound-identity-a-signed-jwt-and-what-that-does-and-does-not-buy). Sections marked *(legacy)* describe the interceptor/web-UI baseline of the sibling variant and are kept for contrast.
 
 ```
                     ┌──────────────────────────────┐        ┌──────────────────────────┐
@@ -31,15 +31,16 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
                     │  resolve → lark:{open_id}    │        │  MEMSESSION → memory id  │
                     │  chat commands (/auth …)     │        │  ALLOW      → allowlist  │
                     └──────────────┬───────────────┘        └──────────────────────────┘
-                     InvokeAgentRuntime (SigV4) — returns "accepted" at once;
-                     carries runtimeSessionId + memorySessionId + actorId + chatId
-                          ⚠ actorId is an unsigned string the Runtime cannot verify
-                            → see "The inbound hop is the weak link" below
+                     POST /invocations, Authorization: Bearer <user's JWT>
+                     — returns "accepted" at once; carries runtimeSessionId +
+                       memorySessionId + actorId + chatId
+                     the Runtime verifies the JWT and derives the workload token
+                       from it → see "Inbound identity" below
                                    ▼
         ┌────────────────────────────────────────────────────────┐
         │  Agent container (ARM64, AgentCore Runtime)            │     AgentCore Identity
         │   Strands agent, history in AgentCore Memory           │     Token Vault (3LO)
-        │   lark_3lo: ForUserId(actorId) → GetResourceOauth2Token │◀───▶ stores / refreshes
+        │   lark_3lo: platform WAT → GetResourceOauth2Token      │◀───▶ stores / refreshes
         │   the turn runs in the background; /ping = HealthyBusy │     THIS user's token
         └───┬───────────────────────────────────────────┬────────┘            ▲
             │ MCP over SigV4, user's Lark token         │ answer, when ready  │ RFC-6749
@@ -87,16 +88,16 @@ Inbound and outbound are **independent axes** — each can be configured without
 | Hop | Credential | Who verifies | Identity carried how |
 |---|---|---|---|
 | Lark → Router (webhook) | `X-Lark-Signature` + AES (encryptKey) | Router, fail-closed | `open_id` inside the decrypted event |
-| Router → agent Runtime | IAM SigV4 (`InvokeAgentRuntime`) | AgentCore (caller is an AWS principal) | **`actorId`, an unsigned payload string** ⚠ |
+| Router → agent Runtime | the user's Cognito **access** token (Bearer) | AgentCore Runtime's `customJWTAuthorizer` (signature + `allowedClients`) | the token's `sub`; the platform derives a workload access token from it and delivers it as a payload header |
 | Agent → lark-cli / approval Runtime | IAM SigV4 | AgentCore | n/a — the user's token rides a header (outbound concern) |
 
-The ⚠ is the one to notice: SigV4 authenticates *the router as an AWS principal*, not *the user*. Nothing verifies the `actorId` string — see [the inbound hop is the weak link](#the-inbound-hop-is-the-weak-link-and-what-production-should-do-instead) for what production should do instead.
+`actorId` is still in the payload, but it is now only a label for logs and Memory — the identity that decides *whose* token is fetched comes from the verified JWT, not from anything the payload asserts. See [Inbound identity](#inbound-identity-a-signed-jwt-and-what-that-does-and-does-not-buy).
 
 **Outbound — what credential leaves us, and who adjudicates access:**
 
 | Hop | Credential | Who adjudicates |
 |---|---|---|
-| Agent → AgentCore Identity | workload access token (from `ForUserId`) | AgentCore Identity |
+| Agent → AgentCore Identity | the workload access token the Runtime delivered (derived from the inbound JWT) | AgentCore Identity |
 | Agent → lark-cli Runtime | the user's Lark token in `X-Amzn-…-Custom-Lark-Token` | passed through; lark-cli uses it verbatim |
 | lark-cli → Lark REST | the user's **`user_access_token`** (Bearer) | **Lark** — returns only what that user can see |
 | approval server → Lark REST | the **app's** tenant token + a `user_id` argument | Lark checks task ownership, never consent (see [approvals](#a-third-path-approvals-where-the-users-identity-cannot-be-passed-through)) |
@@ -108,34 +109,35 @@ The last row is the pair worth holding onto: **replies go out as the app, tool c
 
 *(Legacy, for contrast with the sibling interceptor variant: Browser → `web_api /api/session` used a Cognito JWT on an API Gateway authorizer; Browser → Runtime used a SigV4 **presigned** WSS URL; Gateway → Tool Lambda used the Gateway IAM role with a Lambda resource policy. None of those hops exist here.)*
 
-## The inbound hop is the weak link, and what production should do instead
+## Inbound identity: a signed JWT, and what that does and does not buy
 
-Everything above is about the *outbound* hop — the user's own token reaching Lark, so Lark adjudicates. The inbound hop, router → Runtime, is where this sample is deliberately simpler than production should be, and it is worth stating plainly rather than leaving to be discovered.
+Everything above is about the *outbound* hop — the user's own token reaching Lark, so Lark adjudicates. This section is the inbound hop, router → Runtime, which decides something different: **whose** token the agent is able to fetch at all.
 
-**The limitation.** The router calls `InvokeAgentRuntime` with SigV4 and passes the user identity as `actorId`, a plain string in the payload. The Runtime cannot verify it. The agent then hands that string to `GetWorkloadAccessTokenForUserId`, which does not check whether the caller "owns" that user either — so whatever `actorId` the agent supplies is the identity it acts as. Any user who has consented once is reachable, with nobody present. Against a prompt-injected agent the only thing standing there is that the code doesn't do it: **discipline, not a cryptographic constraint**.
-
-Two narrower holes in the same area were real bugs and are fixed (see `fix(security)` in the history): a vaulted token is now confirmed to belong to the actor before use, because consent completion binds a token to the `userId` in the return-url `state` rather than to the account that actually signed in — so forwarding a consent link vaulted someone else's token under your name. Those were defects. What is described above is not; it is the shape of the design.
-
-**What production should do: move inbound auth to `CUSTOM_JWT`.** This closes the impersonation surface without switching to OBO, because the platform takes over the identity step. Per the [devguide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/get-workload-access-token.html): "Runtime automatically delivers workload access tokens to agent execution instances as payload headers." Configured that way, Runtime validates the inbound JWT's signature, reads `iss`/`sub`, calls `GetWorkloadAccessTokenForJWT` itself, and passes the resulting workload token to the agent — and, on the same page, "Runtime-managed agent identities cannot retrieve workload access tokens directly, preventing token extraction and misuse."
+**What it does.** The router mints a per-user Cognito access token (`sub` = `lark:{open_id}`, `lambda/router/cognito.py`) and invokes the Runtime over HTTPS with it as a Bearer. The Runtime's `customJWTAuthorizer` verifies the signature and `allowedClients`, then hands the container a workload access token derived from that identity, in a payload header. The agent uses what it was given; it never names a user, so there is nothing for it to substitute.
 
 ```
-  this sample                                production
-  ───────────                                ──────────
-  router ──SigV4──▶ Runtime                  router ──signs a user JWT──▶ Runtime
-     payload: actorId="lark:ou_A"               Authorization: Bearer <sub=lark:ou_A>
-                  │                                          │
-                  ▼                                          ▼
-  agent: ForUserId("lark:ou_A")              Runtime verifies → ForJWT → workload
-     ↑ a string; substitute ou_B and            token arrives in the payload header
-       you hold B's Lark token                agent: uses what it was given, cannot
-                                                choose someone else
+  router ──signs a user JWT──▶ Runtime          agent: uses the delivered workload token
+     Authorization: Bearer <sub=lark:ou_A>         ↑ cannot choose someone else, and
+                  │                                 GetWorkloadAccessTokenFor{UserId,JWT}
+                  ▼                                 is explicitly DENIED on its role
+  Runtime verifies → derives workload token
+     delivered as a payload header
 ```
 
-The pieces are mostly present already: the Cognito pool mints per-user JWTs under `lark:{open_id}` (`agent/identity.py`) and publishes a discovery document, and `scripts/provision.sh` already configures a `customJWTAuthorizer` in exactly this shape — for the Gateway. Four things would change: sign the JWT in the router; set `authorizerConfiguration.customJWTAuthorizer` on the agent Runtime (`UpdateAgentRuntime` accepts it, no rebuild); read the workload token from the payload header instead of calling `ForUserId`; and **deny `GetWorkloadAccessTokenForUserId` on the execution role** — code that no longer calls it is not a constraint, IAM is. Consent completion should likewise pass `userIdentifier.userToken` (a verified JWT) rather than `userId` (a string the caller asserts).
+Three details worth keeping, each measured rather than assumed:
 
-**Why this sample doesn't do it.** `CUSTOM_JWT` and SigV4 invocation are mutually exclusive: turning it on means the router must switch to a bearer-token call in the same change, so it is a breaking cutover rather than a hardening you can add alongside. For a reference implementation whose subject is the *outbound* per-user path, the simpler inbound hop keeps the demonstration legible.
+- **Three header aliases carry the same workload token** — `x-amzn-bedrock-agentcore-runtime-workload-accesstoken`, `x-amz-bedrock-agentcore-identity-wat`, `workloadaccesstoken`. `agent/server.py` reads them in that order.
+- **`CUSTOM_JWT` and SigV4 are mutually exclusive, with a clear error.** SigV4 against this Runtime now returns `AccessDeniedException: Authorization method mismatch`, which is why the router change and the authorizer change are one cutover, not two.
+- **Not calling the by-name APIs is not a constraint; IAM is.** The execution role carries an explicit `Deny` on `GetWorkloadAccessTokenForUserId` *and* `GetWorkloadAccessTokenForJWT` (`stacks/agentcore_stack.py`). ForJWT is denied too because holding any user's JWT is by itself enough to exchange for their vaulted token. Verified with `iam simulate-principal-policy`: both come back `explicitDeny`.
 
-**And it relocates trust rather than removing it.** In the event-driven approval flow nobody is present, so the router would sign a JWT for an absent person — "the app asserts it represents X" all over again, with the router as the trusted party instead of the agent. That is still a real improvement, since the router is small, runs no model and never sees untrusted input. But only OBO (`TOKEN_EXCHANGE`) makes impersonation cryptographically impossible: without the user's own token there is nothing to exchange.
+**Consent completion moved with it.** The vault namespace follows the token's `sub`, so a consent started from a JWT-derived workload token can only be completed by naming the user with their signed token: `userIdentifier={"userToken": …}`, not `{"userId": …}`. Passing the string fails with `AccessDeniedException: Invalid or expired session` — which reads like a timing problem and is really a namespace mismatch. Because only the router mints user JWTs, the shim's `/return` delegates completion to it synchronously (`_complete_consent`) rather than holding the password salt itself.
+
+**What it does not buy.** Two things are unchanged, and calling them out matters more than the win:
+
+1. **Trust is relocated, not removed.** In the event-driven approval flow nobody is present, so the router signs a JWT for an absent person — "the app asserts it represents X" again, with the router as the asserting party instead of the agent. This is a real improvement, because the router is small, runs no model and never touches untrusted input, which the agent cannot claim. It is not the same as proof. Only OBO (`TOKEN_EXCHANGE`) makes impersonation cryptographically impossible, and it needs an inbound user token to exchange — a Lark bot entrypoint carries none, so it does not apply here at all (see `docs/agentcore-behavior.md`).
+2. **A prompt-injected agent can still misuse the tools it has**, within that one user's own permissions. What closed is credential theft and impersonation, not over-broad action. That needs action-layer limits in code — which is what the approval server does (allowlist, amount ceiling, must hold the user's own grant), rather than leaving it to the model.
+
+**Migration cost, if you are moving an existing deployment.** `ForUserId` and JWT-derived vault keys are separate namespaces (measured both directions: the same real user's token was retrievable ForUserId and absent ForJWT). Existing grants are not inherited and nothing errors — users are simply asked to consent once more. Budget that window.
 
 ## Identity pass-through vs permission inheritance
 
@@ -267,13 +269,14 @@ sequenceDiagram
     L->>R: webhook event (AES-encrypted)
     R->>R: verify signature (fail-closed, 300 s replay window) → decrypt → actorId=lark:{open_id} → allowlist
     R->>R: park the turn (so consent can replay it) + react OnIt
-    R->>A: InvokeAgentRuntime (SigV4) — actorId in the payload, no user token
-    Note over R,A: SigV4 proves the ROUTER is an AWS principal — nothing verifies actorId itself
+    R->>R: mint this user's Cognito access token (sub=lark:{open_id})
+    R->>A: POST /invocations, Authorization: Bearer <user JWT> — no Lark token
+    Note over R,A: Runtime verifies the JWT, then delivers a workload token derived from it as a payload header
     end
 
     rect rgb(255, 244, 229)
-    Note over A,S: FIRST-USE CONSENT — driven by the agent (a choice; the Gateway can also do this, see Two tool paths)
-    A->>V: ForUserId(actorId) → GetResourceOauth2Token(USER_FEDERATION, customState=b64(actorId))
+    Note over A,S: FIRST-USE CONSENT — driven by the agent (the Gateway cannot reach a Runtime-hosted MCP server, see Two tool paths)
+    A->>V: GetResourceOauth2Token(USER_FEDERATION, customState=b64(actorId)) with the delivered workload token
     V-->>A: no token vaulted → authorizationUrl + sessionUri
     A-->>R: needs_auth + auth_url
     R->>U: post 点击授权 link (app tenant token), then poll the vault ≤45 s
@@ -288,7 +291,9 @@ sequenceDiagram
     S-->>V: unwrapped, standard OAuth response
     V-->>U: 302 → shim /return (session_id + state)
     U->>S: GET shim /return
-    S->>V: CompleteResourceTokenAuth(sessionUri, userId=b64decode(state)) → token vaulted
+    S->>R: _complete_consent(actorId=b64decode(state), sessionUri) — synchronous
+    R->>V: CompleteResourceTokenAuth(sessionUri, userToken=<this user's JWT>) → token vaulted
+    Note over S,R: userId would name the wrong vault namespace and fail as "Invalid or expired session"
     S->>R: poke _consent_resumed
     R->>R: claim the parked turn (atomic — the poll loop races this)
     R->>A: replay the message (fresh_session, so the unauthorized session is rebuilt)

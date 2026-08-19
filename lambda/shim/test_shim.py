@@ -132,17 +132,44 @@ def test_unsupported_grant():
     assert json.loads(r["body"])["error"] == "unsupported_grant_type"
 
 
-def test_return_url_completes_auth():
+def test_return_url_delegates_completion_to_the_router():
     # userId arrives via customState echoed back as `state`, base64url-encoded
     # (AgentCore rejects ':' in state). /return decodes it back.
+    #
+    # The shim does not complete the consent itself: the session belongs to the
+    # JWT-derived vault namespace, so it must be named by the user's signed token, and
+    # only the router mints those.
     import base64
     st = base64.urlsafe_b64encode(b"lark:ou_x").decode().rstrip("=")
-    with mock.patch.object(index, "_agentcore") as ac:
+    payload = mock.Mock()
+    payload.read.return_value = b'{"ok": true}'
+    with mock.patch.object(index, "_ROUTER_FUNCTION", "router-fn"), \
+         mock.patch.object(index, "_lambda") as lam:
+        lam.invoke.return_value = {"Payload": payload}
         r = index.handler(_evt("GET", "/return",
                                qs={"session_id": "sess-uri", "state": st}), None)
-    ac.complete_resource_token_auth.assert_called_once_with(
-        sessionUri="sess-uri", userIdentifier={"userId": "lark:ou_x"})
+    completes = [c for c in lam.invoke.call_args_list
+                 if b"_complete_consent" in c.kwargs["Payload"]]
+    assert len(completes) == 1
+    sent = json.loads(completes[0].kwargs["Payload"])
+    assert sent["actorId"] == "lark:ou_x" and sent["sessionUri"] == "sess-uri"
+    assert completes[0].kwargs["InvocationType"] == "RequestResponse"
     assert r["statusCode"] == 200 and "Authorized" in r["body"]
+
+
+def test_return_url_reports_a_failed_completion():
+    """A failed completion must not render "Authorized" — the user would walk away
+    thinking they had consented."""
+    import base64
+    st = base64.urlsafe_b64encode(b"lark:ou_x").decode().rstrip("=")
+    payload = mock.Mock()
+    payload.read.return_value = b'{"ok": false, "error": "AccessDeniedException: nope"}'
+    with mock.patch.object(index, "_ROUTER_FUNCTION", "router-fn"), \
+         mock.patch.object(index, "_lambda") as lam:
+        lam.invoke.return_value = {"Payload": payload}
+        r = index.handler(_evt("GET", "/return",
+                               qs={"session_id": "sess-uri", "state": st}), None)
+    assert r["statusCode"] == 502 and "AccessDeniedException" in r["body"]
 
 
 def test_return_url_missing_userid():

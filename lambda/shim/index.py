@@ -201,16 +201,14 @@ def handle_return(qs: dict) -> dict:
         return _resp(400, {"error": "missing session_id", "received": qs})
     if not user_id:
         return _resp(400, {"error": "missing state/uid (userId)", "received": qs})
-    try:
-        # CompleteResourceTokenAuth needs BOTH sessionUri and a userIdentifier struct.
-        _agentcore.complete_resource_token_auth(
-            sessionUri=session_id,
-            userIdentifier={"userId": user_id},
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.exception("CompleteResourceTokenAuth failed")
+    # Completion is delegated to the router, synchronously: the consent session lives in
+    # the JWT-derived vault namespace, so it can only be completed by naming the user
+    # with their signed token — and the router is the one component that mints those.
+    # Keeping the minting there also keeps the password salt out of this façade.
+    err = _complete_via_router(user_id, session_id)
+    if err:
         return {"statusCode": 502, "headers": {"Content-Type": "text/html"},
-                "body": f"<h3>Authorization failed</h3><p>{e}</p>"}
+                "body": f"<h3>Authorization failed</h3><p>{err}</p>"}
     # Tell the user in chat — the browser only sees this static page, and the
     # router can't reliably detect completion by polling (a re-auth keeps the old
     # token until the new one lands). This is the precise signal.
@@ -236,6 +234,27 @@ def _post_json(url: str, body: dict, bearer: str = "") -> dict:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         return json.loads(e.read().decode() or "{}")
+
+
+def _complete_via_router(actor_id: str, session_uri: str) -> str:
+    """Ask the router to complete this consent. Returns "" on success, else the error
+    to show the user. Synchronous — the browser is waiting on the answer."""
+    if not _ROUTER_FUNCTION:
+        return "router function not configured (ROUTER_FUNCTION_NAME)"
+    try:
+        resp = _lambda.invoke(
+            FunctionName=_ROUTER_FUNCTION,
+            InvocationType="RequestResponse",
+            Payload=json.dumps({"_complete_consent": True, "actorId": actor_id,
+                                "sessionUri": session_uri}).encode(),
+        )
+        out = json.loads(resp["Payload"].read().decode() or "{}")
+    except Exception as e:  # noqa: BLE001
+        logger.exception("router consent completion invoke failed")
+        return f"{type(e).__name__}: {e}"
+    if out.get("ok"):
+        return ""
+    return str(out.get("error") or out.get("errorMessage") or "unknown error")
 
 
 def _resume_router(actor_id: str) -> None:

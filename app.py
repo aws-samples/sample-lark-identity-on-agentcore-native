@@ -82,6 +82,10 @@ router = RouterStack(
     runtime_endpoint_qualifier=ctx("runtime_endpoint_id") or "DEFAULT",
     lark_secret_name=security.lark_secret.secret_name,
     shim_return_url=shim.return_url,
+    user_pool_id=security.user_pool_id,
+    user_pool_arn=security.user_pool_arn,
+    user_pool_client_id=security.user_pool_client_id,
+    cognito_password_secret_name=security.cognito_password_secret.secret_name,
     env=env,
 )
 

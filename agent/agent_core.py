@@ -101,7 +101,8 @@ def _make_session_manager(actor_id: str, session_id: str):
     return AgentCoreMemorySessionManager(cfg, region_name=_REGION)
 
 
-def _build_session(actor_id: str, email: str, mem_sid: str) -> dict:
+def _build_session(actor_id: str, email: str, mem_sid: str,
+                   workload_token: str = "") -> dict:
     """Build a session for this user. Agent-side 3LO: fetch the user's vaulted Lark
     token if there is one and open an MCP client to lark-mcp (SigV4 + token in the
     custom header), entered once and kept open for the session.
@@ -117,7 +118,8 @@ def _build_session(actor_id: str, email: str, mem_sid: str) -> dict:
     auth_url = None
     identity_error = None
     try:
-        kind, value = lark_3lo.get_user_lark_token(actor_id)
+        kind, value = lark_3lo.get_user_lark_token(
+            actor_id, workload_token=workload_token)
     except Exception as e:  # noqa: BLE001 — never crash the turn on identity hiccups
         log.exception("3LO token lookup failed for %s", actor_id)
         kind, value = "error", str(e)
@@ -227,7 +229,8 @@ _IDENTITY_ERROR = (
 )
 
 
-def _get_session(actor_id: str, email: str, mem_sid: str, fresh: bool = False) -> dict:
+def _get_session(actor_id: str, email: str, mem_sid: str, fresh: bool = False,
+                 workload_token: str = "") -> dict:
     """Return the cached session for this user, rebuilding it if absent or near
     token expiry. A pending-authorization session (no token yet) is NOT cached —
     so the next turn re-checks the vault and picks up a freshly consented token."""
@@ -261,19 +264,20 @@ def _get_session(actor_id: str, email: str, mem_sid: str, fresh: bool = False) -
                         s[key].__exit__(None, None, None)  # close the stale connection
                     except Exception:
                         pass
-        s = _build_session(actor_id, email, mem_sid)
+        s = _build_session(actor_id, email, mem_sid, workload_token)
         if not s.get("identity_error"):
             _sessions[cache_key] = s
         return s
 
 
 def chat_result(actor_id: str, message: str, email: str = "",
-                mem_sid: str = "") -> dict:
+                mem_sid: str = "", workload_token: str = "") -> dict:
     """Non-streaming chat → {reply, needs_auth, auth_url}. History via Memory.
     When the user hasn't authorized Lark yet, needs_auth is True and auth_url is
     the raw consent URL, so the caller (router) can drive the wait-for-consent
     loop instead of asking the user to re-send."""
-    s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id))
+    s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id),
+                     workload_token=workload_token)
     if s.get("identity_error"):
         # Answer without tools, but say so — silently degrading is what made a
         # missing IAM permission look like the model choosing not to help.
@@ -294,7 +298,7 @@ def run_chat(actor_id: str, message: str, email: str = "",
 
 def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
                mem_sid: str = "", message_id: str = "", reaction_id: str = "",
-               fresh_session: bool = False) -> dict:
+               fresh_session: bool = False, workload_token: str = "") -> dict:
     """Accept the work and answer later.
 
     A real task can outlast any request/response window (InvokeAgentRuntime caps at
@@ -307,7 +311,7 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     one. By then the router has returned, so the prompt is pushed to the chat like
     any other answer and the user re-sends after approving."""
     s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id),
-                     fresh=fresh_session)
+                     fresh=fresh_session, workload_token=workload_token)
     if s.get("identity_error"):
         return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
                 "needs_auth": False, "identity_error": s["identity_error"]}
@@ -423,7 +427,7 @@ def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
     return text
 
 
-def reauth(actor_id: str, idp: str = "lark") -> dict:
+def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
     """Start a fresh 3LO flow for `idp` even when a token is already vaulted →
     {auth_url}. Authorization is per-IdP; only "lark" is wired up so far (add a
     module like lark_3lo for each new downstream system)."""
@@ -438,7 +442,8 @@ def reauth(actor_id: str, idp: str = "lark") -> dict:
                     s["mcp"].__exit__(None, None, None)
                 except Exception:
                     pass
-    kind, value = lark_3lo.get_user_lark_token(actor_id, force=True)
+    kind, value = lark_3lo.get_user_lark_token(actor_id, force=True,
+                                               workload_token=workload_token)
     if kind == "auth_url":
         return {"reply": _AUTH_PROMPT.format(url=value),
                 "needs_auth": True, "auth_url": value}

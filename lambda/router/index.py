@@ -17,10 +17,15 @@ import os
 import re
 import time
 
+import urllib.error
+import urllib.parse
+import urllib.request
+
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ReadTimeoutError
 
+import cognito
 import lark
 import identity
 
@@ -48,6 +53,13 @@ agentcore = boto3.client(
     config=Config(read_timeout=READ_TIMEOUT, connect_timeout=10, retries=_RETRIES),
 )
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
+
+# The Runtime is invoked over plain HTTPS with the user's own JWT, not through the SDK
+# with SigV4 — a CUSTOM_JWT runtime rejects SigV4 outright ("Authorization method
+# mismatch"), so the two are alternatives, never a fallback pair.
+_RUNTIME_URL = (f"https://bedrock-agentcore.{AWS_REGION}.amazonaws.com/runtimes/"
+                f"{urllib.parse.quote(RUNTIME_ARN, safe='')}/invocations"
+                f"?qualifier={urllib.parse.quote(QUALIFIER)}")
 
 
 # ------------------------------- invoke agent -------------------------------
@@ -77,19 +89,28 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
         # Consent-resume: force a rebuilt session so the new token is used.
         "freshSession": fresh_session,
     }).encode()
-    client = agentcore
-    if budget is not None:
-        client = boto3.client(
-            "bedrock-agentcore", region_name=AWS_REGION,
-            config=Config(read_timeout=max(int(budget), 10), connect_timeout=10,
-                          retries=_RETRIES),
-        )
-    resp = client.invoke_agent_runtime(
-        agentRuntimeArn=RUNTIME_ARN, qualifier=QUALIFIER,
-        runtimeSessionId=session_id, runtimeUserId=actor_id,
-        payload=payload, contentType="application/json", accept="application/json",
+    req = urllib.request.Request(
+        _RUNTIME_URL, data=payload, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # The identity of this turn, signed. The Runtime validates it and hands the
+            # agent a workload access token derived from it — the agent cannot name a
+            # different user, because it never gets to state one.
+            "Authorization": f"Bearer {cognito.user_jwt(actor_id)}",
+            "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id,
+        },
     )
-    raw = resp["response"].read().decode() if hasattr(resp["response"], "read") else resp["response"]
+    timeout = max(int(budget), 10) if budget is not None else READ_TIMEOUT
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:400]
+        logger.error("runtime HTTP %s for %s: %s", e.code, actor_id, body)
+        raise
+    except TimeoutError as e:  # urllib surfaces a socket timeout as this
+        raise ReadTimeoutError(endpoint_url=_RUNTIME_URL) from e
     try:
         data = json.loads(raw)
     except Exception:
@@ -207,13 +228,17 @@ def user_token_vaulted(actor_id: str, idp_key: str = "lark") -> bool:
     """True once this user's token for `idp_key` is in the Token Vault (consent
     complete). Same USER_FEDERATION sequence the agent uses; presence check only.
     ResourceOauth2ReturnUrl is required even for a presence check — without a
-    valid token AgentCore refuses the call rather than returning empty."""
+    valid token AgentCore refuses the call rather than returning empty.
+
+    Keyed ForJWT, matching what the agent sees. The vault namespace follows the
+    token's `sub`, so a ForUserId-derived check would look in a different namespace
+    and report "not consented" forever."""
     idp = IDPS.get(idp_key)
     if not idp:
         return False
     try:
-        wat = agentcore.get_workload_access_token_for_user_id(
-            workloadName=AGENT_WORKLOAD_NAME, userId=actor_id
+        wat = agentcore.get_workload_access_token_for_jwt(
+            workloadName=AGENT_WORKLOAD_NAME, userToken=cognito.user_jwt(actor_id),
         )["workloadAccessToken"]
         kwargs = dict(
             workloadIdentityToken=wat,
@@ -242,6 +267,23 @@ def wait_for_consent(actor_id: str) -> bool:
             return True
         time.sleep(AUTH_POLL_INTERVAL)
     return False
+
+
+# --------------------------- consent completion -----------------------------
+
+def complete_consent(actor_id: str, session_uri: str) -> None:
+    """Bind a finished 3LO consent to this user's signed identity.
+
+    Called by the shim's /return, which owns the browser redirect but deliberately not
+    the identity: minting user JWTs stays in one place. `userToken`, not `userId` — the
+    consent session belongs to the JWT-derived vault namespace, and naming the user by
+    string instead fails with `AccessDeniedException: Invalid or expired session`, which
+    reads like a timing problem and is really a namespace mismatch (measured)."""
+    agentcore.complete_resource_token_auth(
+        sessionUri=session_uri,
+        userIdentifier={"userToken": cognito.user_jwt(actor_id)},
+    )
+    logger.info("consent completed for %s", actor_id)
 
 
 # ----------------------------- consent resume -------------------------------
@@ -625,6 +667,21 @@ def handler(event, context):
     if event.get("_async_dispatch"):
         logger.info("async dispatch: processing lark event")
         process_lark_event(event["body"], event.get("headers", {}), context)
+        return {"ok": True}
+
+    # Consent-completion path: the shim's /return calls us synchronously, because only
+    # the router mints user JWTs and the completion must name the user by token.
+    # Answered with ok/error so the shim can render an honest page.
+    if event.get("_complete_consent"):
+        actor_id = event.get("actorId", "")
+        session_uri = event.get("sessionUri", "")
+        if not (actor_id and session_uri):
+            return {"ok": False, "error": "actorId and sessionUri required"}
+        try:
+            complete_consent(actor_id, session_uri)
+        except Exception as e:  # noqa: BLE001 — reported to the browser, not swallowed
+            logger.exception("consent completion failed for %s", actor_id)
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
         return {"ok": True}
 
     # Consent-resume path: the shim invokes us here after a user finishes 3LO, so the

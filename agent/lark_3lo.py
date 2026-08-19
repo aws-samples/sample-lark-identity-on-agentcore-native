@@ -102,19 +102,32 @@ def _belongs_to(token: str, actor_id: str) -> bool:
     return True
 
 
-def get_user_lark_token(actor_id: str, force: bool = False) -> tuple[str, str]:
+def get_user_lark_token(actor_id: str, force: bool = False,
+                        workload_token: str = "") -> tuple[str, str]:
     """Return ("token", <lark token>) if vaulted, else ("auth_url", <url>).
 
-    actor_id is "lark:{open_id}" — the same id the token was (or will be) vaulted
-    under, carried through as customState so the shim /return can complete it.
-    force=True always starts a fresh 3LO flow, ignoring any vaulted token.
+    actor_id is "lark:{open_id}" — carried through as customState so the return-url can
+    complete the consent. force=True always starts a fresh 3LO flow, ignoring any
+    vaulted token.
+
+    `workload_token` is the workload access token the Runtime delivered with this
+    request, derived from the caller's verified JWT. Passing it is what makes the
+    identity unforgeable: this code never gets to *name* a user, it can only use the one
+    the platform already authenticated. Absent it (no CUSTOM_JWT inbound) we fall back to
+    deriving one from actor_id, which is a trusted-caller assumption — and a different
+    vault namespace, so the two are not interchangeable for an existing deployment.
 
     A vaulted token is used only after it is confirmed to be this actor's own; one
     that isn't gets discarded in favour of a fresh consent flow (see _belongs_to).
     """
-    wat = _agentcore.get_workload_access_token_for_user_id(
-        workloadName=_WORKLOAD, userId=actor_id
-    )["workloadAccessToken"]
+    if workload_token:
+        wat = workload_token
+    else:
+        log.warning("no platform workload token for %s — falling back to ForUserId",
+                    actor_id)
+        wat = _agentcore.get_workload_access_token_for_user_id(
+            workloadName=_WORKLOAD, userId=actor_id
+        )["workloadAccessToken"]
     kwargs = dict(
         workloadIdentityToken=wat,
         resourceCredentialProviderName=_PROVIDER,
@@ -134,7 +147,8 @@ def get_user_lark_token(actor_id: str, force: bool = False) -> tuple[str, str]:
         # out: the wrong token stays in the vault, so without forcing a fresh flow the
         # next call would fetch it right back. Guarded against recursion by `force`.
         if not force:
-            return get_user_lark_token(actor_id, force=True)
+            return get_user_lark_token(actor_id, force=True,
+                                       workload_token=workload_token)
         log.error("fresh authorization still produced a token for another account")
     return "auth_url", resp["authorizationUrl"]
 

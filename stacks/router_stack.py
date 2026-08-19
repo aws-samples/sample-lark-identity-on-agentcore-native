@@ -36,6 +36,10 @@ class RouterStack(Stack):
         runtime_endpoint_qualifier: str,
         lark_secret_name: str,
         shim_return_url: str,
+        user_pool_id: str,
+        user_pool_arn: str,
+        user_pool_client_id: str,
+        cognito_password_secret_name: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -100,6 +104,10 @@ class RouterStack(Stack):
                 # Per-IdP registry for /auth; written by scripts/setup-3lo.sh.
                 "IDP_REGISTRY": self.node.try_get_context("idp_registry") or "",
                 "SHIM_RETURN_URL": shim_return_url,
+                # Token factory: the router signs each turn's identity (see cognito.py).
+                "COGNITO_USER_POOL_ID": user_pool_id,
+                "COGNITO_CLIENT_ID": user_pool_client_id,
+                "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
             },
             log_group=log_group,
         )
@@ -133,17 +141,9 @@ class RouterStack(Stack):
             )
 
         # --- IAM ---
-        self.router_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                # ForUser is required whenever the X-Amzn-...-Runtime-User-Id
-                # header is set (we pass runtimeUserId=actor_id).
-                actions=[
-                    "bedrock-agentcore:InvokeAgentRuntime",
-                    "bedrock-agentcore:InvokeAgentRuntimeForUser",
-                ],
-                resources=[runtime_arn, f"{runtime_arn}/*"],
-            )
-        )
+        # No InvokeAgentRuntime here: the runtime is reached over HTTPS with the user's
+        # own JWT, and a CUSTOM_JWT runtime refuses SigV4 anyway. Authorization for that
+        # hop is the token, not this role.
         self.identity_table.grant_read_write_data(self.router_fn)
         self.router_fn.add_to_role_policy(
             iam.PolicyStatement(
@@ -163,15 +163,36 @@ class RouterStack(Stack):
         )
         # 3LO consent-wait: check the vault for the user's Lark token (same
         # USER_FEDERATION sequence the agent uses) so the router can hold and
-        # re-invoke once consent completes, sparing the user a re-send.
+        # re-invoke once consent completes, sparing the user a re-send. Also completes
+        # the consent itself — see complete_consent in the router.
+        #
+        # ForJWT, and deliberately NOT ForUserId: the router mints the user's JWT, so it
+        # needs no by-name path, and the vault namespace follows the token's `sub`.
+        # This is the trust the design relocates here — the router is small, runs no
+        # model and never sees untrusted input, which the agent cannot claim.
         self.router_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=[
-                    "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+                    "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
                     "bedrock-agentcore:GetWorkloadAccessToken",
                     "bedrock-agentcore:GetResourceOauth2Token",
+                    "bedrock-agentcore:CompleteResourceTokenAuth",
                 ],
                 resources=["*"],
+            )
+        )
+
+        # Token factory: mint a per-user Cognito access token, so every downstream hop
+        # verifies a signature instead of trusting a string.
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "cognito-idp:AdminGetUser",
+                    "cognito-idp:AdminCreateUser",
+                    "cognito-idp:AdminSetUserPassword",
+                    "cognito-idp:AdminInitiateAuth",
+                ],
+                resources=[user_pool_arn],
             )
         )
 

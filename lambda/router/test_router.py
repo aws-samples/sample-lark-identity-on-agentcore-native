@@ -618,3 +618,65 @@ def test_dm_target_is_inferred_from_the_id_shape(lark_mod):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ---------------- signed inbound identity (CUSTOM_JWT cutover) ----------------
+
+def test_invoke_agent_carries_the_users_signed_identity_not_a_string():
+    """The whole point of the cutover: the runtime hop is authorised by the user's own
+    JWT. A payload string naming a user would be forgeable; a signature is not — and the
+    agent never receives an actorId it could substitute for someone else's."""
+    import index
+    captured = {}
+
+    class FakeResp:
+        def read(self): return b'{"reply": "ok"}'
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["headers"] = {k.lower(): v for k, v in req.headers.items()}
+        captured["body"] = json.loads(req.data)
+        return FakeResp()
+
+    with mock.patch.object(index.cognito, "user_jwt", return_value="JWT-FOR-U") as mint, \
+         mock.patch.object(index.urllib.request, "urlopen", fake_urlopen), \
+         mock.patch.object(index, "agentcore") as ac:
+        out = index.invoke_agent("sess-0123456789abcdef0123456789abcdef",
+                                 "user_1", "lark:ou_u", "hello")
+
+    assert out == {"reply": "ok"}
+    mint.assert_called_once_with("lark:ou_u")
+    assert captured["headers"]["authorization"] == "Bearer JWT-FOR-U"
+    # SigV4 must not be used at all — a CUSTOM_JWT runtime rejects it outright.
+    ac.invoke_agent_runtime.assert_not_called()
+    assert "/invocations" in captured["url"]
+    assert captured["body"]["actorId"] == "lark:ou_u"
+
+
+def test_complete_consent_names_the_user_by_token_not_by_id():
+    """A consent session started from a JWT-derived workload token can only be completed
+    with that identity. Passing userId fails as `Invalid or expired session`, which reads
+    like a timing bug and is really a namespace mismatch (measured)."""
+    import index
+    with mock.patch.object(index.cognito, "user_jwt", return_value="JWT-FOR-U"), \
+         mock.patch.object(index, "agentcore") as ac:
+        index.complete_consent("lark:ou_u", "sess-uri")
+    ac.complete_resource_token_auth.assert_called_once_with(
+        sessionUri="sess-uri", userIdentifier={"userToken": "JWT-FOR-U"})
+
+
+def test_vault_check_uses_the_jwt_namespace():
+    """The vault key follows the token's `sub`, so the router must ask ForJWT. Checking
+    ForUserId would consult a different namespace and report "never consented" forever,
+    leaving the user in an endless consent loop."""
+    import index
+    with mock.patch.object(index.cognito, "user_jwt", return_value="JWT-FOR-U"), \
+         mock.patch.object(index, "agentcore") as ac:
+        ac.get_workload_access_token_for_jwt.return_value = {"workloadAccessToken": "WAT"}
+        ac.get_resource_oauth2_token.return_value = {"accessToken": "lark-token"}
+        assert index.user_token_vaulted("lark:ou_u") is True
+    ac.get_workload_access_token_for_jwt.assert_called_once()
+    assert ac.get_workload_access_token_for_jwt.call_args.kwargs["userToken"] == "JWT-FOR-U"
+    assert not ac.get_workload_access_token_for_user_id.called
