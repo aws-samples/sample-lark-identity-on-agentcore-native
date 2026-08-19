@@ -101,7 +101,11 @@ const server = http.createServer((req, res) => {
         + `content-type=${req.headers['content-type'] || '(none)'} token=${userToken ? 'yes' : 'no'}`);
       res.writeHead(400); res.end('bad json'); return;
     }
-    console.log(`inbound ${req.method} ${req.url} mcp=${mcp.method || '(none)'} token=${userToken ? 'yes' : 'no'}`);
+    // Scheme only, never the credential: AWS4-HMAC-SHA256 means the transport signed this,
+    // Bearer means a per-user token was injected — the distinction this log exists for.
+    const authScheme = String(req.headers['authorization'] || '').split(' ')[0] || '(none)';
+    console.log(`inbound ${req.method} ${req.url} mcp=${mcp.method || '(none)'} `
+      + `token=${userToken ? 'yes' : 'no'} auth=${authScheme}`);
 
     if (mcp.method === 'initialize') {
       return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
