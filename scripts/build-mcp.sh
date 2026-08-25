@@ -186,7 +186,7 @@ ROLE_ARN="$(aws cloudformation describe-stacks --stack-name "$PREFIX-agentcore" 
 ARTIFACT="{\"containerConfiguration\":{\"containerUri\":\"$ECR:$TAG\"}}"
 HEADERS='{"requestHeaderAllowlist":["X-Amzn-Bedrock-AgentCore-Runtime-Custom-Lark-Token"]}'
 # Container env from the server's RUNTIME_ENV_MAP ("CONTAINER_KEY=SOURCE_VAR" pairs).
-# Emitted as JSON because a value may contain commas (the approval allow-list does),
+# Emitted as JSON because a value may contain commas,
 # and the CLI's key=value shorthand splits on those and mangles the whole map.
 ENVVARS="$(MAP="$RUNTIME_ENV_MAP" uv run python -c '
 import json, os

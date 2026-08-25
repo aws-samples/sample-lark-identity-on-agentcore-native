@@ -12,7 +12,7 @@ No AWS needed; everything is mocked. The tests themselves live next to the code 
 
 Two constraints shape what these can cover:
 
-- `agent_core` and `websearch` import `strands`/`mcp`, whose wheels target the ARM64 runtime and don't install on a typical x86 test host. Logic from those modules is either exec'd in isolation (see `_load_busy_helpers`) or asserted against the source text.
+- `agent_core` imports `strands`/`mcp`, whose wheels target the ARM64 runtime and don't install on a typical x86 test host. Logic from those modules is either exec'd in isolation (see `_load_busy_helpers`) or asserted against the source text.
 - Handlers that are mostly a sequence of AWS calls (`/reset`, `/new`, `/reconnect`, `/clear`) are left to the e2e path — mocking them would largely assert the mocks. The parts that actually carry risk are covered directly instead: Memory-thread rotation, conversational-only event counting, and the IdP registry's fallback.
 
 ## E2E smoke tests — need a deployed stack

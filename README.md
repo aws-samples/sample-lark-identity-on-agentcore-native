@@ -28,7 +28,7 @@ This is the **AgentCore Identity** variant: per-user Lark tokens live in the **A
   worse than waiting — the work has usually already succeeded.
 
   First use needs consent: with no vaulted token the router posts a 点击授权 link, waits for
-  approval, and continues on its own, so the user never re-sends.
+  the user to authorize, and continues on its own, so the user never re-sends.
 ```
 
 See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop auth, and the consent-wait sequence; **[docs/agentcore-behavior.md](docs/agentcore-behavior.md)** and **[docs/native-3lo-builtin-vendor.md](docs/native-3lo-builtin-vendor.md)** for why 3LO is agent-side (a choice — the Gateway can do per-user 3LO for a `CustomOauth2` provider once its role has the Identity permissions, verified @2026-08-19) and how to add other downstream systems.
@@ -37,18 +37,18 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 
 | Path | What |
 |---|---|
-| `app.py`, `cdk.json` | CDK app (uv-managed deps) — 6 stacks. Deployment state goes to `.cdk-state.json`, not here |
+| `app.py`, `cdk.json` | CDK app (uv-managed deps) — 5 stacks. Deployment state goes to `.cdk-state.json`, not here |
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
-| `stacks/` | security, agentcore, router, shim, gateway, observability |
-| `agent/` | Strands agent container: HTTP contract + AgentCore Memory + agent-side 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers back into a card (`lark_notify`) |
+| `stacks/` | security, agentcore, router, shim, observability |
+| `agent/` | Strands agent container: HTTP contract + AgentCore Memory + agent-side 3LO (`lark_3lo`) + an MCP client for the lark-cli server; runs turns in the background and streams answers back into a card (`lark_notify`) |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
-| `mcp-servers/` | One directory per MCP server, one Runtime each: `lark-cli/` acts as the user against Lark, `approval/` runs approval decisions on the app identity. Each declares its own build/runtime config in `runtime.env`, so adding a server needs no script change |
+| `mcp-servers/` | One directory per MCP server, one Runtime each; `lark-cli/` acts as the user against Lark. Each declares its own build/runtime config in `runtime.env`, so adding a server needs no script change |
 | `deploy.sh` | the deploy entry point — orders the steps in `scripts/` |
-| `scripts/` | step implementations: preflight / provision (base/runtime/gateway) / build-mcp / setup-3lo / setup-lark / subscribe-approvals / manage-allowlist / destroy |
+| `scripts/` | step implementations: preflight / provision (base/runtime) / build-mcp / setup-3lo / setup-lark / manage-allowlist / destroy |
 | `tests/` | `run.sh` (all unit suites) + e2e smoke tests that need a deployed stack |
 | `docs/architecture.md` | full architecture (core flow updated to the native path; some sections marked legacy) |
-| `docs/agentcore-behavior.md` | measured AgentCore Gateway/Runtime behavior, incl. the IAM permissions Gateway per-user 3LO actually needs |
+| `docs/agentcore-behavior.md` | measured AgentCore Runtime/Gateway behavior — including why a Gateway cannot deliver a per-user token to a Runtime-hosted MCP server, which is what decides the design here |
 | `docs/native-3lo-builtin-vendor.md` | reusable agent-driven 3LO reference (built-in vendors **and** CustomOauth2) — how to add a downstream system |
 
 ## Deploy
@@ -60,27 +60,23 @@ cp .env.example .env          # deployment target (PROFILE/REGION/MODEL_ID) + La
 ./deploy.sh                   # everything, in order — ends by printing the two URLs to register in Lark
 ```
 
-That's the whole deploy. It runs six steps in dependency order and nothing stops to ask you anything: the two values you must paste into the Lark console don't block the deploy, they only gate the bot at runtime, so they're printed together at the end (`./deploy.sh urls` reprints them).
+That's the whole deploy. It runs five steps in dependency order and nothing stops to ask you anything: the two values you must paste into the Lark console don't block the deploy, they only gate the bot at runtime, so they're printed together at the end (`./deploy.sh urls` reprints them).
 
 Individual steps, for iterating — each is idempotent, so re-running any of them is safe:
 
 | Step | What |
 |---|---|
-| `./deploy.sh base` | CDK stacks (security, agentcore, router, shim, gateway, observability) |
-| `./deploy.sh mcp` | build every MCP server under `mcp-servers/` (CodeBuild ARM64) + create/update a Runtime each. `./deploy.sh mcp approval` for just one |
+| `./deploy.sh base` | CDK stacks (security, agentcore, router, shim, observability) |
+| `./deploy.sh mcp` | build every MCP server under `mcp-servers/` (CodeBuild ARM64) + create/update a Runtime each. `./deploy.sh mcp lark-cli` for just one |
 | `./deploy.sh 3lo` | workload identity + the `lark-agent-3lo` OAuth credential provider |
-| `./deploy.sh gateway` | Web Search gateway in us-east-1 — skipped unless `WEB_SEARCH=true` |
 | `./deploy.sh runtime` | build the agent image + deploy the agent Runtime |
 | `./deploy.sh lark` | seed Lark credentials to Secrets Manager + allowlist your `open_id` |
-| `./deploy.sh approvals` | subscribe to Lark approval events for each `AGENT_DECIDE_APPROVAL_CODES` definition — no-op when that is empty. Ticking the event in the console is **not** sufficient; Lark delivers approval events only for definitions also subscribed through the API |
 
-Order matters in one place: `3lo` and `gateway` precede `runtime`, because the agent Runtime is created with the provider name and the gateway URL baked into its environment. `deploy.sh` handles that; the underlying implementations are in `scripts/`.
+Order matters in one place: `3lo` precedes `runtime`, because the agent Runtime is created with the provider name and workload baked into its environment. `deploy.sh` handles that; the underlying implementations are in `scripts/`.
 
 `setup-3lo.sh` registers the OAuth credential provider (Lark behind the RFC-6749 shim) plus the agent's workload identity, and prints the provider `callbackUrl` — register that in the Lark console (step 4 below) before the first 3LO consent. See `docs/native-3lo-builtin-vendor.md` to add other downstream systems.
 
-Per-deployment ids (runtime/gateway) go to `.cdk-state.json` (gitignored), so `cdk.json` stays free of environment state.
-
-Optional web search: set `WEB_SEARCH=true` in `.env` before deploying (or run `./deploy.sh gateway` then `./deploy.sh runtime`). That provisions a Gateway fronting AgentCore's built-in Web Search connector — **in us-east-1, the only region offering it**, so the agent calls it cross-region. Search carries no end-user identity, so it uses `GATEWAY_IAM_ROLE` and never touches the per-user 3LO path the Lark tools have to avoid. Off by default; the agent just runs without the tool.
+Per-deployment ids (runtime, memory) go to `.cdk-state.json` (gitignored), so `cdk.json` stays free of environment state.
 
 ### Tear down
 
@@ -89,7 +85,7 @@ scripts/destroy.sh            # delete everything deploy.sh created (asks for co
 # or: scripts/destroy.sh --yes  # skip the prompt
 ```
 
-Deletes in dependency order — gateway targets → gateways (including the Web Search one in us-east-1) → both CLI-created Runtimes → the CDK stacks → the OAuth credential provider and workload identity. Idempotent: re-running skips already-gone resources.
+Deletes in dependency order — both CLI-created Runtimes → the CDK stacks → the OAuth credential provider and workload identity. Idempotent: re-running skips already-gone resources.
 
 Two consequences worth knowing: deleting the provider **purges every user's vaulted token**, so everyone consents again after a redeploy — and the new provider gets a **new `callbackUrl`** that must be registered in the Lark console (`scripts/setup-3lo.sh` prints it). Your Lark console app config is otherwise untouched; re-seed credentials from `.env` via `scripts/setup-lark.sh`.
 
@@ -120,36 +116,9 @@ Two consequences worth knowing: deleting the provider **purges every user's vaul
    | `offline_access` | issue a refresh token, so the vaulted grant survives without re-consent |
 
    Nothing in the first group can read a user's documents, and nothing in the second is ever used to speak as the bot — `LARKSUITE_CLI_DEFAULT_AS=user` keeps the MCP server on the user's token exclusively.
-3. **Events & Callbacks**: Request URL = the webhook URL from deploy output; enable Encryption; add `im.message.receive_v1`. For the approval demo also add **审批任务状态变更** (`approval_task`) — and note that ticking it here is not enough on its own, see below.
+3. **Events & Callbacks**: Request URL = the webhook URL from deploy output; enable Encryption; add `im.message.receive_v1` on its own, see below.
 4. **Security Settings → Redirect URLs**: add the OAuth credential provider's `callbackUrl` (`https://bedrock-agentcore.<region>.amazonaws.com/identities/oauth2/callback/<uuid>`, from `get-oauth2-credential-provider --name lark-agent-3lo`). This is where AgentCore Identity receives the 3LO code — not the shim URL.
 5. **Publish** a version (re-publish after any scope/event change).
-
-### Optional: the approval demo
-
-Off by default. It shows what to do when a downstream API *refuses* to accept the user's identity — Lark's approval endpoints take only an app token, so a decision is made by the app with a `user_id` saying whose name to record it under. Read [docs/architecture.md](docs/architecture.md#a-third-path-approvals-where-the-users-identity-cannot-be-passed-through) before switching it on: the limits are self-imposed, and what they can and cannot prevent is the point of the demo.
-
-To enable:
-
-1. Add the approval scopes and the `approval_task` event from step 3 above, then re-publish. The console lists these by display name, so both are given here:
-
-   | Scope | Type | Display name | Used for |
-   |---|---|---|---|
-   | `approval:approval` | tenant | View, create, update, and delete info of Approval app | making decisions (approve/reject/transfer) |
-   | `approval:approval:readonly` | tenant | Access Approval | reading instances and queues |
-
-   The `approval_task` event accepts **either** of those two (the console shows "any one suffices"), so nothing extra is needed to receive events.
-2. Set the limits in `.env` — the agent decides nothing until you do:
-   ```
-   AGENT_DECIDE_APPROVAL_CODES="<definitionCode>, ..."   # empty = decide nothing
-   AGENT_DECIDE_MAX_AMOUNT=1000                          # 0 = kill switch
-   ```
-   The definition code is the `definitionCode=` query parameter in the URL of a form's edit page in the Lark approval admin.
-3. `./deploy.sh mcp approval` (builds the approval Runtime — gated on that variable so it costs nothing when unused), then `./deploy.sh approvals` to subscribe. **Both the console tick and this API subscription are required**; Lark delivers approval events only for definitions subscribed through the API.
-4. Authorize as the approver (`/auth lark` in the bot chat). The server refuses to decide for anyone without their own grant on record, so an approver who never consented gets a 点击授权 card instead — after which the turn resumes on its own.
-
-One tool is deliberately left unusable: `approval_add_sign` (加签) is the single approval endpoint that takes the *user's* token instead of the app's, but the vaulted token carries only the scopes `LARK_SCOPES` requests (`drive:drive docx:document offline_access`), and the only user-token approval scope on offer is `approval:approval:readonly` — a read scope, while add_sign writes. So it fails on permissions by construction. It stays exposed because that boundary is the lesson: Lark's approval API admits a user identity for exactly one operation, and not one this sample can reach.
-
-Then submit an approval assigned to that approver. Both outcomes are worth trying: within the limits the agent decides and comments `[AI 自动处理]`; over the amount ceiling it refuses to decide and hands the case back.
 
 ### Letting more people in
 
@@ -161,7 +130,7 @@ scripts/manage-allowlist.sh list
 scripts/manage-allowlist.sh remove lark:ou_...
 ```
 
-The allowlist gates *conversations*. It also gates whether an approval event is acted on at all: an approver who isn't listed is left alone silently. Note the asymmetry — deciding for someone needs their own 3LO grant, but DMing them does not (that runs on the app's token), so the allowlist is the only thing standing between an approval event and a stranger's chat window.
+The allowlist gates *conversations*: an unlisted user is told their id and asked to request access, and nothing else happens. It is not what protects a user's data — that is the vaulted token, which only its owner ever consents to.
 
 ## Chat commands
 
@@ -196,15 +165,14 @@ Unit tests sit next to the code they cover and mock AWS; `tests/run.sh` walks th
 This deploys billable AWS resources. All the always-on pieces are consumption- or per-unit-priced (no fixed reservation), so an idle single-user demo in us-west-2 is on the order of a couple USD/month before model usage; the variable cost is dominated by the agent's Bedrock calls. Verify current rates on the AWS pricing pages — figures below are as researched, not a quote.
 
 - **Bedrock model invocations** — the main usage-sensitive line; priced per input/output token on the model in `default_model_id`. A chatty demo is cents-to-dollars; a load test is not.
-- **AgentCore Runtime ×2–3** — the agent and the lark-cli MCP server always, plus the approval MCP server if `AGENT_DECIDE_APPROVAL_CODES` is set. Each is metered per-second: CPU (`~$0.0895/vCPU-hour`) only during active processing, memory (`~$0.00945/GB-hour`) continuously while the microVM is alive. So each extra MCP server adds idle memory-time even when nothing calls it — which is why the approval one is gated on that variable rather than always deployed.
+- **AgentCore Runtime ×2** — the agent and the lark-cli MCP server. Each is metered per-second: CPU (`~$0.0895/vCPU-hour`) only during active processing, memory (`~$0.00945/GB-hour`) continuously while the microVM is alive. So each extra MCP server adds idle memory-time even when nothing calls it — which is why the approval one is gated on that variable rather than always deployed.
 - **AgentCore Identity Token Vault (3LO)** — stores/refreshes/injects each user's Lark token natively. No separate per-user Secrets Manager charge (unlike the interceptor variant) — this is the main cost-structure difference between the two.
 - **AgentCore Memory (STM)** — billed per event *written* (`~$0.25 per 1,000` create-event calls), **not** for retention duration.
 - **Lambda + API Gateway** — router (webhook) + shim (OAuth RFC-6749 façade, a backend web service); effectively free at demo volume.
 - **Secrets Manager** — `$0.40/secret/month` each, and only two static secrets: the Lark credentials (`{prefix}/channels/lark`) and the Cognito password salt. This variant does **not** create dynamic per-user secrets.
-- **Web search (optional)** — only when `WEB_SEARCH=true`: an AgentCore Gateway plus per-query connector charges. The gateway sits in us-east-1, so its traffic is cross-region.
 - **Cognito, DynamoDB (on-demand)** — the identity/state plane; negligible at demo volume. (A `user-files` S3 bucket is provisioned but not used on the current tool path — near-zero cost.)
 
-`scripts/destroy.sh` removes everything `deploy.sh` created, including the OAuth credential provider and both gateways. Costs are usage-driven; an idle deployment still accrues the two microVMs' memory-time and the two static per-secret charges.
+`scripts/destroy.sh` removes everything `deploy.sh` created, including the OAuth credential provider and workload identity. Costs are usage-driven; an idle deployment still accrues the two microVMs' memory-time and the two static per-secret charges.
 
 ## Security considerations
 
@@ -213,7 +181,6 @@ This is a **reference implementation, not production-ready as-is**. Before any r
 - **Per-user Lark tokens live in the AgentCore Identity Token Vault**, not in application code or a self-managed store. The agent fetches a user's token at call time (agent-side 3LO) and passes it to the lark-cli MCP server in a custom header; it holds no long-lived credential of its own. Treat the account hosting the vault as sensitive.
 - **The MCP server calls Lark strictly as the user.** `LARKSUITE_CLI_DEFAULT_AS=user` — the lark-cli engine always acts with the vaulted `user_access_token`, never the bot identity, so access is scoped to what that user can do in Lark and Lark adjudicates it.
 - **Command execution is injection-safe.** The MCP server spawns lark-cli via `execFile` (no shell) with arguments passed as an array, and the user token via an environment variable — never interpolated into a command line.
-- **Web search sees no user data.** It runs on Amazon's index with `GATEWAY_IAM_ROLE`, carries no user token, and queries stay inside AWS. It does mean model output can include fetched web content — treat that as untrusted input like any other tool result. `parameterValues.domainFilter` can restrict which domains are searched.
 - **IAM is scoped but a sample.** Re-review least-privilege for your account before production.
 - **Webhook verification is fail-closed** — a missing/invalid signature or a timestamp outside the replay window is rejected before decryption. Don't relax this.
 - **AES-CBC webhook decryption** is Lark's fixed scheme (not our choice); authenticity is guaranteed by the upstream signature check, not by the cipher mode.

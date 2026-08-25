@@ -11,14 +11,12 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 | Component | What it is | Where |
 |---|---|---|
 | Router Lambda | Lark webhook ingestion (verify + AES decrypt, resolve user, invoke runtime); owns both session ids; handles the chat commands | `lambda/router/` |
-| Agent container | Strands agent on Bedrock; HTTP contract (8080); AgentCore Memory for continuity; agent-side 3LO; MCP clients to the lark-cli server, the approval server when deployed, and optionally web search; runs turns in the background and posts answers to the chat itself | `agent/` |
+| Agent container | Strands agent on Bedrock; HTTP contract (8080); AgentCore Memory for continuity; agent-side 3LO; an MCP client to the lark-cli server; streams answers into a Lark card | `agent/` |
 | Lark OAuth shim | RFC-6749 façade over Lark's non-standard token endpoint, plus the 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) | `lambda/shim/` |
 | Lark MCP server | lark-cli engine on AgentCore Runtime; calls Lark with the per-user token from a custom passthrough header | `mcp-servers/lark-cli/` |
-| Approval MCP server | Lark approvals on AgentCore Runtime — the case where the user's identity *cannot* be forwarded: every decision endpoint takes only the app's tenant token, with a `user_id` naming whose record it becomes. Limits are enforced in code, not by the model | `mcp-servers/approval/` |
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `lark-agent-3lo`, workload `lark-agent-wl` |
 | AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `lark_agent_agent_mem` (STM) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
-| AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region). Not on the Lark tool path here, because it cannot be: verified @2026-08-19 the Gateway does per-user 3LO for a `CustomOauth2` provider, but only into an addressable HTTPS downstream — never into a Runtime-hosted MCP server | `stacks/gateway_stack.py`, `deploy.sh gateway` |
 
 ## One entrypoint, one identity
 
@@ -89,7 +87,7 @@ Inbound and outbound are **independent axes** — each can be configured without
 |---|---|---|---|
 | Lark → Router (webhook) | `X-Lark-Signature` + AES (encryptKey) | Router, fail-closed | `open_id` inside the decrypted event |
 | Router → agent Runtime | the user's Cognito **access** token (Bearer) | AgentCore Runtime's `customJWTAuthorizer` (signature + `allowedClients`) | the token's `sub`; the platform derives a workload access token from it and delivers it as a payload header |
-| Agent → lark-cli / approval Runtime | IAM SigV4 | AgentCore | n/a — the user's token rides a header (outbound concern) |
+| Agent → lark-cli Runtime | IAM SigV4 | AgentCore | n/a — the user's token rides a header (outbound concern) |
 
 `actorId` is still in the payload, but it is now only a label for logs and Memory — the identity that decides *whose* token is fetched comes from the verified JWT, not from anything the payload asserts. See [Inbound identity](#inbound-identity-a-signed-jwt-and-what-that-does-and-does-not-buy).
 
@@ -100,9 +98,6 @@ Inbound and outbound are **independent axes** — each can be configured without
 | Agent → AgentCore Identity | the workload access token the Runtime delivered (derived from the inbound JWT) | AgentCore Identity |
 | Agent → lark-cli Runtime | the user's Lark token in `X-Amzn-…-Custom-Lark-Token` | passed through; lark-cli uses it verbatim |
 | lark-cli → Lark REST | the user's **`user_access_token`** (Bearer) | **Lark** — returns only what that user can see |
-| approval server → Lark REST | the **app's** tenant token + a `user_id` argument | Lark checks task ownership, never consent (see [approvals](#a-third-path-approvals-where-the-users-identity-cannot-be-passed-through)) |
-| Agent → Web Search Gateway | the user's Cognito **access** token (Bearer) | Gateway `customJWTAuthorizer` (`allowedClients` checks the `client_id` claim, which ID tokens lack — an ID token 403s with `insufficient_scope`) |
-| Gateway → Web Search connector | `GATEWAY_IAM_ROLE` | IAM |
 | Agent / Router → Lark chat | the app's tenant token | Lark — it is the bot speaking, not the user |
 
 The last row is the pair worth holding onto: **replies go out as the app, tool calls go out as the user.** Both directions exist in the same turn, on purpose.
@@ -134,7 +129,7 @@ Three details worth keeping, each measured rather than assumed:
 
 **What it does not buy.** Two things are unchanged, and calling them out matters more than the win:
 
-1. **Trust is relocated, not removed.** In the event-driven approval flow nobody is present, so the router signs a JWT for an absent person — "the app asserts it represents X" again, with the router as the asserting party instead of the agent. This is a real improvement, because the router is small, runs no model and never touches untrusted input, which the agent cannot claim. It is not the same as proof. Only OBO (`TOKEN_EXCHANGE`) makes impersonation cryptographically impossible, and it needs an inbound user token to exchange — a Lark bot entrypoint carries none, so it does not apply here at all (see `docs/agentcore-behavior.md`).
+1. **Trust is relocated, not removed.** The router is now the party that asserts who a turn belongs to. Every turn here does originate from a Lark message the router verified by signature first, so it signs for someone who demonstrably just acted — which is a stronger position than the agent asserting it. But it is still an assertion: a compromised router could sign for anyone. The improvement is that the asserting component is small, runs no model and never touches untrusted input, which the agent cannot claim. Only OBO (`TOKEN_EXCHANGE`) makes impersonation cryptographically impossible, and it needs an inbound user token to exchange — a Lark bot entrypoint carries none, so it does not apply here at all (see `docs/agentcore-behavior.md`).
 2. **A prompt-injected agent can still misuse the tools it has**, within that one user's own permissions. What closed is credential theft and impersonation, not over-broad action. That needs action-layer limits in code — which is what the approval server does (allowlist, amount ceiling, must hold the user's own grant), rather than leaving it to the model.
 
 **Migration cost, if you are moving an existing deployment.** `ForUserId` and JWT-derived vault keys are separate namespaces (measured both directions: the same real user's token was retrievable ForUserId and absent ForJWT). Existing grants are not inherited and nothing errors — users are simply asked to consent once more. Budget that window.
@@ -146,86 +141,27 @@ Three details worth keeping, each measured rather than assumed:
 
 Authorization is scoped per downstream system, not per bot: each one gets its own OAuth credential provider, and the vault keys tokens by `(provider, userId)`. The router carries that mapping in `IDP_REGISTRY` (written by `scripts/setup-3lo.sh`), which is what lets `/auth` report status per IdP and `/auth <idp>` re-consent just one of them. Adding a downstream system means registering a provider and appending a registry entry — see `docs/native-3lo-builtin-vendor.md`.
 
-## Two tool paths, and why
+## One tool path, and why it is not through the Gateway
 
-| | Lark tools | Web search |
-|---|---|---|
-| Needs the end user's identity | yes — it reads *their* documents | no — it queries Amazon's web index |
-| How the agent reaches it | direct to the lark-cli Runtime (SigV4 + the user's token in a custom header) | through an AgentCore Gateway (MCP) |
-| Outbound credential | the user's vaulted Lark token | `GATEWAY_IAM_ROLE` |
+The agent connects **straight to the lark-cli Runtime** over SigV4 and passes the user's vaulted
+Lark token in a custom passthrough header. It does not go through an AgentCore Gateway, and that
+is a constraint rather than a preference.
 
-The split is a choice, and the reason recorded here for two months was wrong. Verified @2026-08-19,
-the Gateway **does** perform per-user 3LO for a `CustomOauth2` provider like Lark: a `tools/call`
-returns a `-32042` elicitation with an authorization URL, and after the user consents the retry
-comes back with that user's own Lark data — the Gateway fetched the token and injected
-`Authorization: Bearer` itself, with the agent never seeing it. What had blocked every earlier
-attempt was the **gateway execution role**, which needs both
-`bedrock-agentcore:GetResourceOauth2Token` / `GetWorkloadAccessToken*` and
-`secretsmanager:GetSecretValue` on `bedrock-agentcore-identity!default/oauth2/*` (fetching reads
-the provider's managed secret as the caller). Missing either returns one opaque string,
-`An internal error occurred. Please retry later.`, which reads like a missing feature.
+The Gateway does perform per-user 3LO — verified @2026-08-19 against an OpenAPI target, where a
+`tools/call` returns a `-32042` elicitation with an authorization URL and the retry after consent
+comes back with that user's own Lark data, the Gateway having fetched and injected the token
+itself. But it cannot do that for an MCP server hosted on **AgentCore Runtime**: that endpoint
+authenticates the transport and owns the `Authorization` header, so under SigV4 outbound the
+header is spent on the signature and stripped before the container, and under OAuth outbound the
+Bearer displaces the signature and the front door rejects the call before any of our code runs.
+Measured as a single-variable A/B — one gateway, one identity, one permission set, three targets —
+and re-run with wide-open IAM to rule permissions out. See `docs/agentcore-behavior.md`.
 
-So the Lark tools stay on the direct path because that is what is built and measured here, not
-because the Gateway cannot carry them. One caveat if you migrate: `ForUserId` and JWT-derived
-vault keys are separate namespaces, so existing consents are **not** inherited and every user
-re-authorises once — silently, as repeated consent prompts. See `docs/agentcore-behavior.md` for
-the permission matrix and the rest. Web search needs none of this: with no user identity to
-forward, `GATEWAY_IAM_ROLE` is all it needs, so it uses the Gateway as intended.
-
-The Web Search connector is only offered in **us-east-1**, so its gateway lives there even
-when the rest of the stack doesn't, and the agent calls it cross-region. Inbound auth is a
-Cognito **access** token (the Gateway validates the `client_id` claim, which ID tokens lack) —
-this is what the Cognito user pool is for on this variant. Two IAM actions are required:
-`InvokeGateway` on the gateway, and `InvokeWebSearch` on `…:aws:tool/web-search.v1`, whose
-account segment is the literal `aws`, not yours. Search is optional: `WEB_SEARCH=false` skips
-the gateway entirely, and the agent simply runs without that tool.
-
-## A third path: approvals, where the user's identity *cannot* be passed through
-
-Everything above rests on one property — the downstream call carries the user's own token, so Lark decides what it may reach. Lark's approval API breaks that property, and the approval demo exists to show what you do when it happens.
-
-`tasks/approve`, `reject`, `transfer` and `rollback` accept **only a tenant (app) token**; there is no user-token variant. `tasks/query` is the same. Only `add_sign` takes a user token — and even that one is out of reach here: Lark offers `approval:approval:readonly` as a user-token scope but no user-token *write* scope for approvals, while add_sign writes. So the user-identity path this whole document is about admits exactly one approval operation, and not one that can actually be performed. So a decision cannot be made *as* the user — it is made by the app, and a `user_id` argument says whose name to record it under:
-
-| | Value | What it decides |
-|---|---|---|
-| `Authorization: Bearer` | the **app's** tenant token | that the app may operate approvals |
-| `user_id` argument | the approver's `open_id` | **whose name the decision is recorded under** |
-
-Lark verifies that `user_id` owns the task. It never asks whether that person agreed — there is nothing in the request that could represent them. So the approval record means "an authorised app claims to have decided for X", not "X decided". **The record itself cannot tell the two apart**, which is why every automated decision carries an `[AI 自动处理]` comment: that marker is the only thing an audit can key on afterwards.
-
-Worse, the `user_id` is free: the app already knows every relevant `open_id` without anyone's consent (a webhook hands over its sender's; `tasks/query` returns each approver's). So Lark's ownership check is not a barrier — the `task_id` and its `user_id` are read together, and filling it in correctly is the only natural thing to do.
-
-### What the guards actually are
-
-Since the protocol offers no enforcement point, the limits live in the approval MCP server, in code rather than in the prompt (`mcp-servers/approval/server.js`, tested in `test_guards.mjs`):
-
-- **An allow-list of approval definitions** (`AGENT_DECIDE_APPROVAL_CODES`) and an **amount ceiling** (`AGENT_DECIDE_MAX_AMOUNT`). Empty allow-list decides nothing — fail closed, so the demo is inert until switched on deliberately. `0` is a kill switch.
-- **The approver's own grant must be on record.** The agent holds a vaulted token for everyone who ever consented, so "a token was passed" and "this approver consented" are different questions: the token is resolved to its owner (`authen/v1/user_info`) and compared with `user_id`. A mismatch refuses; an identity that can't be established refuses too.
-
-Both are **self-imposed**. Lark would permit every decision they block. And they do not survive a leaked `appSecret`, which bypasses this server entirely — the agent itself holds that secret (it needs it to send messages), so the honest description is that these guards raise the bar from "knows a task_id" to "has compromised the app", without changing the trust model. A production design would split messaging and approvals into two Lark apps so the agent only holds the former's secret; this sample does not, to keep one app to configure.
-
-### Event-driven: a turn with nobody present
-
-The demo runs unattended — a `approval_task` event wakes a turn, so nobody has to ask. Delivery is scoped by subscription: Lark sends approval events only for definitions subscribed through `approvals/{code}/subscribe`, which is a **separate step from ticking the event in the console** (`./deploy.sh approvals`).
-
-```
-approval_task (PENDING, carries open_id + task_id + instance_code)
-   ↓  router: three gates, then hand over the address
-   │    status must be PENDING      — a settled status is the agent's own decision echoing back
-   │    claim the task_id           — conditional put; Lark redelivers until acked, and the
-   │                                  ack goes out long before the agent has decided
-   │    approver must be allowlisted — otherwise silence; their approval is their own business
-   ↓  invoke_agent(chat_async, chatId=open_id)   ← returns at once, address only
-agent: reads the instance, applies the guards, decides, and posts its own reply
-   ↓  StreamingCard(open_id) → im/v1/messages
-the approver's DM
-```
-
-Two details that are easy to get wrong. **The router does not deliver the answer** — it only resolves the address; the agent posts the card itself, because the reply streams and a Lambda cannot stay alive for it. The router sends only the consent link and error fallbacks. And **an approval event carries no chat**, so the address is a person, not a room: both senders read an `ou_` prefix as "DM this person".
-
-If the approver has never consented, the turn is guaranteed to wall (the guard above). So it is parked before dispatch and replayed by consent-resume after they authorize — an unattended turn has no user to re-send it.
-
-Two Lark naming inconsistencies cost an afternoon each: the event calls it `approval_code` while `tasks/query` returns `definition_code`, and `tasks/query` is a **GET** (POST answers `404 page not found`, which reads like a permissions problem).
+So the managed path becomes available only by moving the MCP server off Runtime onto an
+addressable HTTPS endpoint (ALB / API Gateway / Fargate), trading Runtime's per-session microVM
+and scaling model for it. Worth knowing if you migrate: `ForUserId` and JWT-derived vault keys are
+separate namespaces, so existing consents are not inherited and every user re-authorises once —
+silently, as repeated consent prompts.
 
 ## Conversation memory
 
@@ -355,4 +291,4 @@ sequenceDiagram
 
 ## Deploy shape
 
-CDK stacks: security, agentcore, router, shim, gateway, observability. On this variant the tool path is agent-side 3LO, so the gateway stack is reduced to its service role (no mcpServer target); the shim stack (Lark OAuth RFC-6749 façade + 3LO return-url) is what the 3LO flow actually uses. Everything AgentCore-side is created outside CloudFormation: the **Runtimes** (agent, lark-cli MCP server, and the approval MCP server when deployed), Memory, the OAuth2 credential provider, the workload identity, and the Web Search gateway. `deploy.sh` builds them — ARM64 images via CodeBuild, resources via the AgentCore CLI / control-plane — and feeds ids back through `.cdk-state.json`. `AWS::BedrockAgentCore::*` types do now exist, so this is a choice rather than a limitation: the agent Runtime and Memory are created implicitly by `agentcore deploy`, which also builds the image, and replacing that official tool to move them into a stack costs more than it returns. Two consequences worth knowing: `destroy.sh` needs an explicit delete for each of these (nothing errors if one is missed — only a real teardown catches it), and the ordering `3lo`/`gateway` → `runtime` has to be maintained by hand, since the Runtime bakes in the provider name and gateway URL. See `README.md` for the deploy commands and Lark console setup.
+CDK stacks: security, agentcore, router, shim, observability. There is no gateway stack — the tool path is agent-side 3LO straight to the MCP Runtime; the shim stack (Lark OAuth RFC-6749 façade + 3LO return-url) is what the 3LO flow actually uses. Everything AgentCore-side is created outside CloudFormation: the **Runtimes** (agent, lark-cli MCP server), Memory, the OAuth2 credential provider, the workload identity, and the Web Search gateway. `deploy.sh` builds them — ARM64 images via CodeBuild, resources via the AgentCore CLI / control-plane — and feeds ids back through `.cdk-state.json`. `AWS::BedrockAgentCore::*` types do now exist, so this is a choice rather than a limitation: the agent Runtime and Memory are created implicitly by `agentcore deploy`, which also builds the image, and replacing that official tool to move them into a stack costs more than it returns. Two consequences worth knowing: `destroy.sh` needs an explicit delete for each of these (nothing errors if one is missed — only a real teardown catches it), and the ordering `3lo`/`gateway` → `runtime` has to be maintained by hand, since the Runtime bakes in the provider name and gateway URL. See `README.md` for the deploy commands and Lark console setup.

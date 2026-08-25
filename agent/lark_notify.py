@@ -73,7 +73,7 @@ def _tenant_token() -> str:
 
 def _rid_type(receive_id: str) -> str:
     """`ou_` means an open_id — a DM to that person rather than a chat. Event-driven
-    turns (an approval task landing) have no chat to reply in, only the person."""
+    turns have no chat to reply in, only the person."""
     return "open_id" if receive_id.startswith("ou_") else "chat_id"
 
 

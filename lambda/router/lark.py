@@ -149,7 +149,7 @@ _MAX_TEXT_LEN = 20000
 def _receive_id_type(receive_id: str, explicit: str = "") -> str:
     """Lark wants the id's kind alongside the id itself. An `ou_` prefix is an open_id
     (a DM to that person); anything else is a chat. Inferring it lets a caller holding
-    only the person reuse these senders — an approval event carries no chat_id."""
+    only the person reuse these senders."""
     if explicit:
         return explicit
     return "open_id" if receive_id.startswith("ou_") else "chat_id"

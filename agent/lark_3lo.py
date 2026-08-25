@@ -172,8 +172,8 @@ class _SigV4HTTPXAuth(httpx.Auth):
 def mcp_client_for(lark_token: str, url: str = "") -> MCPClient:
     """MCP client to an MCP-server Runtime: SigV4 transport + the Lark token in the
     custom passthrough header. Defaults to the lark-cli server; pass `url` for
-    another one (the approval server, say). Same transport either way — what differs
-    is which tools the server exposes and which identity each of them uses."""
+    another one. Same transport either way — what differs is which tools the server
+    exposes and which identity each of them uses."""
     creds = boto3.Session(region_name=_REGION).get_credentials()
     auth = _SigV4HTTPXAuth(creds, "bedrock-agentcore", _REGION)
     headers = {_CUSTOM_HEADER: lark_token}

@@ -12,11 +12,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 # Command-line env vars win over .env, which wins over defaults (same as deploy.sh).
-_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEARCH:-}"
+_CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}"
 [ -f .env ] && { set -a; . ./.env; set +a; }
 PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
-WEB_SEARCH="${_CLI_WEB_SEARCH:-${WEB_SEARCH:-false}}"
 export AWS_REGION="$REGION"
 # Credentials already in the environment outrank .env's profile — otherwise this
 # would report (and check) an identity other than the one the caller supplied.
@@ -69,8 +68,6 @@ probe ecr            aws ecr describe-repositories --max-items 1
 probe codebuild      aws codebuild list-projects
 probe cognito        aws cognito-idp list-user-pools --max-results 1
 probe iam            aws iam list-roles --max-items 1
-[ "$WEB_SEARCH" != "true" ] || probe "agentcore(us-east-1)" \
-  aws bedrock-agentcore-control list-gateways --region us-east-1 --max-results 1
 [ -z "$denied" ] || printf '\033[1;33m%s\033[0m\n' "  warning: no read access to:$denied
   The deploy writes to these — expect it to fail unless that is just a read-only denial."
 
@@ -86,4 +83,3 @@ done
 echo "  account : $ACCOUNT"
 echo "  region  : $REGION${PROFILE:+   profile: $PROFILE}"
 echo "  model   : $MODEL"
-echo "  search  : $WEB_SEARCH$([ "$WEB_SEARCH" = "true" ] && echo '  (+ a gateway in us-east-1)')"

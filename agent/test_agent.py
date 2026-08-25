@@ -21,52 +21,6 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 
 
-# ------------------------------- identity -----------------------------------
-
-def test_derive_password_deterministic_and_complex():
-    import identity
-    with mock.patch.object(identity, "_get_salt", return_value="test-salt"):
-        p1 = identity._derive_password("lark:ou_abc")
-        p2 = identity._derive_password("lark:ou_abc")
-        p3 = identity._derive_password("lark:ou_xyz")
-    assert p1 == p2                       # deterministic
-    assert p1 != p3                       # per-user
-    assert p1.endswith("Aa1!")            # complexity suffix
-    assert len(p1) == 36
-
-
-def test_jwt_exp_parses_unverified():
-    import identity
-    payload = base64.urlsafe_b64encode(json.dumps({"exp": 1234567890}).encode()).decode().rstrip("=")
-    token = f"header.{payload}.sig"
-    assert identity._jwt_exp(token) == 1234567890.0
-
-
-def test_jwt_exp_bad_token_returns_zero():
-    import identity
-    assert identity._jwt_exp("not-a-jwt") == 0.0
-
-
-def test_ensure_user_email_sanitizes_colon():
-    """open_id-based username 'lark:ou_x' must not produce an invalid email."""
-    import identity
-    captured = {}
-
-    def fake_create(**kw):
-        captured["email"] = next(a["Value"] for a in kw["UserAttributes"] if a["Name"] == "email")
-
-    with mock.patch.object(identity, "_cognito") as c:
-        from botocore.exceptions import ClientError
-        c.admin_get_user.side_effect = ClientError(
-            {"Error": {"Code": "UserNotFoundException"}}, "AdminGetUser")
-        c.admin_create_user.side_effect = fake_create
-        c.admin_set_user_password.return_value = {}
-        with mock.patch.object(identity, "_get_salt", return_value="s"):
-            identity._ensure_user("lark:ou_abc", "")
-    assert ":" not in captured["email"]           # colon replaced
-    assert captured["email"] == "lark-ou_abc@lark.local"
-
-
 # ------------------------------- agent_core session id ----------------------
 
 def test_session_id_deterministic_per_user():
@@ -137,22 +91,6 @@ def test_track_is_usable_from_a_thread():
 
 
 # ------------------------------- web search ---------------------------------
-# Search is optional; with no gateway configured the agent must simply run
-# without the tool rather than failing to build a session.
-
-def test_websearch_gateway_contract():
-    """websearch imports mcp (not installable here), so assert the two things that
-    silently break the Gateway call: the protocol-version header, without which it
-    negotiates 2025-03-26 and rejects with -32022, and an access token rather than
-    an ID token, since the Gateway checks the client_id claim."""
-    src = open(os.path.join(os.path.dirname(__file__), "websearch.py"), encoding="utf-8").read()
-    assert "MCP-Protocol-Version" in src
-    assert "2025-11-25" in src
-    assert "get_user_jwt" in src        # identity.py returns the ACCESS token
-    # available() must be a pure config check, so an unset gateway just means no tool
-    assert 'os.environ.get("WEBSEARCH_GATEWAY_URL", "")' in src
-
-
 # --------------------------- deferred authorization -------------------------
 # A user without a vaulted Lark token still gets a working session: lark-mcp lists
 # its tools without one and only rejects tools/call. Consent is raised when a tool
@@ -433,22 +371,12 @@ def test_stream_aborts_when_an_unauthorized_session_reaches_a_lark_tool():
     Aborting at the tool call is what keeps the card the only thing the user reads."""
     card = FakeCard()
     session = {"agent": object(), "auth_url": "https://consent"}
-    fn = _load_stream_to_chat(["让我查一下…"], card, [], tool_calls=["approval_list_pending"])
-    text = fn(session, "查待审批", "oc_1")
-    assert session.get("walled_tool") == "approval_list_pending"
+    fn = _load_stream_to_chat(["让我查一下…"], card, [], tool_calls=["lark_list_my_docs"])
+    text = fn(session, "查我的文档", "oc_1")
+    assert session.get("walled_tool") == "lark_list_my_docs"
     # The half-sentence is replaced, not left on the card.
     assert "让我查一下" not in text
     assert "Lark" in text
-
-
-def test_stream_does_not_abort_on_websearch_when_unauthorized():
-    """Search needs no Lark grant, so an unauthorized user must still get results."""
-    card = FakeCard()
-    session = {"agent": object(), "auth_url": "https://consent"}
-    fn = _load_stream_to_chat(["天气是…"], card, [], tool_calls=["WebSearch"])
-    text = fn(session, "今天天气", "oc_1")
-    assert "walled_tool" not in session
-    assert text == "天气是…"
 
 
 def test_stream_does_not_abort_when_authorized():

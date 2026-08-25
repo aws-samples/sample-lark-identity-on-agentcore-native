@@ -76,7 +76,7 @@ class AgentCoreStack(Stack):
         )
 
         # Cognito admin auth — mint a per-user JWT (username = lark:{open_id})
-        # to attach as Bearer on outbound MCP/Gateway calls.
+        # to attach as Bearer on outbound MCP calls.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
@@ -172,10 +172,6 @@ class AgentCoreStack(Stack):
                     "bedrock-agentcore:GetResourceOauth2Token",
                     "bedrock-agentcore:InvokeAgentRuntime",
                     "bedrock-agentcore:InvokeAgentRuntimeForUser",
-                    # Web search reaches the agent through a Gateway (in us-east-1,
-                    # the only region offering the connector), so the caller needs
-                    # this on top of the Gateway role's own permissions.
-                    "bedrock-agentcore:InvokeGateway",
                 ],
                 resources=["*"],
             )

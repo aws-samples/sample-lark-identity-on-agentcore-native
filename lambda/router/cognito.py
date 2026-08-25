@@ -9,8 +9,8 @@ Access tokens, not id tokens: `client_id` (which authorizers match on) is only i
 access token, and it is the access token AgentCore derives the vault identity from.
 
 Passwords are HMAC-derived from a Secrets Manager salt, so they are deterministic and
-never stored. Same scheme as agent/identity.py — that copy stays, it mints the token
-the web-search Gateway authorises with.
+never stored. The agent mints nothing: it only ever uses the workload token the platform
+hands it, which is what makes the identity on a turn unforgeable.
 """
 
 from __future__ import annotations

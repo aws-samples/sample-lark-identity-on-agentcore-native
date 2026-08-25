@@ -4,14 +4,14 @@
 A single-tenant-friendly PoC that runs a simple Python agent on Bedrock
 AgentCore Runtime, reachable from Lark bot chat (webhook messages), with Lark
 as the identity provider. Per-user Lark tokens live in the AgentCore Identity
-Token Vault (3LO) and are injected by the Gateway into an MCP-server target —
-the agent never holds a downstream credential.
+Token Vault (3LO); the agent fetches the calling user's token and passes it to
+the MCP server, which acts as that user against Lark.
 
 Deployment is hybrid:
-  Phase 1 (CDK):  Security, AgentCore base (Role/ECR/S3), Router,
-                  Gateway, Observability
-  Phase 2 (CLI):  AgentCore Runtime + Gateway created/updated by deploy.sh
-                  (control-plane APIs), IDs fed back into cdk.json context
+  Phase 1 (CDK):  Security, AgentCore base (Role/ECR/S3), Router, Shim,
+                  Observability
+  Phase 2 (CLI):  AgentCore Runtimes (agent + MCP server) created/updated by
+                  deploy.sh (control-plane APIs), IDs fed back via .cdk-state.json
 """
 
 import json
@@ -23,13 +23,12 @@ import aws_cdk as cdk
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
 from stacks.router_stack import RouterStack
-from stacks.gateway_stack import GatewayStack
 from stacks.shim_stack import ShimStack
 from stacks.observability_stack import ObservabilityStack
 
 app = cdk.App()
 
-# Per-deployment state (runtime/gateway ids) lives outside version control —
+# Per-deployment state (runtime/memory ids) lives outside version control —
 # deploy.sh writes it, we inject it so stacks read it via try_get_context as usual.
 _state = pathlib.Path(__file__).parent / ".cdk-state.json"
 if _state.is_file():
@@ -88,9 +87,6 @@ router = RouterStack(
     cognito_password_secret_name=security.cognito_password_secret.secret_name,
     env=env,
 )
-
-# --- Gateway: demo tool Lambda + Gateway IAM (mcpServer target wired in Phase 3) ---
-gateway = GatewayStack(app, f"{prefix}-gateway", env=env)
 
 # --- Observability: dashboard + alarms ---
 observability = ObservabilityStack(app, f"{prefix}-observability", env=env)
