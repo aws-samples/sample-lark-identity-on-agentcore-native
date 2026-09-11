@@ -2,7 +2,7 @@
 
 A reference implementation of enterprise identity on Amazon Bedrock AgentCore, using **Lark (Feishu) as the identity provider**. A simple agent is reachable from **Lark bot chat**; every message resolves to a `lark:{open_id}` identity, and downstream MCP tools **act as that user against Lark** with the user's own token — so they reach only what that user can, and Lark itself adjudicates access. The agent inherits both *who you are* and *what you're allowed to do*, adding nothing of its own.
 
-This is the **AgentCore Identity** variant: per-user Lark tokens live in the **AgentCore Identity Token Vault** (OAuth 3LO), which stores, refreshes, and injects each user's token natively — no custom interceptor, no self-managed token store. The sibling repo [lark-agententity-on-agentcore-interceptor](https://github.com/aws-samples/sample-lark-agententity-on-agentcore-interceptor) achieves the same guarantees with a Gateway Request Interceptor and self-managed vaulting; the two differ only in how the downstream hop resolves per-user credentials.
+This is the **AgentCore Identity** variant: per-user Lark tokens live in the **AgentCore Identity Token Vault** (OAuth 3LO), stored and refreshed natively — no custom interceptor, no self-managed token store. The sibling repo [lark-identity-on-agentcore-interceptor](https://github.com/aws-samples/sample-lark-identity-on-agentcore-interceptor) achieves the same guarantees with a Gateway Request Interceptor and self-managed vaulting; the two differ only in how the downstream hop resolves per-user credentials.
 
 ## Architecture
 
@@ -85,7 +85,7 @@ scripts/destroy.sh            # delete everything deploy.sh created (asks for co
 # or: scripts/destroy.sh --yes  # skip the prompt
 ```
 
-Deletes in dependency order — both CLI-created Runtimes → the CDK stacks → the OAuth credential provider and workload identity. Idempotent: re-running skips already-gone resources.
+Deletes in dependency order — both CLI-created Runtimes → Memory / ECR / CodeBuild leftovers (including the AgentCore CLI's own `bedrock-agentcore-*`-named repo and builder) → log groups → the CDK stacks → the OAuth credential provider and workload identity. Idempotent: re-running skips already-gone resources.
 
 Two consequences worth knowing: deleting the provider **purges every user's vaulted token**, so everyone consents again after a redeploy — and the new provider gets a **new `callbackUrl`** that must be registered in the Lark console (`scripts/setup-3lo.sh` prints it). Your Lark console app config is otherwise untouched; re-seed credentials from `.env` via `scripts/setup-lark.sh`.
 

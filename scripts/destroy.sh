@@ -79,15 +79,17 @@ for mid in $(aws bedrock-agentcore-control list-memories --max-results 100 \
     || warn "  (memory $mid delete failed)"
 done
 
+# Two naming schemes: our own $PREFIX-*, and the AgentCore CLI's
+# bedrock-agentcore-<runtime_name>* (repo and builder project alike).
 for repo in $(aws ecr describe-repositories \
-                --query "repositories[?starts_with(repositoryName,'$PREFIX')].repositoryName" \
+                --query "repositories[?starts_with(repositoryName,'$PREFIX') || starts_with(repositoryName,'bedrock-agentcore-${PREFIX//-/_}')].repositoryName" \
                 --output text 2>/dev/null || true); do
   echo "  deleting ECR repo $repo (with images)"
   aws ecr delete-repository --repository-name "$repo" --force >/dev/null 2>&1 \
     || warn "  (ECR repo $repo delete failed)"
 done
 
-for proj in $(aws codebuild list-projects --query "projects[?starts_with(@,'$PREFIX')]" \
+for proj in $(aws codebuild list-projects --query "projects[?starts_with(@,'$PREFIX') || starts_with(@,'bedrock-agentcore-${PREFIX//-/_}')]" \
                 --output text 2>/dev/null || true); do
   echo "  deleting CodeBuild project $proj"
   aws codebuild delete-project --name "$proj" >/dev/null 2>&1 \
@@ -104,6 +106,17 @@ if aws s3api head-bucket --bucket "$SRC_BUCKET" >/dev/null 2>&1; then
       && echo "  removed s3://$SRC_BUCKET/$key" || true
   done
 fi
+
+# --- 1c. Log groups (auto-created by runtimes / CodeBuild / Memory) -------
+# The runtimes and builders create these on first write, outside any stack, and
+# CDK's own log groups vanish with their stacks — these do not.
+log "Log groups — runtime / CodeBuild / Memory leftovers"
+for g in $(aws logs describe-log-groups \
+             --query "logGroups[?contains(logGroupName,'$PREFIX') || contains(logGroupName,'${PREFIX//-/_}')].logGroupName" \
+             --output text 2>/dev/null || true); do
+  aws logs delete-log-group --log-group-name "$g" >/dev/null 2>&1 \
+    && echo "  deleted $g" || true
+done
 
 # --- 2. CDK stacks (reverse dependency order) ----------------------------
 log "CDK — destroy stacks"
