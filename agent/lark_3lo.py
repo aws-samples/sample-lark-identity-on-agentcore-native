@@ -31,20 +31,20 @@ import base64
 import hashlib
 import logging
 import os
-from datetime import timedelta
 
 import boto3
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
-import httpx
+import httpx           # for direct Lark REST calls (_token_owner)
+import httpx2          # mcp 2.x vendors this httpx fork; its client type-checks auth against it
 
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 from strands.tools.mcp.mcp_client import MCPClient
 
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
 _PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "lark-agent-3lo")
 _WORKLOAD = os.environ.get("AGENT_WORKLOAD_NAME", "lark-agent-wl")
-_SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # bare, allowlisted on the workload
+_RETURN_URL = os.environ.get("CONSENT_RETURN_URL", "")  # bare, allowlisted on the workload
 _LARK_MCP_URL = os.environ.get("LARK_MCP_URL", "")        # SigV4 Runtime MCP invocations URL
 _SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
 _CUSTOM_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-Custom-Lark-Token"
@@ -136,8 +136,8 @@ def get_user_lark_token(actor_id: str, force: bool = False,
         customState=_b64url(actor_id),
         forceAuthentication=force,
     )
-    if _SHIM_RETURN_URL:
-        kwargs["resourceOauth2ReturnUrl"] = _SHIM_RETURN_URL
+    if _RETURN_URL:
+        kwargs["resourceOauth2ReturnUrl"] = _RETURN_URL
     resp = _agentcore.get_resource_oauth2_token(**kwargs)
     token = resp.get("accessToken")
     if token and _belongs_to(token, actor_id):
@@ -153,13 +153,17 @@ def get_user_lark_token(actor_id: str, force: bool = False,
     return "auth_url", resp["authorizationUrl"]
 
 
-class _SigV4HTTPXAuth(httpx.Auth):
-    """Sign every httpx request (incl. SSE polls) with SigV4 for bedrock-agentcore."""
+class _SigV4HTTPXAuth(httpx2.Auth):
+    """Sign every request (incl. SSE polls) with SigV4 for bedrock-agentcore.
+
+    Subclasses the httpx fork mcp 2.x vendors (httpx2), NOT the real httpx: the
+    vendored client rejects an httpx.Auth with TypeError: Invalid "auth" argument.
+    The auth_flow protocol is identical."""
 
     def __init__(self, creds, service: str, region: str):
         self._signer = SigV4Auth(creds, service, region)
 
-    def auth_flow(self, request: httpx.Request):
+    def auth_flow(self, request: httpx2.Request):
         headers = dict(request.headers)
         headers.pop("connection", None)  # or the server rejects on signature mismatch
         aws_req = AWSRequest(method=request.method, url=str(request.url),
@@ -173,10 +177,19 @@ def mcp_client_for(lark_token: str, url: str = "") -> MCPClient:
     """MCP client to an MCP-server Runtime: SigV4 transport + the Lark token in the
     custom passthrough header. Defaults to the lark-cli server; pass `url` for
     another one. Same transport either way — what differs is which tools the server
-    exposes and which identity each of them uses."""
+    exposes and which identity each of them uses.
+
+    mcp 2.x moved headers/auth/timeout onto an httpx client you supply. Built inside
+    the factory, not outside: the transport closes its client on exit, and strands
+    may re-open the transport, which must not reuse a closed client."""
     creds = boto3.Session(region_name=_REGION).get_credentials()
     auth = _SigV4HTTPXAuth(creds, "bedrock-agentcore", _REGION)
     headers = {_CUSTOM_HEADER: lark_token}
-    return MCPClient(lambda: streamablehttp_client(
-        url or _LARK_MCP_URL, headers=headers, auth=auth, timeout=timedelta(seconds=60),
+    return MCPClient(lambda: streamable_http_client(
+        url or _LARK_MCP_URL,
+        http_client=create_mcp_http_client(
+            headers=headers, auth=auth,
+            # 60 s per operation; reads get longer for SSE polls (the old transport's
+            # separate sse_read_timeout defaulted to 300 s).
+            timeout=httpx2.Timeout(60.0, read=300.0)),
     ))

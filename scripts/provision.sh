@@ -2,7 +2,7 @@
 # Deploy lark-agent. Override the target with PROFILE=... REGION=... env vars.
 #
 # Steps (idempotent — re-runnable independently):
-#   --base      CDK base stacks (security, agentcore, router, shim, observability)
+#   --base      CDK base stacks (security, agentcore, router, consent, observability)
 #   --runtime   create/update the AgentCore Runtime from the built image (CLI)
 #   (no arg)    run all steps in order
 #
@@ -57,7 +57,7 @@ base_cdk_stacks() {
 
   log "Base — CDK stacks"
   $CDK deploy "$PREFIX-security" "$PREFIX-agentcore" "$PREFIX-router" \
-             "$PREFIX-shim" "$PREFIX-observability" \
+             "$PREFIX-consent" "$PREFIX-observability" \
              --require-approval never --outputs-file cdk.out/outputs.json
 }
 
@@ -69,7 +69,7 @@ phase2_runtime() {
   command -v agentcore >/dev/null || { echo "agentcore CLI not found: npm i -g @aws/agentcore"; exit 1; }
   export AGENTCORE_SUPPRESS_RECOMMENDATION=1
 
-  local role model memory shim mcp_arn mcp_url pool client pwsecret
+  local role model memory ret_url mcp_arn mcp_url pool client pwsecret
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
   pool="$(cfn_out "$PREFIX-security" UserPoolId)"
   client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
@@ -77,7 +77,7 @@ phase2_runtime() {
   # MODEL_ID from .env wins; else cdk.json's default_model_id.
   model="${MODEL_ID:-$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['default_model_id'])")}"
   memory="$(uv run python -c "import json,os;f='.cdk-state.json';print((json.load(open(f)) if os.path.isfile(f) else {}).get('memory_id',''))" 2>/dev/null)"
-  shim="$(cfn_out "$PREFIX-shim" ShimReturnUrl)"
+  ret_url="$(cfn_out "$PREFIX-consent" ConsentReturnUrl)"
   # lark-cli MCP server runtime → its SigV4 MCP invocations URL (URL-encoded ARN).
   mcp_arn="$(aws bedrock-agentcore-control list-agent-runtimes \
     --query "agentRuntimes[?agentRuntimeName=='lark_agent_mcp'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
@@ -97,7 +97,7 @@ phase2_runtime() {
     --env "BEDROCK_MODEL_ID=$model" \
     --env "BEDROCK_AGENTCORE_MEMORY_ID=$memory" \
     --env "LARK_MCP_URL=$mcp_url" \
-    --env "SHIM_RETURN_URL=$shim" \
+    --env "CONSENT_RETURN_URL=$ret_url" \
     --env "LARK_OAUTH_PROVIDER=lark-agent-3lo" \
     --env "AGENT_WORKLOAD_NAME=lark-agent-wl" \
     --env "LARK_SCOPES=drive:drive docx:document offline_access" \
@@ -120,7 +120,7 @@ phase2_runtime() {
   #
   # UpdateAgentRuntime REPLACES the runtime rather than patching it: anything omitted is
   # cleared, and it silently dropped every environment variable the first time round
-  # (SHIM_RETURN_URL going missing surfaced as a ValidationException from
+  # (CONSENT_RETURN_URL going missing surfaced as a ValidationException from
   # GetResourceOauth2Token). So read the current config back and resend all of it.
   #
   # This is also what makes SigV4 invocation stop working ("Authorization method

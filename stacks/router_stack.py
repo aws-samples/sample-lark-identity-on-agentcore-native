@@ -35,7 +35,7 @@ class RouterStack(Stack):
         runtime_arn: str,
         runtime_endpoint_qualifier: str,
         lark_secret_name: str,
-        shim_return_url: str,
+        consent_return_url: str,
         user_pool_id: str,
         user_pool_arn: str,
         user_pool_client_id: str,
@@ -97,13 +97,12 @@ class RouterStack(Stack):
                 # Without this the code assumed 60s and cut the agent off early,
                 # leaving part of the Lambda's budget unused.
                 "LAMBDA_TIMEOUT_SECONDS": str(timeout),
-                # 3LO consent-wait: poll the vault so the user needn't re-send.
+                # Labels the IdP registry; the router asks the agent for vault state.
                 "LARK_OAUTH_PROVIDER": f"{prefix}-3lo",
-                "AGENT_WORKLOAD_NAME": f"{prefix}-wl",
                 "LARK_SCOPES": "drive:drive docx:document offline_access",
                 # Per-IdP registry for /auth; written by scripts/setup-3lo.sh.
                 "IDP_REGISTRY": self.node.try_get_context("idp_registry") or "",
-                "SHIM_RETURN_URL": shim_return_url,
+                "CONSENT_RETURN_URL": consent_return_url,
                 # Token factory: the router signs each turn's identity (see cognito.py).
                 "COGNITO_USER_POOL_ID": user_pool_id,
                 "COGNITO_CLIENT_ID": user_pool_client_id,
@@ -156,18 +155,16 @@ class RouterStack(Stack):
                 actions=["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
                 resources=[
                     f"arn:aws:secretsmanager:{region}:{account}:secret:{prefix}/*",
-                    # Identity-managed OAuth provider secret (for the vault check below).
+                    # Identity-managed OAuth provider secret, read when completing consent.
                     f"arn:aws:secretsmanager:{region}:{account}:secret:bedrock-agentcore-identity!default/oauth2/*",
                 ],
             )
         )
-        # 3LO consent-wait: check the vault for the user's Lark token (same
-        # USER_FEDERATION sequence the agent uses) so the router can hold and
-        # re-invoke once consent completes, sparing the user a re-send. Also completes
-        # the consent itself — see complete_consent in the router.
+        # Completing a finished consent (CompleteResourceTokenAuth) is the router's only
+        # vault interaction — reading it is impossible from here, since the entry belongs
+        # to the Runtime's service-linked workload identity, so the router asks the agent
+        # instead (see user_token_vaulted).
         #
-        # ForJWT, and deliberately NOT ForUserId: the router mints the user's JWT, so it
-        # needs no by-name path, and the vault namespace follows the token's `sub`.
         # This is the trust the design relocates here — the router is small, runs no
         # model and never sees untrusted input, which the agent cannot claim.
         self.router_fn.add_to_role_policy(

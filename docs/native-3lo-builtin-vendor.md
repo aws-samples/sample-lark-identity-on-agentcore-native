@@ -71,7 +71,7 @@ Built-in vendors with a dedicated config sub-key (endpoints baked in, you supply
 - **That same "requestUri regex" error is also what a stale/expired/consumed request_uri returns** — it does not mean the URL is malformed. If a byte-correct URL suddenly 400s with it, the session is gone; mint a fresh one.
 - **Don't let the URL get mangled in transit.** A double-encoded `%3A`→`%253A` (from copy/paste or line-wrapping) or a decoded bare `:` both fail. Hand the URL as one unbroken line.
 - **The return URL allowlist is exact-match** — keep the return URL bare and carry variable data (userId) via `customState`, not query params on the return URL.
-- **PKCE:** AgentCore drives PKCE for you on the built-in path (no shim to worry about). For CustomOauth2 with a shim, the shim's token endpoint must forward `code_verifier` to the upstream.
+- **PKCE:** AgentCore drives PKCE for you on the built-in path (nothing of yours in the OAuth path). For CustomOauth2 with a shim, the shim's token endpoint must forward `code_verifier` to the upstream.
 
 ## Verified result (2026-07-09)
 
@@ -84,7 +84,7 @@ The same agent-driven flow vaults a token for a `CustomOauth2` provider too. Ver
 | provider | type | agent-driven 3LO → token vaulted |
 |---|---|---|
 | GoogleOauth2 | built-in | ✅ real `ya29.*` vaulted |
-| Lark (shim) | CustomOauth2 | ✅ real `user_access_token` (JWT) vaulted |
+| Lark (own endpoints, registered directly) | CustomOauth2 | ✅ real `user_access_token` (JWT) vaulted |
 
 An earlier note here wrongly claimed CustomOauth2 completion was "defective". That was a misdiagnosis: three operational mistakes (curl-consuming the single-use `request_uri`, a `:` in `customState`, URL mangling) produced misleading `Invalid request` / `Invalid or expired session` errors. Once all three are avoided — exactly the gotchas listed above — the CustomOauth2 flow completes and vaults the token, same as a built-in vendor.
 

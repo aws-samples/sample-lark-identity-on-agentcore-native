@@ -39,10 +39,10 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 |---|---|
 | `app.py`, `cdk.json` | CDK app (uv-managed deps) — 5 stacks. Deployment state goes to `.cdk-state.json`, not here |
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
-| `stacks/` | security, agentcore, router, shim, observability |
+| `stacks/` | security, agentcore, router, consent, observability |
 | `agent/` | Strands agent container: HTTP contract + AgentCore Memory + agent-side 3LO (`lark_3lo`) + an MCP client for the lark-cli server; runs turns in the background and streams answers back into a card (`lark_notify`) |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands |
-| `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
+| `lambda/consent/` | the 3LO return endpoint (delegates `CompleteResourceTokenAuth` to the router, resumes the parked turn, DMs the user). The OAuth façade this Lambda used to host is gone — Lark's endpoints are registered directly |
 | `mcp-servers/` | One directory per MCP server, one Runtime each; `lark-cli/` acts as the user against Lark. Each declares its own build/runtime config in `runtime.env`, so adding a server needs no script change |
 | `deploy.sh` | the deploy entry point — orders the steps in `scripts/` |
 | `scripts/` | step implementations: preflight / provision (base/runtime) / build-mcp / setup-3lo / setup-lark / manage-allowlist / destroy |
@@ -66,7 +66,7 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 
 | Step | What |
 |---|---|
-| `./deploy.sh base` | CDK stacks (security, agentcore, router, shim, observability) |
+| `./deploy.sh base` | CDK stacks (security, agentcore, router, consent, observability) |
 | `./deploy.sh mcp` | build every MCP server under `mcp-servers/` (CodeBuild ARM64) + create/update a Runtime each. `./deploy.sh mcp lark-cli` for just one |
 | `./deploy.sh 3lo` | workload identity + the `lark-agent-3lo` OAuth credential provider |
 | `./deploy.sh runtime` | build the agent image + deploy the agent Runtime |
@@ -74,7 +74,7 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 
 Order matters in one place: `3lo` precedes `runtime`, because the agent Runtime is created with the provider name and workload baked into its environment. `deploy.sh` handles that; the underlying implementations are in `scripts/`.
 
-`setup-3lo.sh` registers the OAuth credential provider (Lark behind the RFC-6749 shim) plus the agent's workload identity, and prints the provider `callbackUrl` — register that in the Lark console (step 4 below) before the first 3LO consent. See `docs/native-3lo-builtin-vendor.md` to add other downstream systems.
+`setup-3lo.sh` registers the OAuth credential provider — Lark's own endpoints, directly, so no translation façade sits in the OAuth path. Token endpoint is `open.*/authen/v2/oauth/token`: Lark's newer `oauth/v3/token` is the RFC-6749 one, but PKCE is not wired into it yet (AgentCore always sends `code_challenge`, and v3 then fails the exchange with `20049`), and Lark's own docs say PKCE currently pairs with v2 — see `.dev/LARK_OAUTH_SPEC.md`. Also registers the agent's workload identity, and prints the provider `callbackUrl` — register that in the Lark console (step 4 below) before the first 3LO consent. See `docs/native-3lo-builtin-vendor.md` to add other downstream systems.
 
 Per-deployment ids (runtime, memory) go to `.cdk-state.json` (gitignored), so `cdk.json` stays free of environment state.
 
@@ -155,7 +155,7 @@ Authorization is a third, orthogonal dimension: the vaulted Lark token is keyed 
 ## Test
 
 ```bash
-tests/run.sh                 # unit suites (agent, router, shim) — no AWS needed
+tests/run.sh                 # unit suites (agent, router, consent) — no AWS needed
 ```
 
 Unit tests sit next to the code they cover and mock AWS; `tests/run.sh` walks them, one process per suite (several modules share filenames, so a single pytest session would import the wrong one). The e2e smoke tests in `tests/` exercise a **deployed** stack and stay skipped unless you point them at it — see `tests/README.md`.
@@ -168,7 +168,7 @@ This deploys billable AWS resources. All the always-on pieces are consumption- o
 - **AgentCore Runtime ×2** — the agent and the lark-cli MCP server. Each is metered per-second: CPU (`~$0.0895/vCPU-hour`) only during active processing, memory (`~$0.00945/GB-hour`) continuously while the microVM is alive. So each extra MCP server adds idle memory-time even when nothing calls it — which is why the approval one is gated on that variable rather than always deployed.
 - **AgentCore Identity Token Vault (3LO)** — stores/refreshes/injects each user's Lark token natively. No separate per-user Secrets Manager charge (unlike the interceptor variant) — this is the main cost-structure difference between the two.
 - **AgentCore Memory (STM)** — billed per event *written* (`~$0.25 per 1,000` create-event calls), **not** for retention duration.
-- **Lambda + API Gateway** — router (webhook) + shim (OAuth RFC-6749 façade, a backend web service); effectively free at demo volume.
+- **Lambda + API Gateway** — router (webhook) + the 3LO return endpoint; effectively free at demo volume.
 - **Secrets Manager** — `$0.40/secret/month` each, and only two static secrets: the Lark credentials (`{prefix}/channels/lark`) and the Cognito password salt. This variant does **not** create dynamic per-user secrets.
 - **Cognito, DynamoDB (on-demand)** — the identity/state plane; negligible at demo volume. (A `user-files` S3 bucket is provisioned but not used on the current tool path — near-zero cost.)
 

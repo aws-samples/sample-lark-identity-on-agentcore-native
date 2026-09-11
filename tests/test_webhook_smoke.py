@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import time
+import urllib.error      # not implied by urllib.request — only bound if imported
 import urllib.request
 
 import pytest

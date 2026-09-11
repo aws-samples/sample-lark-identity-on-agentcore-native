@@ -12,7 +12,7 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
 |---|---|---|
 | Router Lambda | Lark webhook ingestion (verify + AES decrypt, resolve user, invoke runtime); owns both session ids; handles the chat commands | `lambda/router/` |
 | Agent container | Strands agent on Bedrock; HTTP contract (8080); AgentCore Memory for continuity; agent-side 3LO; an MCP client to the lark-cli server; streams answers into a Lark card | `agent/` |
-| Lark OAuth shim | RFC-6749 façade over Lark's non-standard token endpoint, plus the 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) | `lambda/shim/` |
+| 3LO return endpoint | Completes consent after Lark redirects back (delegates `CompleteResourceTokenAuth` to the router), resumes the parked turn, DMs the user. Lark's endpoints are registered directly, so the OAuth façade that used to live here is gone | `lambda/shim/` |
 | Lark MCP server | lark-cli engine on AgentCore Runtime; calls Lark with the per-user token from a custom passthrough header | `mcp-servers/lark-cli/` |
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `lark-agent-3lo`, workload `lark-agent-wl` |
 | AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `lark_agent_agent_mem` (STM) |
@@ -41,17 +41,17 @@ Every entrypoint resolves to the same stable identity `lark:{open_id}`, and that
         │   lark_3lo: platform WAT → GetResourceOauth2Token      │◀───▶ stores / refreshes
         │   the turn runs in the background; /ping = HealthyBusy │     THIS user's token
         └───┬───────────────────────────────────────────┬────────┘            ▲
-            │ MCP over SigV4, user's Lark token         │ answer, when ready  │ RFC-6749
+            │ MCP over SigV4, user's Lark token         │ answer, when ready  │ 3LO
             │ in X-Amzn-…-Custom-Lark-Token             │ (tenant token)      │
             ▼                                           │         ┌───────────┴───────────┐
-    ┌──────────────────────────────┐                    │         │  Lark OAuth shim      │
-    │  Lark MCP server (lark-cli)  │                    │         │  form ⇄ JSON,         │
-    │  runs lark-cli AS the user   │                    │         │  code≠0 → 4xx         │
-    └──────────────┬───────────────┘                    │         │  /return: complete +  │
-         Authorization: Bearer                          │         │  DM the user          │
-                   ▼                                    ▼         └───────────┬───────────┘
+    ┌──────────────────────────────┐                    │         │  /return endpoint     │
+    │  Lark MCP server (lark-cli)  │                    │         │  complete consent +   │
+    │  runs lark-cli AS the user   │                    │         │  resume + DM the user │
+    └──────────────┬───────────────┘                    │         └───────────┬───────────┘
+         Authorization: Bearer                          ▼                     │
               Lark REST API ◀─────────────────────────────────────────────────┘
               → only what THIS user can see. Lark adjudicates.       consent
+              (OAuth authorize/token are Lark's own endpoints — no façade)
 ```
 
 Identity is `lark:{open_id}` for every message, and the vaulted Lark token is keyed by it — so it survives any session change. The two session ids are separate on purpose (see [Conversation memory](#conversation-memory)): the runtime one picks the microVM, the memory one picks the history thread.
@@ -197,7 +197,7 @@ sequenceDiagram
     participant R as Router λ
     participant A as Agent (AgentCore Runtime)
     participant V as AgentCore Identity (OAuth + Token Vault)
-    participant S as Shim λ
+    participant S as /return λ
     participant M as lark-cli MCP Runtime
 
     rect rgb(232, 240, 254)
@@ -217,16 +217,13 @@ sequenceDiagram
     A-->>R: needs_auth + auth_url
     R->>U: post 点击授权 link (app tenant token), then poll the vault ≤45 s
     U->>V: GET AgentCore /authorize (binds a cookie to the session, then 302)
-    V->>S: 302 → shim /authorize (AgentCore appends client_id / redirect_uri / scope / state / PKCE)
-    S-->>U: 302 → Lark accounts authorize page
+    V-->>U: 302 → Lark accounts authorize page (AgentCore appends client_id / redirect_uri / scope / state / PKCE)
     U->>L: sign in and consent
     L-->>V: 302 with code → AgentCore callback
-    V->>S: POST shim /token
-    S->>L: POST authen/v2/oauth/token (RFC form → Lark JSON)
-    L-->>S: code:0 envelope + access_token
-    S-->>V: unwrapped, standard OAuth response
-    V-->>U: 302 → shim /return (session_id + state)
-    U->>S: GET shim /return
+    V->>L: POST open.*/authen/v2/oauth/token (form-encoded, no translation; v3 pending PKCE support)
+    L-->>V: standard OAuth response (access_token + refresh_token)
+    V-->>U: 302 → /return (session_id + state)
+    U->>S: GET /return
     S->>R: _complete_consent(actorId=b64decode(state), sessionUri) — synchronous
     R->>V: CompleteResourceTokenAuth(sessionUri, userToken=<this user's JWT>) → token vaulted
     Note over S,R: userId would name the wrong vault namespace and fail as "Invalid or expired session"
@@ -291,4 +288,4 @@ sequenceDiagram
 
 ## Deploy shape
 
-CDK stacks: security, agentcore, router, shim, observability. There is no gateway stack — the tool path is agent-side 3LO straight to the MCP Runtime; the shim stack (Lark OAuth RFC-6749 façade + 3LO return-url) is what the 3LO flow actually uses. Everything AgentCore-side is created outside CloudFormation: the **Runtimes** (agent, lark-cli MCP server), Memory, the OAuth2 credential provider, the workload identity, and the Web Search gateway. `deploy.sh` builds them — ARM64 images via CodeBuild, resources via the AgentCore CLI / control-plane — and feeds ids back through `.cdk-state.json`. `AWS::BedrockAgentCore::*` types do now exist, so this is a choice rather than a limitation: the agent Runtime and Memory are created implicitly by `agentcore deploy`, which also builds the image, and replacing that official tool to move them into a stack costs more than it returns. Two consequences worth knowing: `destroy.sh` needs an explicit delete for each of these (nothing errors if one is missed — only a real teardown catches it), and the ordering `3lo`/`gateway` → `runtime` has to be maintained by hand, since the Runtime bakes in the provider name and gateway URL. See `README.md` for the deploy commands and Lark console setup.
+CDK stacks: security, agentcore, router, consent, observability. There is no gateway stack — the tool path is agent-side 3LO straight to the MCP Runtime; the shim stack (Lark OAuth RFC-6749 façade + 3LO return-url) is what the 3LO flow actually uses. Everything AgentCore-side is created outside CloudFormation: the **Runtimes** (agent, lark-cli MCP server), Memory, the OAuth2 credential provider, the workload identity, and the Web Search gateway. `deploy.sh` builds them — ARM64 images via CodeBuild, resources via the AgentCore CLI / control-plane — and feeds ids back through `.cdk-state.json`. `AWS::BedrockAgentCore::*` types do now exist, so this is a choice rather than a limitation: the agent Runtime and Memory are created implicitly by `agentcore deploy`, which also builds the image, and replacing that official tool to move them into a stack costs more than it returns. Two consequences worth knowing: `destroy.sh` needs an explicit delete for each of these (nothing errors if one is missed — only a real teardown catches it), and the ordering `3lo`/`gateway` → `runtime` has to be maintained by hand, since the Runtime bakes in the provider name and gateway URL. See `README.md` for the deploy commands and Lark console setup.

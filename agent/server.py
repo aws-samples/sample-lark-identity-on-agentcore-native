@@ -121,6 +121,20 @@ async def handle_invocations(request: web.Request) -> web.Response:
     if action == "warmup":
         return web.json_response({"ready": True})
 
+    if action == "authstatus":
+        # Read-only: does this user have a vaulted token? The router asks because only
+        # this container can read the vault entry (see agent_core.auth_status).
+        actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
+        idp = payload.get("message", "") or "lark"
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, agent_core.auth_status, actor_id, idp, workload_token
+            )
+            return web.json_response(result)
+        except Exception as e:
+            log.exception("authstatus failed")
+            return web.json_response({"authorized": False, "error": str(e)})
+
     if action == "reauth":
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
         idp = payload.get("message", "") or "lark"   # router sends the idp key here

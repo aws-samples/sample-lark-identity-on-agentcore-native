@@ -375,12 +375,12 @@ def test_status_shows_both_identities_and_masks_the_app_id():
 
 # --------------------------- consent resume ---------------------------------
 # When a Lark tool hits an auth wall in the async run, the message is parked; the
-# shim's /return replays it after consent. These pin the parts that must not drift:
+# the /return endpoint replays it after consent. These pin the parts that must not drift:
 # take is once-only, expiry is honoured, and resume actually re-invokes the agent.
 
 def test_take_pending_auth_claims_atomically_and_honours_ttl():
     """The claim IS the delete. Two paths race to replay a parked turn — the router
-    polling the vault and the shim's post-consent callback — so a get-then-delete lets
+    the consent-wait poll and the post-consent callback — so a get-then-delete lets
     both read the same item and run the turn twice, with duplicated side effects."""
     import identity, time as _t
     store = {}
@@ -413,7 +413,7 @@ def test_take_pending_auth_reads_the_item_from_the_delete_itself():
 
 
 def test_fast_path_claims_before_replaying():
-    """When the user consents inside the polling window, the router and the shim both
+    """When the user consents inside the polling window, the router and the /return callback both
     want to replay. The claim decides which one does."""
     import index, identity
     with mock.patch.object(identity, "get_or_create_session", return_value="ses_x"), \
@@ -436,7 +436,7 @@ def test_fast_path_claims_before_replaying():
 
 
 def test_fast_path_does_not_replay_when_the_claim_is_lost():
-    """The shim got there first and is already replaying — a second run would duplicate
+    """The /return callback got there first and is already replaying — a second run would duplicate
     every side effect, in a different session, with no dedup on the agent side."""
     import index, identity
     with mock.patch.object(identity, "get_or_create_session", return_value="ses_x"), \
@@ -546,16 +546,30 @@ def test_complete_consent_names_the_user_by_token_not_by_id():
         sessionUri="sess-uri", userIdentifier={"userToken": "JWT-FOR-U"})
 
 
-def test_vault_check_uses_the_jwt_namespace():
-    """The vault key follows the token's `sub`, so the router must ask ForJWT. Checking
-    ForUserId would consult a different namespace and report "never consented" forever,
-    leaving the user in an endless consent loop."""
+def test_auth_status_is_asked_of_the_agent_not_read_from_the_vault():
+    """The vault entry belongs to the Runtime's service-linked workload identity, and
+    minting a workload token for it from outside is refused ("WorkloadIdentity is linked
+    to a service"). So the router must ask the agent — and must not try to read the vault
+    itself, or the check silently answers about an empty namespace."""
     import index
-    with mock.patch.object(index.cognito, "user_jwt", return_value="JWT-FOR-U"), \
+    with mock.patch.object(index.identity, "resolve_user", return_value=("user_1", False)), \
+         mock.patch.object(index.identity, "get_or_create_session", return_value="sess-x"), \
+         mock.patch.object(index, "invoke_agent", return_value={"authorized": True}) as inv, \
          mock.patch.object(index, "agentcore") as ac:
-        ac.get_workload_access_token_for_jwt.return_value = {"workloadAccessToken": "WAT"}
-        ac.get_resource_oauth2_token.return_value = {"accessToken": "lark-token"}
         assert index.user_token_vaulted("lark:ou_u") is True
-    ac.get_workload_access_token_for_jwt.assert_called_once()
-    assert ac.get_workload_access_token_for_jwt.call_args.kwargs["userToken"] == "JWT-FOR-U"
+    assert inv.call_args.kwargs["action"] == "authstatus"
+    # Read-only probe: no vault call of any kind from the router.
+    assert not ac.get_workload_access_token_for_jwt.called
     assert not ac.get_workload_access_token_for_user_id.called
+    assert not ac.get_resource_oauth2_token.called
+
+
+def test_auth_status_fails_closed_when_the_agent_is_unreachable():
+    """An unreachable agent must read as "not authorized": that prompts a consent the
+    user may not need, which is recoverable — reporting authorized when it isn't would
+    send the turn into a tool call that fails deep in the run."""
+    import index
+    with mock.patch.object(index.identity, "resolve_user", return_value=("user_1", False)), \
+         mock.patch.object(index.identity, "get_or_create_session", return_value="sess-x"), \
+         mock.patch.object(index, "invoke_agent", side_effect=RuntimeError("boom")):
+        assert index.user_token_vaulted("lark:ou_u") is False

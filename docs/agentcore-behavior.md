@@ -121,6 +121,26 @@ One variable at a time: both groups → success; only `bedrock-agentcore:*` → 
 
 > Four wordings preceded this one, and the sequence is worth keeping as a caution. (1) "the Gateway cannot do per-user 3LO for `CustomOauth2`" — second-hand, from #1424. (2) after seeing a target-level federation complete, over-corrected to "3LO works". (3) narrowed to "target-level works, per-user does not" after three target configurations all returned the opaque error. (4) this one, after adding the Identity permissions and getting real user data back. Steps 1–3 all failed to rule out permissions first, **including after a permission problem had already been diagnosed once in the same investigation**. The generalisable lesson is in the debug order above.
 
+### Only the identity holder can read its own vault entry — verified @2026-09-11
+
+With `CUSTOM_JWT` inbound the Runtime derives its workload access token from its **own
+service-linked workload identity** (named after the runtime id, e.g. `lark_agent_agent-<id>`),
+not from any workload identity you registered. Two consequences that shape the design:
+
+- **Nobody outside can mint a token for it.** `GetWorkloadAccessTokenForJWT` against that
+  workload is refused: `ValidationException: WorkloadIdentity is linked to a service and
+  cannot retrieve an access token by the caller.` This is the documented protection
+  ("Runtime-managed agent identities cannot retrieve workload access tokens directly,
+  preventing token extraction and misuse") working as intended.
+- **So a consent the agent initiated is invisible to every other component.** A caller that
+  queries its *own* registered workload instead gets no error — just an empty namespace and a
+  permanent "not consented". That failure is silent, which is what makes it dangerous: here it
+  survived a passing end-to-end test because the consent link comes from the agent and the
+  resume comes from the return-url callback, so only the `/auth` status display was wrong.
+
+**Consequence:** anything needing to know whether a user has consented must ask the agent
+(this repo adds an `authstatus` action for exactly that), not read the vault itself.
+
 ### Other things established along the way
 
 - **3LO outbound requires `CUSTOM_JWT` inbound.** On an `AWS_IAM` gateway the target is refused outright: `ValidationException: 3LO Auth is not supported when gateway authorizer type is AWS_IAM`. Per-user outbound needs an inbound user identity to key on, and SigV4 carries none — so inbound and outbound are **not** freely combinable.
@@ -160,7 +180,7 @@ Also note the OAuth Runtime target's error *changed* from `-32042` to the author
 
 ## FINDING: AgentCore native 3LO WORKS end-to-end for a non-standard IdP (Lark) via the agent-driven path — measured
 
-**Bottom line:** Lark, as a `CustomOauth2` provider behind an RFC-6749 shim, **does** complete native per-user 3LO and vault the token. Verified: a real user consented once through the shim → Lark → AgentCore, the return page showed "Authorized", and `GetResourceOauth2Token` then returned a real Lark `user_access_token` (a ~1529-char JWT) from the managed Token Vault. So the "fully native managed Token Vault for the user token" thesis holds for Lark too — **no self-managed store needed after all.**
+**Bottom line:** Lark, as a `CustomOauth2` provider (behind an RFC-6749 façade at the time; its own endpoints are registered directly since v1.0), **does** complete native per-user 3LO and vault the token. Verified: a real user consented once through the shim → Lark → AgentCore, the return page showed "Authorized", and `GetResourceOauth2Token` then returned a real Lark `user_access_token` (a ~1529-char JWT) from the managed Token Vault. So the "fully native managed Token Vault for the user token" thesis holds for Lark too — **no self-managed store needed after all.**
 
 **Revised @2026-07 after re-running it:** a prior version of this finding said CustomOauth2 3LO completion was "defective" (CompleteResourceTokenAuth → "Invalid or expired session"). That was a **misdiagnosis** caused by our own operational noise, not an AWS defect. Three self-inflicted issues, each independently confirmed and fixed, produced that error:
 1. **Server-side "generate-and-verify" curl consumed the single-use `request_uri`** before the user's browser could — after which the browser hit an already-spent session (surfacing as "Invalid request" / "Invalid or expired session"). Fix: never touch the authorizationUrl server-side; hand it straight to the user.
@@ -172,7 +192,7 @@ With all three avoided (base64url state, no server-side curl, clean URL) the ide
 **Superseded @2026-08-19:** this section used to name the Gateway-mediated per-user elicitation as "the one real remaining AWS gap" for `CustomOauth2`. It is not a gap — see the top of this document. The agent-driven path below remains correct and useful (it is what this repo runs), but it is a choice, not a workaround for a missing feature.
 
 **What works (measured):**
-- Shim translating Lark's non-standard OAuth (JSON body / `code:"0"` envelope / HTTP-200-on-error / PKCE `code_verifier`) into RFC-6749.
+- (Historical — Lark's endpoints are registered directly since v1.0; the shim façade below was for the deprecated v2 endpoint.) Shim translating Lark's non-standard OAuth (JSON body / `code:"0"` envelope / HTTP-200-on-error / PKCE `code_verifier`) into RFC-6749.
 - `CustomOauth2` provider registration, Gateway `mcpServer` target (via `mcpToolSchema`), lark-mcp on Runtime, Gateway→lark-mcp forwarding, per-user microVM isolation.
 - Agent-driven 3LO end to end: `GetResourceOauth2Token(USER_FEDERATION)` → consent → `CompleteResourceTokenAuth` → **Lark token vaulted and retrievable per-user.**
 
@@ -180,7 +200,7 @@ With all three avoided (base64url state, no server-side curl, clean URL) the ide
 
 - **`CompleteResourceTokenAuth` requires both `sessionUri` and `userIdentifier`** (a struct `{userId}` or `{userToken}`), and the OAuth authorization code is short-lived (~5 min) — the completion must happen automatically on the return-URL callback, not via a delayed manual step.
 
-## Built-in OAuth2 vendors vs CustomOauth2 — which downstream systems need the shim + agent-side workaround
+## Built-in OAuth2 vendors vs CustomOauth2 — which downstream systems need a façade + agent-side workaround
 
 `create-oauth2-credential-provider` accepts a `credentialProviderVendor`. The full set (from the control-plane API schema) is 24 built-in vendors plus `CustomOauth2`:
 

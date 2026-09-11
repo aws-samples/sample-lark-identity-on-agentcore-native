@@ -98,7 +98,7 @@ def drop_session(user_id: str) -> None:
 
 
 # When a turn hits a Lark authorization wall, the original message is parked here so
-# the shim's /return can replay it once consent completes — the "durable intent"
+# the /return endpoint can replay it once consent completes — the "durable intent"
 # that makes callback-driven resume possible without a live task to wake. TTL-bounded
 # so an abandoned consent doesn't linger.
 _PENDING_AUTH_TTL = int(os.environ.get("PENDING_AUTH_TTL_SECONDS", "600"))  # 10 min
@@ -118,7 +118,7 @@ def park_pending_auth(user_id: str, message: str, chat_id: str) -> None:
 def take_pending_auth(user_id: str) -> dict | None:
     """Claim the parked turn: return {message, chatId} and remove it, atomically.
 
-    Two paths race for this — the router polling the vault and the shim's callback
+    Two paths race for this — the router's consent-wait and the /return callback
     after consent completes — and both replay whatever they claim. A get-then-delete
     lets both read the same item inside the same window and run the turn twice, with
     duplicated side effects. Deleting with ALL_OLD makes the delete itself the claim:

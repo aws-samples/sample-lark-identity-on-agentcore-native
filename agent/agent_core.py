@@ -291,7 +291,7 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
             if _hit_auth_wall(s):
                 # A clickable "点击授权" link, matching the router's synchronous path,
                 # instead of a raw URL. The message was parked before this turn, so
-                # the shim's /return replays it once consent lands — no re-send.
+                # the /return endpoint replays it once consent lands — no re-send.
                 lark_notify.send_link(
                     chat_id, "需要访问你的 Lark 账号，授权后我会自动继续：",
                     "点击授权", s["auth_url"])
@@ -394,6 +394,29 @@ def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
         if not lark_notify.send_text(chat_id, text):
             log.error("could not deliver reply to %s: %s", chat_id, text[:200])
     return text
+
+
+def auth_status(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
+    """Whether this user's token for `idp` is vaulted → {authorized: bool}.
+
+    The router cannot answer this itself. Under CUSTOM_JWT inbound the vault entry
+    lives under the Runtime's own service-linked workload identity, and
+    GetWorkloadAccessTokenForJWT on it is refused outright: "WorkloadIdentity is
+    linked to a service and cannot retrieve an access token by the caller." That is
+    the documented protection against token extraction, so the component holding the
+    identity is the only one that can report on it.
+
+    Never starts a flow: a miss returns False rather than an authorization URL, so
+    polling this cannot mint consent sessions (each one would invalidate the last).
+    """
+    if idp not in ("", "lark"):
+        return {"authorized": False, "error": f"unknown idp: {idp}"}
+    try:
+        kind, _ = lark_3lo.get_user_lark_token(actor_id, workload_token=workload_token)
+    except Exception as e:  # noqa: BLE001 — a status probe must not fail the command
+        log.exception("auth status check failed for %s", actor_id)
+        return {"authorized": False, "error": str(e)}
+    return {"authorized": kind == "token"}
 
 
 def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:

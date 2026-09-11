@@ -203,9 +203,9 @@ def _secs(seconds) -> str:
 AUTH_WAIT_SECONDS = int(os.environ.get("AUTH_WAIT_SECONDS", "45"))
 AUTH_POLL_INTERVAL = float(os.environ.get("AUTH_POLL_INTERVAL", "2"))
 LARK_OAUTH_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "lark-agent-3lo")
-AGENT_WORKLOAD_NAME = os.environ.get("AGENT_WORKLOAD_NAME", "lark-agent-wl")
+# Only used to label the IdP registry — the router no longer reads the vault itself
+# (the agent does; see user_token_vaulted).
 LARK_SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
-SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # required by GetResourceOauth2Token
 
 # One runtime can front several IdPs — one OAuth provider per downstream system.
 # IDP_REGISTRY is a JSON list of {key, provider, scopes, label}; `key` is what the
@@ -225,37 +225,36 @@ IDPS = _load_idps()
 
 
 def user_token_vaulted(actor_id: str, idp_key: str = "lark") -> bool:
-    """True once this user's token for `idp_key` is in the Token Vault (consent
-    complete). Same USER_FEDERATION sequence the agent uses; presence check only.
-    ResourceOauth2ReturnUrl is required even for a presence check — without a
-    valid token AgentCore refuses the call rather than returning empty.
+    """True once this user's token for `idp_key` is in the Token Vault (consent done).
 
-    Keyed ForJWT, matching what the agent sees. The vault namespace follows the
-    token's `sub`, so a ForUserId-derived check would look in a different namespace
-    and report "not consented" forever."""
-    idp = IDPS.get(idp_key)
-    if not idp:
+    Asked of the agent rather than read here. Under CUSTOM_JWT inbound the vault entry
+    belongs to the Runtime's own service-linked workload identity, and minting a
+    workload token for it from outside is refused: "WorkloadIdentity is linked to a
+    service and cannot retrieve an access token by the caller." That refusal is the
+    documented protection against token extraction, so the container holding the
+    identity is the only component that can answer — the router asks it.
+
+    Fails closed: an unreachable agent reads as "not authorized", which at worst
+    prompts a consent the user does not need, never a silent skip.
+    """
+    if idp_key not in IDPS:
+        return False
+    user_id, _ = identity.resolve_user("lark", actor_id.split(":", 1)[-1])
+    if not user_id:
         return False
     try:
-        wat = agentcore.get_workload_access_token_for_jwt(
-            workloadName=AGENT_WORKLOAD_NAME, userToken=cognito.user_jwt(actor_id),
-        )["workloadAccessToken"]
-        kwargs = dict(
-            workloadIdentityToken=wat,
-            resourceCredentialProviderName=idp["provider"],
-            scopes=idp["scopes"],
-            oauth2Flow="USER_FEDERATION",
-        )
-        if SHIM_RETURN_URL:
-            kwargs["resourceOauth2ReturnUrl"] = SHIM_RETURN_URL
-        resp = agentcore.get_resource_oauth2_token(**kwargs)
-        has = bool(resp.get("accessToken"))
-        logger.info("vault check %s (%s): token=%s authUrl=%s", actor_id, idp_key,
-                    has, bool(resp.get("authorizationUrl")))
-        return has
-    except Exception:
-        logger.exception("vault check failed for %s (%s)", actor_id, idp_key)
+        session_id = identity.get_or_create_session(user_id)
+        # action=authstatus is read-only: it never starts a 3LO flow, so polling it
+        # cannot invalidate a consent session the user is mid-way through.
+        data = invoke_agent(session_id, user_id, actor_id, idp_key,
+                            action="authstatus", budget=_PROBE_SECONDS)
+    except Exception:  # noqa: BLE001 — a status probe must not fail the command
+        logger.exception("auth status probe failed for %s (%s)", actor_id, idp_key)
         return False
+    has = bool(data.get("authorized"))
+    logger.info("auth status %s (%s): authorized=%s%s", actor_id, idp_key, has,
+                f" err={data['error'][:80]}" if data.get("error") else "")
+    return has
 
 
 def wait_for_consent(actor_id: str) -> bool:
@@ -274,7 +273,7 @@ def wait_for_consent(actor_id: str) -> bool:
 def complete_consent(actor_id: str, session_uri: str) -> None:
     """Bind a finished 3LO consent to this user's signed identity.
 
-    Called by the shim's /return, which owns the browser redirect but deliberately not
+    Called by the /return endpoint, which owns the browser redirect but deliberately not
     the identity: minting user JWTs stays in one place. `userToken`, not `userId` — the
     consent session belongs to the JWT-derived vault namespace, and naming the user by
     string instead fails with `AccessDeniedException: Invalid or expired session`, which
@@ -290,7 +289,7 @@ def complete_consent(actor_id: str, session_uri: str) -> None:
 
 def resume_consented_turn(actor_id: str) -> None:
     """Replay the message that hit an auth wall, now that the user has consented.
-    Invoked by the shim's /return after 3LO completes — this is the callback-driven
+    Invoked by the /return endpoint after 3LO completes — this is the callback-driven
     resume that lets the task continue without the user re-sending.
 
     No-op if nothing was parked (the user may have run /auth directly, with no turn
@@ -488,7 +487,7 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
 
     # If the user isn't authorized yet, a Lark tool this turn may hit an auth wall
     # deep in the async run — past where the router can see it. Park the message now
-    # so the shim's /return can replay it once consent lands. Only for unauthorized
+    # so the /return endpoint can replay it once consent lands. Only for unauthorized
     # users: an authorized turn won't wall, and parking every message would be waste.
     # Left to expire by TTL if this turn needs no Lark tool after all.
     if not user_token_vaulted(actor_id):
@@ -499,7 +498,7 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
 def _dispatch_turn(user_id: str, actor_id: str, agent_message: str, chat_id: str,
                    message_id: str = "", context=None) -> None:
     """Invoke the agent for one turn and deliver the reply. Shared by the webhook
-    path and the consent-resume path (shim replays a parked message here)."""
+    path and the consent-resume path (/return replays a parked message here)."""
     session_id = identity.get_or_create_session(user_id)
     mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
     logger.info("invoking agent: session=%s mem=%s msg=%r",
@@ -527,7 +526,7 @@ def _dispatch_turn(user_id: str, actor_id: str, agent_message: str, chat_id: str
                 lark.send_message(chat_id, result.get("reply", ""))
             logger.info("awaiting consent for %s (<= %ds)", actor_id, AUTH_WAIT_SECONDS)
             if wait_for_consent(actor_id):
-                # Claim the parked turn before replaying it. The shim's callback races
+                # Claim the parked turn before replaying it. The /return callback races
                 # us the moment consent lands — it claims and replays too — so whoever
                 # polls the token first would otherwise run the turn a second time, in
                 # a different session, with the side effects duplicated. Whoever wins
@@ -580,9 +579,9 @@ def handler(event, context):
         process_lark_event(event["body"], event.get("headers", {}), context)
         return {"ok": True}
 
-    # Consent-completion path: the shim's /return calls us synchronously, because only
+    # Consent-completion path: the /return endpoint calls us synchronously, because only
     # the router mints user JWTs and the completion must name the user by token.
-    # Answered with ok/error so the shim can render an honest page.
+    # Answered with ok/error so /return can render an honest page.
     if event.get("_complete_consent"):
         actor_id = event.get("actorId", "")
         session_uri = event.get("sessionUri", "")
@@ -595,7 +594,7 @@ def handler(event, context):
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
         return {"ok": True}
 
-    # Consent-resume path: the shim invokes us here after a user finishes 3LO, so the
+    # Consent-resume path: /return invokes us here after a user finishes 3LO, so the
     # message that hit the auth wall can be replayed with the token now in the vault
     # — the user does not re-send. See .dev/adr and PLAN-consent-resume.
     if event.get("_consent_resumed"):

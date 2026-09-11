@@ -8,7 +8,7 @@ Token Vault (3LO); the agent fetches the calling user's token and passes it to
 the MCP server, which acts as that user against Lark.
 
 Deployment is hybrid:
-  Phase 1 (CDK):  Security, AgentCore base (Role/ECR/S3), Router, Shim,
+  Phase 1 (CDK):  Security, AgentCore base (Role/ECR/S3), Router, Consent,
                   Observability
   Phase 2 (CLI):  AgentCore Runtimes (agent + MCP server) created/updated by
                   deploy.sh (control-plane APIs), IDs fed back via .cdk-state.json
@@ -23,7 +23,7 @@ import aws_cdk as cdk
 from stacks.security_stack import SecurityStack
 from stacks.agentcore_stack import AgentCoreStack
 from stacks.router_stack import RouterStack
-from stacks.shim_stack import ShimStack
+from stacks.consent_stack import ConsentStack
 from stacks.observability_stack import ObservabilityStack
 
 app = cdk.App()
@@ -62,12 +62,12 @@ agentcore = AgentCoreStack(
     env=env,
 )
 
-# --- Shim: Lark OAuth RFC-6749 façade + 3LO return-url ---
+# --- Consent: the 3LO return-url endpoint ---
 # Created before the router so the router can consume its return_url for the
 # consent-wait vault check.
-shim = ShimStack(
+consent = ConsentStack(
     app,
-    f"{prefix}-shim",
+    f"{prefix}-consent",
     lark_api_domain=ctx("lark_api_domain") or "https://open.larksuite.com",
     lark_secret_name=security.lark_secret.secret_name,
     env=env,
@@ -80,7 +80,7 @@ router = RouterStack(
     runtime_arn=agentcore.runtime_arn,
     runtime_endpoint_qualifier=ctx("runtime_endpoint_id") or "DEFAULT",
     lark_secret_name=security.lark_secret.secret_name,
-    shim_return_url=shim.return_url,
+    consent_return_url=consent.return_url,
     user_pool_id=security.user_pool_id,
     user_pool_arn=security.user_pool_arn,
     user_pool_client_id=security.user_pool_client_id,

@@ -1,11 +1,11 @@
-"""Shim stack — Lark OAuth shim (RFC-6749 façade) on Lambda + HTTP API.
+"""Consent stack — the 3LO return endpoint on Lambda + HTTP API.
 
-Fronts Lark's non-standard token endpoint so AgentCore Identity can register it
-as a custom OAuth2 provider (Phase 3). Also hosts the 3LO return-url that calls
-CompleteResourceTokenAuth (Phase 3b). See lambda/shim/index.py.
+One route: GET /return, where AgentCore Identity sends the browser after Lark
+consent so the flow can be completed and the parked turn resumed. The OAuth
+authorize/token endpoints are Lark's own (v3 implements RFC 6749), registered
+directly on the credential provider — see lambda/consent/index.py.
 
-The API's execute-api URL is the provider's issuer/authorization/token base —
-no custom domain for the PoC.
+The API's execute-api URL is only the return-url base — no custom domain.
 """
 
 from aws_cdk import (
@@ -24,7 +24,7 @@ from constructs import Construct
 from stacks import retention_days
 
 
-class ShimStack(Stack):
+class ConsentStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, *, lark_api_domain: str,
                  lark_secret_name: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -33,22 +33,22 @@ class ShimStack(Stack):
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
 
         log_group = logs.LogGroup(
-            self, "ShimLog",
-            log_group_name=f"/{prefix}/lambda/shim",
+            self, "ConsentLog",
+            log_group_name=f"/{prefix}/lambda/consent",
             retention=retention_days(log_retention),
             removal_policy=RemovalPolicy.DESTROY,
         )
-        # The router's function name is deterministic ({prefix}-router), so the shim
+        # The router's function name is deterministic ({prefix}-router), so this stack
         # can address it without a cross-stack reference — which matters because the
-        # shim is created BEFORE the router (the router consumes the shim's return
+        # consent stack is created BEFORE the router (the router consumes its return
         # URL). Referencing the router construct here would be a dependency cycle.
         router_function = f"{prefix}-router"
-        self.shim_fn = _lambda.Function(
-            self, "ShimFn",
-            function_name=f"{prefix}-oauth-shim",
+        self.consent_fn = _lambda.Function(
+            self, "ConsentFn",
+            function_name=f"{prefix}-consent",
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="index.handler",
-            code=_lambda.Code.from_asset("lambda/shim"),  # stdlib + boto3 only, no deps
+            code=_lambda.Code.from_asset("lambda/consent"),  # stdlib + boto3 only, no deps
             timeout=Duration.seconds(15),
             memory_size=256,
             environment={"LARK_API_DOMAIN": lark_api_domain,
@@ -60,19 +60,19 @@ class ShimStack(Stack):
         )
         # Invoke the router for consent-resume. Scoped to that one function by ARN
         # built from the deterministic name — no router-stack reference needed.
-        self.shim_fn.add_to_role_policy(iam.PolicyStatement(
+        self.consent_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["lambda:InvokeFunction"],
             resources=[f"arn:aws:lambda:{Stack.of(self).region}:{Stack.of(self).account}"
                        f":function:{router_function}"],
         ))
         # The return-url handler completes the 3LO auth session.
-        self.shim_fn.add_to_role_policy(iam.PolicyStatement(
+        self.consent_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["bedrock-agentcore:CompleteResourceTokenAuth"],
             resources=["*"],
         ))
         # CompleteResourceTokenAuth reads the provider's Identity-managed client
         # secret AS THE CALLER, so this role needs GetSecretValue on it.
-        self.shim_fn.add_to_role_policy(iam.PolicyStatement(
+        self.consent_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
             resources=[
                 f"arn:aws:secretsmanager:{Stack.of(self).region}:{Stack.of(self).account}"
@@ -83,15 +83,10 @@ class ShimStack(Stack):
             ],
         ))
 
-        integration = apigwv2_integrations.HttpLambdaIntegration("ShimIntegration", handler=self.shim_fn)
-        self.http_api = apigwv2.HttpApi(self, "ShimApi", api_name=f"{prefix}-oauth-shim")
-        self.http_api.add_routes(path="/authorize", methods=[apigwv2.HttpMethod.GET], integration=integration)
-        self.http_api.add_routes(path="/token", methods=[apigwv2.HttpMethod.POST], integration=integration)
+        integration = apigwv2_integrations.HttpLambdaIntegration("ConsentIntegration", handler=self.consent_fn)
+        self.http_api = apigwv2.HttpApi(self, "ConsentApi", api_name=f"{prefix}-consent")
         self.http_api.add_routes(path="/return", methods=[apigwv2.HttpMethod.GET], integration=integration)
 
         base = (self.http_api.url or "").rstrip("/")
         self.return_url = f"{base}/return"  # consumed by the router (consent-wait)
-        CfnOutput(self, "ShimIssuer", value=base)
-        CfnOutput(self, "ShimAuthorizeUrl", value=f"{base}/authorize")
-        CfnOutput(self, "ShimTokenUrl", value=f"{base}/token")
-        CfnOutput(self, "ShimReturnUrl", value=f"{base}/return")
+        CfnOutput(self, "ConsentReturnUrl", value=f"{base}/return")
