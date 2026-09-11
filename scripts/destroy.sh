@@ -107,17 +107,6 @@ if aws s3api head-bucket --bucket "$SRC_BUCKET" >/dev/null 2>&1; then
   done
 fi
 
-# --- 1c. Log groups (auto-created by runtimes / CodeBuild / Memory) -------
-# The runtimes and builders create these on first write, outside any stack, and
-# CDK's own log groups vanish with their stacks — these do not.
-log "Log groups — runtime / CodeBuild / Memory leftovers"
-for g in $(aws logs describe-log-groups \
-             --query "logGroups[?contains(logGroupName,'$PREFIX') || contains(logGroupName,'${PREFIX//-/_}')].logGroupName" \
-             --output text 2>/dev/null || true); do
-  aws logs delete-log-group --log-group-name "$g" >/dev/null 2>&1 \
-    && echo "  deleted $g" || true
-done
-
 # --- 2. CDK stacks (reverse dependency order) ----------------------------
 log "CDK — destroy stacks"
 # consent/router depend on agentcore+security; destroy dependents first.
@@ -126,7 +115,20 @@ $CDK destroy \
   "$PREFIX-agentcore" "$PREFIX-observability" "$PREFIX-security" \
   --force
 
-# --- 3. AgentCore Identity (CLI-created, region-scoped) ------------------
+# --- 3. Log groups (auto-created outside any stack) -----------------------
+# Runtimes, builders and Memory create these on first write, so they outlive the
+# stacks. Swept AFTER the stacks: CDK's S3-auto-delete custom resource only runs
+# during stack destruction and writes its own log group on the way out, so an
+# earlier sweep leaves that one behind (measured).
+log "Log groups — runtime / CodeBuild / Memory leftovers"
+for g in $(aws logs describe-log-groups \
+             --query "logGroups[?contains(logGroupName,'$PREFIX') || contains(logGroupName,'${PREFIX//-/_}')].logGroupName" \
+             --output text 2>/dev/null || true); do
+  aws logs delete-log-group --log-group-name "$g" >/dev/null 2>&1 \
+    && echo "  deleted $g" || true
+done
+
+# --- 4. AgentCore Identity (CLI-created, region-scoped) ------------------
 # Deleting the provider purges every user's vaulted token, so a redeploy means
 # everyone consents again — and the new provider gets a NEW callbackUrl that must
 # be registered in the Lark console. Both are region-scoped: leaving them behind
@@ -147,7 +149,7 @@ else
   echo "  no workload identity named $PREFIX-wl — skipping"
 fi
 
-# --- 4. leftover local state --------------------------------------------
+# --- 5. leftover local state --------------------------------------------
 log "Local — clear the AgentCore CLI config so a fresh deploy reconfigures"
 [ -f .bedrock_agentcore.yaml ] && { rm -f .bedrock_agentcore.yaml; echo "  removed .bedrock_agentcore.yaml"; }  # safe-rm-ok
 rm -rf .bedrock_agentcore 2>/dev/null || true  # safe-rm-ok
